@@ -1,4 +1,4 @@
-# pi-ai (Python)
+# pi_ai
 
 Unified LLM API with provider collections, automatic auth resolution, token and cost
 tracking, and simple context persistence and hand-off to other models mid-session.
@@ -47,12 +47,12 @@ OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp, ...).
 ## Installation
 
 ```bash
-pip install pi-ai               # httpx + official SDKs: anthropic, openai, google-genai
-pip install "pi-ai[bedrock]"    # + boto3 for Amazon Bedrock
-pip install "pi-ai[fast]"       # + orjson for faster stream decoding
-pip install "pi-ai[websocket]"  # + websockets for the OpenAI Codex WebSocket transport
-pip install "pi-ai[pydantic]"   # + pydantic, to use models as tool parameter schemas
-pip install "pi-ai[all]"
+pip install pi-ai-python               # pi_ai + pi_agent; httpx + official SDKs: anthropic, openai, google-genai
+pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
+pip install "pi-ai-python[fast]"       # + orjson for faster stream decoding
+pip install "pi-ai-python[websocket]"  # + websockets for the OpenAI Codex WebSocket transport
+pip install "pi-ai-python[pydantic]"   # + pydantic, to use models as tool parameter schemas
+pip install "pi-ai-python[all]"
 ```
 
 Python 3.11+. Everything is `asyncio`-based.
@@ -777,7 +777,7 @@ a service account file, plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`.
 
 ### Amazon Bedrock
 
-Requires `pip install "pi-ai[bedrock]"` (boto3). Requests go through the boto3
+Requires `pip install "pi-ai-python[bedrock]"` (boto3). Requests go through the boto3
 `bedrock-runtime` client, so credentials, region and endpoints resolve through botocore's
 standard chain (env keys, `~/.aws` profiles, SSO, ECS/EC2 roles, web identity), plus
 `AWS_BEARER_TOKEN_BEDROCK` or the `credentials=` option. boto3 is synchronous; the stream
@@ -810,7 +810,7 @@ New code should use `create_models()` and provider factories.
   dominates). The google-genai SDK validates every streamed chunk with pydantic, roughly
   100 µs per chunk; real Gemini chunks carry many tokens, so this is a few milliseconds per
   response.
-- With `pi-ai[fast]`, SSE chunks decode with orjson.
+- With `pi-ai-python[fast]`, SSE chunks decode with orjson.
 - Tool-argument validators compile once per schema and are cached.
 - Catalogs load lazily per provider; API implementations and OAuth flows import on first use.
 - HTTP connections are pooled per event loop.

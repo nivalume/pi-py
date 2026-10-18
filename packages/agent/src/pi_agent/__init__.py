@@ -1,5 +1,5 @@
-"""pi-agent-core: stateful agent with tool execution, steering/follow-up queues and
-event streaming, built on pi-ai.
+"""pi_agent: stateful agent with tool execution, steering/follow-up queues and
+event streaming, built on pi_ai.
 
 Python port of ``@earendil-works/pi-agent-core``.
 """

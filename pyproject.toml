@@ -1,29 +1,81 @@
 [project]
-name = "pi-py-workspace"
-version = "0.0.0"
-description = "Workspace root for the Python port of pi (pi-ai and pi-agent-core)"
-requires-python = ">=3.11"
+name = "pi-ai-python"
+version = "1.3.0"
+description = "Python port of pi's AI libraries: a unified LLM API (pi_ai) and a stateful agent runtime (pi_agent)"
 readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "nivalume" }]
+keywords = ["ai", "llm", "agent", "openai", "anthropic", "gemini", "bedrock", "streaming", "tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27",
+    # Official vendor SDKs, as used by the TypeScript packages.
+    "anthropic>=1.15",
+    "openai>=3.35",
+    "google-genai>=2.31",
+]
 
-[tool.uv]
-package = false
+[project.optional-dependencies]
+# orjson speeds up SSE/JSON decoding on the streaming hot path.
+fast = ["orjson>=3.10"]
+# WebSocket transport for OpenAI Codex Responses.
+websocket = ["websockets>=13"]
+# Pydantic models as tool parameter schemas.
+pydantic = ["pydantic>=2.6"]
+# Amazon Bedrock (bedrock-converse-stream) through the AWS SDK.
+bedrock = ["boto3>=1.43"]
+all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43"]
 
-[tool.uv.workspace]
-members = ["packages/ai", "packages/agent"]
+[project.scripts]
+pi-ai = "pi_ai.cli:main"
 
-[tool.uv.sources]
-pi-ai = { workspace = true }
-pi-agent-core = { workspace = true }
+[project.urls]
+Homepage = "https://github.com/nivalume/pi-py"
+Source = "https://github.com/nivalume/pi-py"
+Upstream = "https://github.com/earendil-works/pi"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# One distribution, two import packages.
+packages = ["packages/ai/src/pi_ai", "packages/agent/src/pi_agent"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "packages/ai/src",
+    "packages/agent/src",
+    "packages/ai/tests",
+    "packages/agent/tests",
+    "packages/ai/README.md",
+    "packages/agent/README.md",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+]
 
 [dependency-groups]
 dev = [
-    "pi-ai[fast,websocket,bedrock]",
-    "pi-agent-core",
+    "orjson>=3.10",
+    "websockets>=13",
+    "boto3>=1.43",
+    "pydantic>=2.9",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.8",
     "pyright>=1.1.390",
-    "pydantic>=2.9",
 ]
 
 [tool.pytest.ini_options]

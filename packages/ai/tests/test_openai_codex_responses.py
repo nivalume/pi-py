@@ -1154,7 +1154,7 @@ async def test_explicit_websocket_without_package(monkeypatch: pytest.MonkeyPatc
         codex_model(), hello_context(), {"api_key": mock_token(), "transport": "websocket"}
     ).result()
     assert result.stop_reason == "error"
-    assert "pip install pi-ai[websocket]" in (result.error_message or "")
+    assert 'pip install "pi-ai-python[websocket]"' in (result.error_message or "")
 
     sse.add(sse_response())
     result = await codex.stream(

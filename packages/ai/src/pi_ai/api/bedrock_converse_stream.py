@@ -3,7 +3,7 @@
 Port of pi's ``api/bedrock-converse-stream.ts``, which drives the AWS SDK's
 ``ConverseStreamCommand``. This module uses the AWS SDK for Python: a boto3
 ``bedrock-runtime`` client and ``converse_stream``. boto3 is an optional extra
-(``pip install "pi-ai[bedrock]"``).
+(``pip install "pi-ai-python[bedrock]"``).
 
 boto3 is synchronous, so each request runs the call and iterates its
 ``EventStream`` in a worker thread; events reach the event loop in batches.
@@ -134,7 +134,7 @@ THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
 REDACTED_THINKING_PLACEHOLDER = "[Reasoning redacted]"
 _AMBIENT_AUTH_MARKER = "<authenticated>"
 BOTO3_INSTALL_HINT = (
-    'Amazon Bedrock requires the AWS SDK for Python (boto3). Install it with: pip install "pi-ai[bedrock]"'
+    'Amazon Bedrock requires the AWS SDK for Python (boto3). Install it with: pip install "pi-ai-python[bedrock]"'
 )
 
 

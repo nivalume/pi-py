@@ -1,6 +1,6 @@
 """JSON encode/decode with an optional ``orjson`` fast path.
 
-Install ``pi-ai[fast]`` to use orjson for SSE chunk decoding and request bodies.
+Install ``pi-ai-python[fast]`` to use orjson for SSE chunk decoding and request bodies.
 Output is compact and UTF-8 in both cases.
 """
 

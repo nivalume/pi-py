@@ -1,19 +1,21 @@
 # pi-py
 
-[pi](https://github.com/earendil-works/pi) 核心库的 Python 实现，包含两个包：
+[pi](https://github.com/earendil-works/pi) 核心库的 Python 实现，包含两个模块：
 
-| 包 | 导入名 | 对应上游 | 功能 |
-| --- | --- | --- | --- |
-| [`pi-ai`](packages/ai/README.md) | `pi_ai` | `@earendil-works/pi-ai` | 统一的 LLM API：provider 集合、鉴权解析（API key / OAuth）、流式事件、token 与费用统计、工具调用、跨 provider 上下文切换、图像生成、分类 |
-| [`pi-agent-core`](packages/agent/README.md) | `pi_agent` | `@earendil-works/pi-agent-core` | 有状态 Agent：工具执行（并行/串行）、steering 与 follow-up 队列、生命周期事件、钩子 |
+| Import 名 | 对应上游 | 作用 |
+| --- | --- | --- |
+| [`pi_ai`](packages/ai/README.md) | `@earendil-works/pi-ai` | 统一的 LLM API：provider 集合、鉴权解析（API key / OAuth）、流式事件、token 与费用统计、工具调用、跨 provider 上下文切换、图像生成、分类 |
+| [`pi_agent`](packages/agent/README.md) | `@earendil-works/pi-agent-core` | 有状态 Agent：工具执行（并行/串行）、steering 与 follow-up 队列、生命周期事件、钩子 |
+
+两者在 PyPI 上作为同一个包 `pi-ai-python` 发布。
 
 ## 安装
 
 ```bash
-pip install pi-ai pi-agent-core          # 依赖 httpx 和官方 SDK：anthropic、openai、google-genai
-pip install "pi-ai[bedrock]"             # 可选：boto3，用于 Amazon Bedrock
-pip install "pi-ai[fast]"                # 可选：orjson 加速 JSON 解码
-pip install "pi-ai[all]"                 # 可选：orjson + websockets + pydantic + boto3
+pip install pi-ai-python                  # 依赖 httpx 和官方 SDK：anthropic、openai、google-genai
+pip install "pi-ai-python[bedrock]"       # 可选：boto3，用于 Amazon Bedrock
+pip install "pi-ai-python[fast]"          # 可选：orjson 加速 JSON 解码
+pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3
 ```
 
 开发环境：
@@ -95,7 +97,7 @@ provider id）。`pi_ai.serialization` 读写 pi 的 camelCase JSON，会话记�
 
 * **使用厂商官方 SDK**：与 pi 一致，Anthropic、OpenAI（Chat Completions、Responses、Azure、OpenRouter 图片）、
   Google（Gemini、Vertex）和 Bedrock 适配器分别使用官方 SDK `anthropic`、`openai`、`google-genai`、`boto3`
-  （`pi-ai[bedrock]`），各 SDK 客户端共用每个事件循环一个的 `httpx.AsyncClient` 连接池。
+  （`pi-ai-python[bedrock]`），各 SDK 客户端共用每个事件循环一个的 `httpx.AsyncClient` 连接池。
   pi 本身不经 SDK 调用的 API（Mistral、OpenAI Codex、pi-messages、分类器）直接使用 `httpx`。
 * **性能**：slots 数据类、低分配的事件队列、包装流之间零拷贝转发、增量式部分 JSON 解析
   （大参数工具调用比逐 delta 全量重解析快约 60 倍）、流式文本线性时间累加、可选 orjson、编译并缓存的参数校验器。
@@ -105,7 +107,7 @@ provider id）。`pi_ai.serialization` 读写 pi 的 camelCase JSON，会话记�
 * **Python 友好的扩展**：Pydantic 模型作为工具参数、`@agent_tool` 从类型注解生成工具、`Agent.events()` 异步迭代器、
   `FileCredentialStore`（pi 的 `auth.json` 格式，带跨进程锁）、事件循环外创建的流、`async with` 关闭流。
 
-详细文档：[pi-ai](packages/ai/README.md)、[pi-agent-core](packages/agent/README.md)。
+详细文档：[pi_ai](packages/ai/README.md)、[pi_agent](packages/agent/README.md)。
 
 ## 许可证
 

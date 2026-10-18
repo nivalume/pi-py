@@ -6,7 +6,7 @@ Two transports:
   when a zstd codec is available (Python 3.14 ``compression.zstd`` or the ``zstandard``
   package), like the official Codex client.
 * WebSocket (``transport="websocket"``, ``"websocket-cached"`` or ``"auto"``, the default),
-  using the optional ``websockets`` package (``pip install pi-ai[websocket]``). Connections are
+  using the optional ``websockets`` package (``pip install "pi-ai-python[websocket]"``). Connections are
   pooled per session and account; ``websocket-cached``/``auto`` send only the new input items
   with ``previous_response_id`` when the request extends the previous one. Failures before the
   first event fall back to SSE, and the session then stays on SSE.
@@ -108,7 +108,8 @@ OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06"
 SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000
 SESSION_WEBSOCKET_MAX_AGE_MS = 55 * 60 * 1000
 WEBSOCKET_UNAVAILABLE_MESSAGE = (
-    "WebSocket transport requires the optional 'websockets' package. Install it with: pip install pi-ai[websocket]"
+    "WebSocket transport requires the optional 'websockets' package. Install it with: "
+    'pip install "pi-ai-python[websocket]"'
 )
 
 _CODEX_RESPONSE_STATUSES = frozenset({"completed", "incomplete", "failed", "cancelled", "queued", "in_progress"})

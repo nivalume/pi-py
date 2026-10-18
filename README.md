@@ -1,13 +1,20 @@
 # pi-py
 
-Python port of [pi](https://github.com/earendil-works/pi)'s core libraries:
+Python port of [pi](https://github.com/earendil-works/pi)'s core libraries, published on
+PyPI as one package, `pi-ai-python`, with two import packages:
 
-| Package | Import | Upstream | What it does |
-| --- | --- | --- | --- |
-| [`pi-ai`](packages/ai/README.md) | `pi_ai` | `@earendil-works/pi-ai` | Unified LLM API: provider collections, auth resolution (API keys, OAuth), streaming events, token and cost tracking, tool calling, cross-provider context hand-off, image generation, classification |
-| [`pi-agent-core`](packages/agent/README.md) | `pi_agent` | `@earendil-works/pi-agent-core` | Stateful agent: tool execution (parallel or sequential), steering and follow-up queues, lifecycle events, hooks |
+| Import | Upstream | What it does |
+| --- | --- | --- |
+| [`pi_ai`](https://github.com/nivalume/pi-py/blob/main/packages/ai/README.md) | `@earendil-works/pi-ai` | Unified LLM API: provider collections, auth resolution (API keys, OAuth), streaming events, token and cost tracking, tool calling, cross-provider context hand-off, image generation, classification |
+| [`pi_agent`](https://github.com/nivalume/pi-py/blob/main/packages/agent/README.md) | `@earendil-works/pi-agent-core` | Stateful agent: tool execution (parallel or sequential), steering and follow-up queues, lifecycle events, hooks |
 
-中文说明见 [README.zh-CN.md](README.zh-CN.md)。
+```bash
+pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
+pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
+pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3
+```
+
+中文说明见 [README.zh-CN.md](https://github.com/nivalume/pi-py/blob/main/README.zh-CN.md)。
 
 ```python
 import asyncio
@@ -81,7 +88,7 @@ definitions and `auth.json` credential files are interchangeable with TypeScript
 * **Official vendor SDKs.** As in pi, the Anthropic, OpenAI (Chat Completions,
   Responses, Azure, OpenRouter images), Google (Gemini, Vertex) and Bedrock adapters use
   the vendors' official SDKs: `anthropic`, `openai`, `google-genai` and `boto3`
-  (`pi-ai[bedrock]`). The SDK clients share one pooled `httpx.AsyncClient` per event loop.
+  (`pi-ai-python[bedrock]`). The SDK clients share one pooled `httpx.AsyncClient` per event loop.
   APIs that pi calls without an SDK (Mistral, OpenAI Codex, pi-messages, classifiers)
   use `httpx` directly.
 * **Fast streaming path.** Slotted data classes, an allocation-light event queue,
@@ -105,7 +112,7 @@ definitions and `auth.json` credential files are interchangeable with TypeScript
 ## Development
 
 ```bash
-uv sync                      # create .venv with both packages (editable) and dev tools
+uv sync                      # create .venv with the package (editable) and dev tools
 uv run pytest                # run all tests (offline; HTTP is mocked)
 uv run ruff check . && uv run ruff format --check .
 uv run pyright

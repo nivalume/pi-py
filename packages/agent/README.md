@@ -1,12 +1,12 @@
-# pi-agent-core (Python)
+# pi_agent
 
-Stateful agent with tool execution and event streaming, built on [`pi-ai`](../ai/README.md).
+Stateful agent with tool execution and event streaming, built on [`pi_ai`](../ai/README.md). Installed with `pip install pi-ai-python`.
 Python port of `@earendil-works/pi-agent-core`; behavior and event order match the TypeScript package.
 
 ## Installation
 
 ```bash
-pip install pi-agent-core          # pulls in pi-ai
+pip install pi-ai-python             # contains both pi_agent and pi_ai
 ```
 
 ## Quick start

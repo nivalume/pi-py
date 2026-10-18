@@ -458,7 +458,7 @@ async def test_missing_boto3_ends_the_stream_with_install_hint(monkeypatch, keys
     message = await _stream()
     assert message.stop_reason == "error"
     assert message.error_message == BOTO3_INSTALL_HINT
-    assert 'pip install "pi-ai[bedrock]"' in BOTO3_INSTALL_HINT
+    assert 'pip install "pi-ai-python[bedrock]"' in BOTO3_INSTALL_HINT
 
 
 # -- response stream -------------------------------------------------------------------------------------
