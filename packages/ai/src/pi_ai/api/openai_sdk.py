@@ -177,6 +177,15 @@ async def openai_request(call: Callable[[], Awaitable[_T]], options: Mapping[str
     )
 
 
+# Streams are decoded by the SDK, as upstream iterates the JS SDK's ``Stream``. The SDK's SSE
+# decoder is the throughput limit of these adapters: about 70k events/s in
+# ``benchmarks/bench_stream.py`` versus about 120k with pi's ``iter_sse`` + ``fastjson``.
+# Two ways to recover that speed, neither taken:
+# - overriding ``AsyncOpenAI._make_sse_decoder`` relies on a private SDK method that can change
+#   in any release;
+# - parsing ``raw.http_response`` with pi's own SSE parser uses only public API (the Anthropic
+#   adapter does this), but stops using the SDK's stream decoding.
+# Real model output arrives far slower than either rate, so per-event cost rarely matters.
 def open_sdk_stream(raw: Any) -> AsyncStream[Any]:
     """The event stream of a ``with_raw_response`` streaming call, yielding plain JSON."""
     return raw.parse(to=_RawStream)
