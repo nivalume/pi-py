@@ -1,9 +1,12 @@
 name: Release
 
-# Push a tag like v1.3.0 to publish that version to PyPI.
+# Publish the version in pyproject.toml to PyPI, either by pushing a tag like v1.3.0 or
+# by running this workflow manually (Actions -> Release -> Run workflow), which then
+# creates the tag itself.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,17 +14,25 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Check that the tag matches the package version
+      - name: Read the package version
+        id: version
         run: |
           version=$(uv version --short)
-          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
             echo "Tag ${GITHUB_REF_NAME} does not match pyproject.toml version ${version}" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" != "tag" ] && git ls-remote --exit-code --tags origin "v${version}" >/dev/null; then
+            echo "Tag v${version} already exists; bump the version in pyproject.toml first" >&2
             exit 1
           fi
       - run: uv sync --locked
@@ -51,3 +62,16 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  tag:
+    # Manual runs tag the published commit.
+    if: github.ref_type != 'tag'
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          git tag "v${{ needs.build.outputs.version }}"
+          git push origin "v${{ needs.build.outputs.version }}"
