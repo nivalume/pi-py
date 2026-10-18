@@ -18,6 +18,7 @@ from durable_harness_support import (
     open_chat,
     open_tasks,
     settled,
+    wait_for,
 )
 from durable_session_support import (
     STORAGE_BACKENDS,
@@ -235,7 +236,8 @@ async def test_lets_a_new_harness_open_the_same_storage_once_close_resolved(tmp_
     first = await open_tasks(await open_sqlite_storage(path), [stubborn])
     id = await start(await first.harness.root(context), stubborn)
     first.harness.resume()
-    await eventually(lambda: len(log) == 1)
+    # SQLite runs on executor threads: wait in real time, not a fixed number of turns.
+    await wait_for(lambda: len(log) == 1)
 
     async def close_and_log() -> None:
         await first.harness.close(context)

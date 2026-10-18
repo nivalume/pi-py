@@ -21,7 +21,7 @@ from pi_ai.utils.schema import is_pydantic_model, parameters_schema
 from pi_ai.utils.validation import check_schema, schema_errors, validate_tool_arguments
 from pi_chord.context import Context, await_with_context
 from pi_chord.delta import overlap
-from pi_chord.json import copy_json
+from pi_chord.json import UNDEFINED, copy_json
 from pi_chord.output import (
     PROGRESS_BYTES_PER_SECOND,
     OutputBuffer,
@@ -317,8 +317,10 @@ def _validate(tool: ToolRegistration, call: ToolCall, args: Any) -> dict[str, An
     """Arguments validated and coerced against the implementation's schema: ``{"args", "json"}`` or ``{"error"}``.
 
     ``args`` is what ``execute()`` receives (a model instance for Pydantic parameters), ``json`` its JSON.
+    A property repair set to ``UNDEFINED`` is absent, as JavaScript's schema check treats ``undefined``.
     """
     try:
+        args = _omit_undefined(args)
         validated = validate_tool_arguments(tool, dataclasses.replace(call, arguments=args))
     except Exception as error:
         return {"error": error_message(error)}
@@ -510,9 +512,34 @@ async def _run(
         await runtime.commit(change, task_context)
         return created[0]
 
-    async def execute_tool(
+    def execute_tool(
         name: str, tool_args: Any, call_context: Context, key: str | None, nested_progress: bool | None
-    ) -> NestedToolExecutionResult:
+    ) -> asyncio.Future[NestedToolExecutionResult]:
+        """Eager (section 5 of DESIGN.md): the checks, the key, and the admission start at the call, as upstream's
+        ``async`` body runs them before its first ``await``; a caller that returns right after still has it awaited
+        by cleanup."""
+        try:
+            nested_key, admission = start_nested(name, tool_args, call_context, key, nested_progress)
+        except Exception as error:
+            failed: asyncio.Future[NestedToolExecutionResult] = asyncio.get_running_loop().create_future()
+            failed.set_exception(error)
+            return failed
+
+        async def finish() -> NestedToolExecutionResult:
+            id = await admission
+            settled = await runtime.wait_for_task(id, call_context)
+            stored = await runtime.snapshot(NestedCallDoc, runtime.task_id, nested_key, call_context)
+            result = None if stored is None else stored.get("result")
+            # A copy the tool may change; a nested call the scheduler faulted or orphaned stored none.
+            if result is None:
+                return _fallback_result(id, name, settled["state"]["outcome"])
+            return _nested_from_json(result)
+
+        return asyncio.ensure_future(finish())
+
+    def start_nested(
+        name: str, tool_args: Any, call_context: Context, key: str | None, nested_progress: bool | None
+    ) -> tuple[str, asyncio.Future[TaskId[Any]]]:
         if state["ended"]:
             raise RuntimeError(f"Tool call {call.id} has settled")
         if key is not None:
@@ -549,14 +576,7 @@ async def _run(
         # Registered now, so cleanup waits for it.
         admission = asyncio.ensure_future(admit())
         admissions.append(admission)
-        id = await admission
-        settled = await runtime.wait_for_task(id, call_context)
-        stored = await runtime.snapshot(NestedCallDoc, runtime.task_id, nested_key, call_context)
-        result = None if stored is None else stored.get("result")
-        # A copy the tool may change; a nested call the scheduler faulted or orphaned stored none.
-        if result is None:
-            return _fallback_result(id, name, settled["state"]["outcome"])
-        return _nested_from_json(result)
+        return nested_key, admission
 
     api = _ToolApi(runtime, call, reported, progress, state, execute_tool, create_task)
     ending: dict[str, Any] = _COMPLETED
@@ -744,7 +764,7 @@ async def _final_result(
         input["kind"] == "nested"
         and tool.structured_output_schema is not None
         and final.get("isError") is True
-        and final.get("structuredOutput") is None
+        and not _defined(final, "structuredOutput")
         and not any(diagnostic["severity"] == "error" for diagnostic in [*final.get("diagnostics", []), *harness])
     ):
         text = "\n".join(item.text for item in bounded if isinstance(item, TextContent))
@@ -757,13 +777,14 @@ def _structured_output_error(tool: ToolRegistration, result: dict[str, Any]) -> 
     """Why a result's ``structuredOutput`` breaks the tool's contract, or ``None`` when it keeps it."""
     schema = tool.structured_output_schema
     value = result.get("structuredOutput")
+    # JSON null is a value (a ``Type.Null()`` schema returns it); only an absent key is "no structuredOutput".
     if schema is None:
         return (
             None
-            if value is None
+            if not _defined(result, "structuredOutput")
             else f"Tool {tool.name} returned structuredOutput but declares no structuredOutputSchema"
         )
-    if value is None:
+    if not _defined(result, "structuredOutput"):
         return None if result.get("isError") is True else f"Tool {tool.name} returned no structuredOutput"
     plain = parameters_schema(schema) if not isinstance(schema, dict) else schema
     if check_schema(plain, value):
@@ -850,10 +871,11 @@ async def _settle(
 def _nested_result(task_id: TaskId[Any], result: Any, duration_ms: float | None) -> dict[str, Any]:
     """A nested call's result, as stored and returned: strict JSON, without ``output`` and ``control``."""
     nested: dict[str, Any] = {"taskId": task_id}
-    if result.get("structuredOutput") is not None:
+    # Upstream's ``copyJson`` drops only undefined properties: a JSON null result or details is kept.
+    if _defined(result, "structuredOutput"):
         nested["structuredOutput"] = _plain_json(result["structuredOutput"])
     nested["isError"] = result.get("isError", False)
-    if result.get("details") is not None:
+    if _defined(result, "details"):
         nested["details"] = _plain_json(result["details"])
     nested["diagnostics"] = [_plain_json(diagnostic) for diagnostic in result.get("diagnostics", [])]
     if result.get("usage") is not None:
@@ -861,6 +883,20 @@ def _nested_result(task_id: TaskId[Any], result: Any, duration_ms: float | None)
     if duration_ms is not None:
         nested["durationMs"] = duration_ms
     return copy_json(nested, omit_undefined_properties=True)  # type: ignore[return-value]
+
+
+def _omit_undefined(value: Any) -> Any:
+    """``value`` without the dict entries (at any depth) whose value is ``UNDEFINED``; other values unchanged."""
+    if isinstance(value, dict):
+        return {key: _omit_undefined(item) for key, item in value.items() if item is not UNDEFINED}
+    if isinstance(value, list):
+        return [_omit_undefined(item) for item in value]
+    return value
+
+
+def _defined(result: Any, key: str) -> bool:
+    """Whether ``result[key]`` is not JS ``undefined``: present and not ``UNDEFINED`` (``None`` is JSON null)."""
+    return key in result and result[key] is not UNDEFINED
 
 
 def _plain_json(value: Any) -> Any:

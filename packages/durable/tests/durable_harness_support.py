@@ -43,6 +43,7 @@ __all__ = [
     "add_task",
     "add_tool",
     "all_entries",
+    "assert_match",
     "assistant",
     "chat_setup",
     "completed",
@@ -51,10 +52,14 @@ __all__ = [
     "describe_message",
     "eventually",
     "flush",
+    "gated",
+    "match_object",
     "open_chat",
     "open_harness",
     "open_tasks",
+    "race_aborted",
     "settled",
+    "StorageSpy",
     "system",
     "text_of",
     "tool",
@@ -400,3 +405,91 @@ def tools_named(setup: ChatSetup, *names: str) -> list[Any]:
             raise RuntimeError(f"Tool {name} is not installed")
         found.append(match["tool"])
     return found
+
+
+def match_object(actual: Any, expected: Any) -> bool:
+    """Vitest's ``toMatchObject``: ``expected``'s dict keys (recursively) are in ``actual`` with matching values.
+
+    Lists match element by element with equal lengths; a dataclass in ``actual`` matches a dict of its
+    attribute names; anything else compares with ``==``.
+    """
+    if isinstance(expected, dict):
+        for key, value in expected.items():
+            if isinstance(actual, dict):
+                if key not in actual or not match_object(actual[key], value):
+                    return False
+            elif not hasattr(actual, key) or not match_object(getattr(actual, key), value):
+                return False
+        return isinstance(actual, dict) or hasattr(actual, "__dataclass_fields__")
+    if isinstance(expected, list) and isinstance(actual, (list, tuple)):
+        return len(actual) == len(expected) and all(match_object(a, e) for a, e in zip(actual, expected, strict=True))
+    return actual == expected
+
+
+def assert_match(actual: Any, expected: Any) -> None:
+    """Assert :func:`match_object`, showing both values."""
+    assert match_object(actual, expected), f"{actual!r} does not match {expected!r}"
+
+
+class Gated:
+    """A faux response held until ``release()`` or cancellation; ``reached`` resolves when the request is sent.
+
+    Upstream's per-file ``gated(message)`` helper: ``step`` races the gate against the request's signal.
+    """
+
+    def __init__(self, message: Any) -> None:
+        loop = asyncio.get_running_loop()
+        self.reached: asyncio.Future[None] = loop.create_future()
+        self._gate: asyncio.Future[None] = loop.create_future()
+        self._message = message
+
+    async def step(self, _request: Any, options: Any, *_rest: Any) -> Any:
+        if not self.reached.done():
+            self.reached.set_result(None)
+        cancelled = asyncio.ensure_future(aborted(options["signal"]))
+        try:
+            await asyncio.wait([self._gate, cancelled], return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if not cancelled.done():
+                cancelled.cancel()
+        if cancelled.done() and not cancelled.cancelled():
+            cancelled.result()
+        return self._message
+
+    def release(self) -> None:
+        if not self._gate.done():
+            self._gate.set_result(None)
+
+
+def gated(message: Any) -> Gated:
+    return Gated(message)
+
+
+async def race_aborted(awaitable: Awaitable[Any], signal: AbortSignal) -> Any:
+    """``Promise.race([awaitable, aborted(signal)])``: the awaitable's result, or the signal's reason raised.
+
+    A shared gate passed in is never cancelled.
+    """
+    target = asyncio.ensure_future(awaitable)
+    cancelled = asyncio.ensure_future(aborted(signal))
+    try:
+        await asyncio.wait([target, cancelled], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        if not cancelled.done():
+            cancelled.cancel()
+    if target.done():
+        return target.result()
+    return cancelled.result()
+
+
+class StorageSpy:
+    """Delegates every storage method to ``inner``; subclass it to observe or hold some of them.
+
+    Upstream rebinds methods of a storage instance (``storage.commit = ...``); the Python backends are slotted.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)

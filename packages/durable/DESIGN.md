@@ -342,10 +342,12 @@ API shape:
 - **Eager methods.** As the Session's (section 5), the Harness and conversation methods whose upstream body
   admits work to the Session line before its first `await` are plain `def`s returning an already started
   `asyncio.Future`: `Conversation.configure/submit/reset/compact/commit/context/entries/fork/abort/
-  wait_for_idle/agent`, `Harness.root/conversation/create_conversation/get_task/inspect/submission/
+  wait_for_idle/agent/view_state/watch` (the view attachment is admitted at the call, so a `close()` that
+  follows cannot overtake it), `Harness.root/conversation/create_conversation/get_task/inspect/submission/
   abort_submission/abort_task/retry_task/wait_for_task/wait_for_idle/task_graph/watch_task_graph`,
-  `Submission.status/wait/abort`, and `ToolExecutionApi.details` (its checks and the update run at the
-  call). The protocols in `harness/types.py` declare these `def ... -> Awaitable[T]`. Helpers in
+  `Submission.status/wait/abort`, `ToolExecutionApi.details` (its checks and the update run at the
+  call) and `ToolExecutionApi.execute_tool` (its checks, key and admission start at the call, so a caller
+  that returns right after still has the call admitted and aborted by cleanup). The protocols in `harness/types.py` declare these `def ... -> Awaitable[T]`. Helpers in
   `harness/util.py`: `eager(awaitable, then)` keeps a started operation as a future; `chain(future, then,
   context=None)` is `promise.then(then)` through done callbacks (no extra task hop; a cancelled `context`
   rejects only the wait).
@@ -395,6 +397,14 @@ Test helpers (`tests/durable_harness_support.py`, ports of `harness-support.ts`,
   (raises the reason when it aborts), `unanswered()` (a faux step that blocks until cancelled; `reached`
   resolves once the request was sent). `durable_session_support.deferred()`/`resolve()` are gates.
 - `all_entries(conversation)`, `text_of(message)`, `describe_message`, `tools_named(setup, *names)`.
+- `match_object(actual, expected)` / `assert_match(actual, expected)`: Vitest's `toMatchObject` (dict keys
+  recursively; a dataclass matches a dict of its attribute names); `gated(message)`: a faux step held until
+  `release()` or cancellation, with `reached`.
+- `race_aborted(awaitable, signal)`: `Promise.race([awaitable, aborted(signal)])` (never cancels a shared gate);
+  `StorageSpy(inner)`: delegates every storage method, subclass it to observe or hold some (upstream rebinds
+  methods of a storage instance; the Python backends are slotted).
+- SQLite storage runs on executor threads, so waits on it poll in real time (`wait_for`, not `eventually`,
+  whose fixed number of turns suffices for upstream's synchronous `node:sqlite`).
 - Deterministic driving: a Harness schedules nothing until `harness.resume()` (or a `submit`, `compact`,
   `abort`, `wait_for_task` or `wait_for_idle`, which resume); `ControlledStorage(MemoryStorage(), STORAGE_BACKENDS["memory"])` gives
   `hold_commits()` (returns a gate with `entered`/`release()` to occupy the Session line),

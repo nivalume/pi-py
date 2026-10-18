@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
@@ -102,7 +103,8 @@ class ConversationViews:
 
         def on_close() -> None:
             self._closed = True
-            for mount in self._mounts.values():
+            # A copy: an observer's close can detach it, which drops its mount (JavaScript Maps allow that mid-loop).
+            for mount in list(self._mounts.values()):
                 for observer in list(mount.observers):
                     contained(lambda observer=observer: observer.close_session(self._session.failure), self.report)
             self._mounts.clear()
@@ -113,29 +115,41 @@ class ConversationViews:
         """Report an observer's listener error through the Harness."""
         self._session.report(error)
 
-    async def state(self, id: ConversationId, context: Context) -> AttachedReplicatedState[ConversationView]:
-        """A disposable read-only Chord state of the view."""
-        observer, detach = await self.attach(
-            id, lambda value, release, _storage: CommittedStateSource(value, release), context
-        )
-        try:
-            return replicated_state(observer, ReplicatedStateSourceOptions(on_error=self._session.report))
-        except BaseException:
-            detach()
-            raise
+    def state(self, id: ConversationId, context: Context) -> asyncio.Future[AttachedReplicatedState[ConversationView]]:
+        """A disposable read-only Chord state of the view.
 
-    async def watch(self, id: ConversationId, context: Context) -> WatchHandle[ConversationView]:
-        """A serialized exact-frame watch of the view; cancelling ``context`` stops it."""
-        observer, _detach = await self.attach(
+        Eager (section 5 of DESIGN.md): the attachment is admitted to the Session line at the call, as upstream's
+        ``async`` body does before its first ``await``, so a ``close()`` that follows the call cannot overtake it.
+        """
+        attached = self.attach(id, lambda value, release, _storage: CommittedStateSource(value, release), context)
+
+        async def finish() -> AttachedReplicatedState[ConversationView]:
+            observer, detach = await attached
+            try:
+                return replicated_state(observer, ReplicatedStateSourceOptions(on_error=self._session.report))
+            except BaseException:
+                detach()
+                raise
+
+        return asyncio.ensure_future(finish())
+
+    def watch(self, id: ConversationId, context: Context) -> asyncio.Future[WatchHandle[ConversationView]]:
+        """A serialized exact-frame watch of the view; cancelling ``context`` stops it. Eager, as :meth:`state`."""
+        attached = self.attach(
             id, lambda value, release, _storage: CommittedWatch(value, release, self._session.report), context
         )
-        signal = context.abort_signal
-        if signal is not None and signal.aborted:
-            observer.cancel()
-            context.throw_if_aborted()
-        if signal is not None:
-            observer.observe_cancellation(signal)
-        return observer
+
+        async def finish() -> WatchHandle[ConversationView]:
+            observer, _detach = await attached
+            signal = context.abort_signal
+            if signal is not None and signal.aborted:
+                observer.cancel()
+                context.throw_if_aborted()
+            if signal is not None:
+                observer.observe_cancellation(signal)
+            return observer
+
+        return asyncio.ensure_future(finish())
 
     def attach(
         self,
