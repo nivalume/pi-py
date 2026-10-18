@@ -51,16 +51,23 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # One distribution, two import packages.
-packages = ["packages/ai/src/pi_ai", "packages/agent/src/pi_agent", "packages/chord/src/pi_chord"]
+packages = [
+    "packages/ai/src/pi_ai",
+    "packages/agent/src/pi_agent",
+    "packages/chord/src/pi_chord",
+    "packages/durable/src/pi_durable",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "packages/ai/src",
     "packages/agent/src",
     "packages/chord/src",
+    "packages/durable/src",
     "packages/ai/tests",
     "packages/agent/tests",
     "packages/chord/tests",
+    "packages/durable/tests",
     "packages/ai/README.md",
     "packages/agent/README.md",
     "README.md",
@@ -83,13 +90,13 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests"]
+testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests", "packages/durable/tests"]
 addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-src = ["packages/ai/src", "packages/agent/src", "packages/chord/src"]
+src = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src"]
 extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
@@ -113,10 +120,10 @@ ignore = [
 "packages/*/tests/**" = ["ASYNC109", "ASYNC110", "RUF043"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pi_ai", "pi_agent", "pi_chord"]
+known-first-party = ["pi_ai", "pi_agent", "pi_chord", "pi_durable"]
 
 [tool.pyright]
-include = ["packages/ai/src", "packages/agent/src", "packages/chord/src"]
+include = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src"]
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.11"
