@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -54,12 +55,15 @@ class AbortSignal:
     ``loop.call_soon_threadsafe`` (the helpers in this module already do).
     """
 
-    __slots__ = ("__weakref__", "_aborted", "_listeners", "_lock", "_reason")
+    __slots__ = ("__weakref__", "_aborted", "_dependents", "_listeners", "_lock", "_reason")
 
     def __init__(self) -> None:
         self._aborted = False
         self._reason: Any = None
         self._listeners: list[_Listener] | None = None
+        #: Signals created by :meth:`any` from this one, held weakly like JavaScript's
+        #: dependent signals, so deriving from a long-lived signal does not leak.
+        self._dependents: weakref.WeakSet[AbortSignal] | None = None
         self._lock = threading.Lock()
 
     @property
@@ -103,11 +107,14 @@ class AbortSignal:
             self._aborted = True
             self._reason = AbortError(reason) if reason is None or not isinstance(reason, BaseException) else reason
             listeners, self._listeners = self._listeners, None
+            dependents, self._dependents = self._dependents, None
         for listener in listeners or ():
             try:
                 listener()
             except Exception:  # listeners must not break abort propagation
                 pass
+        for dependent in list(dependents or ()):
+            dependent._abort(self._reason)
 
     async def wait(self) -> Any:
         """Wait until the signal aborts and return its reason."""
@@ -140,16 +147,27 @@ class AbortSignal:
 
     @staticmethod
     def any(signals: Iterable[AbortSignal | None]) -> AbortSignal:
-        """A signal that aborts when any of ``signals`` aborts."""
+        """A signal that aborts when any of ``signals`` aborts.
+
+        The sources hold the new signal weakly: once it is no longer referenced it is
+        dropped from them, however long they live.
+        """
         active = [signal for signal in signals if signal is not None]
-        controller = AbortController()
+        combined = AbortSignal()
         for signal in active:
             if signal.aborted:
-                controller.abort(signal.reason)
-                return controller.signal
+                combined._abort(signal.reason)
+                return combined
         for signal in active:
-            signal.add_listener(lambda signal=signal: controller.abort(signal.reason))
-        return controller.signal
+            with signal._lock:
+                if not signal._aborted:
+                    if signal._dependents is None:
+                        signal._dependents = weakref.WeakSet()
+                    signal._dependents.add(combined)
+                    continue
+            combined._abort(signal.reason)
+            break
+        return combined
 
     def __repr__(self) -> str:
         return f"AbortSignal(aborted={self._aborted})"

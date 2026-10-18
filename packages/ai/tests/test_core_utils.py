@@ -161,6 +161,25 @@ async def test_signal_any_and_timeout() -> None:
     assert timed.aborted and isinstance(timed.reason, TimeoutError)
 
 
+def test_signal_any_holds_derived_signals_weakly() -> None:
+    import gc
+    import weakref
+
+    parent = AbortController()
+    derived = [AbortSignal.any([parent.signal]) for _ in range(100)]
+    kept = derived[0]
+    refs = [weakref.ref(signal) for signal in derived]
+    del derived
+    gc.collect()
+    assert sum(ref() is not None for ref in refs) == 1
+    listener_calls: list[Any] = []
+    kept.add_listener(lambda: listener_calls.append(kept.reason))
+    nested = AbortSignal.any([kept])
+    parent.abort("stop")
+    assert kept.aborted and nested.aborted and str(nested.reason) == "stop"
+    assert len(listener_calls) == 1
+
+
 def test_signal_listeners_and_removal() -> None:
     controller = AbortController()
     calls: list[str] = []
