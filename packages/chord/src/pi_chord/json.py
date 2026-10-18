@@ -9,6 +9,7 @@ in the TypeScript original.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any, Final, TypeAlias
 
 __all__ = [
@@ -50,6 +51,14 @@ class _Undefined:
 
 #: Marks a dict entry to drop with ``copy_json(..., omit_undefined_properties=True)``.
 UNDEFINED: Final = _Undefined()
+
+# Container subclasses that are still JSON, mapped to a function returning their plain copy.
+# pi_chord.delta registers its drafts here, so copy_json(draft) works as copyJson(draft) does.
+_DETACHERS: dict[type, Callable[[Any], JsonValue]] = {}
+
+
+def _register_json_container(kind: type, detach: Callable[[Any], JsonValue]) -> None:
+    _DETACHERS[kind] = detach
 
 
 def copy_json(value: Any, *, omit_undefined_properties: bool = False) -> JsonValue:
@@ -95,6 +104,9 @@ def _copy(value: Any, ancestors: set[int], omit_undefined: bool) -> JsonValue:
             return result
         finally:
             ancestors.discard(marker)
+    detach = _DETACHERS.get(kind)
+    if detach is not None:
+        return detach(value)
     if value is UNDEFINED:
         raise TypeError("Value contains UNDEFINED and is not strict JSON")
     raise TypeError(f"Value contains a non-JSON {kind.__name__}; expected strict JSON")
@@ -122,4 +134,11 @@ def _check(value: Any, ancestors: set[int]) -> bool:
             return all(type(key) is str and _check(item, ancestors) for key, item in value.items())
         finally:
             ancestors.discard(marker)
+    detach = _DETACHERS.get(kind)
+    if detach is not None:
+        try:
+            detach(value)
+        except TypeError:
+            return False
+        return True
     return False
