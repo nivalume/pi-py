@@ -1,8 +1,7 @@
 """Port of ``test/memory-storage.test.ts``, plus smoke tests of the memory storage.
 
-The storage conformance suite (``testing/storage-conformance.ts``) that upstream registers here is
-ported separately and runs against :class:`MemoryStorage` too; the smoke tests below cover the
-basics until then.
+Upstream registers the storage conformance suite (``testing/storage-conformance.ts``) here;
+``register_storage_conformance`` below runs it against :class:`MemoryStorage`.
 """
 
 from __future__ import annotations
@@ -14,6 +13,7 @@ import pytest
 from pi_ai.types import TextContent, UserMessage
 from pi_chord.context import BACKGROUND_CONTEXT
 from pi_durable import ROOT_CONVERSATION_ID, MemoryStorage, StorageRequestError, id_from_number, seq_from_number
+from pi_durable.testing import register_storage_conformance
 from pi_durable.types import (
     AnyTaskRecord,
     ConversationId,
@@ -26,6 +26,13 @@ from pi_durable.types import (
 )
 
 context = BACKGROUND_CONTEXT
+
+
+async def _with_memory_storage(use: Any) -> None:
+    await use(MemoryStorage())
+
+
+register_storage_conformance(globals(), "MemoryStorage", _with_memory_storage)
 
 
 async def test_does_not_expose_retained_state_through_a_prepared_commit() -> None:

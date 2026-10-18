@@ -1,0 +1,1 @@
+{"format":1,"type":"record","seq":3,"ordinal":1,"payload":{"type":"task","value":{"id":6,"conversationId":1,"kind":"t.sleep","version":2,"input":null,"state":{"status":"sleeping","checkpoint":{"phase":"b"},"until":61000},"background":false,"abortRequested":true,"memos":{"m":[1,2]}}}}

@@ -1,7 +1,8 @@
 """Execution environment interfaces and helpers (port of ``env/index.ts``).
 
 The interfaces live in :mod:`pi_durable.env.types`; this package re-exports them with the UTF-8
-decoders and :class:`LineScanner`. The Node.js environment (``env/node.ts``) is a separate module.
+decoders and :class:`LineScanner`. The local environment (upstream ``env/node.ts``) is the separate
+:mod:`pi_durable.env.local`, not loaded here.
 """
 
 from __future__ import annotations

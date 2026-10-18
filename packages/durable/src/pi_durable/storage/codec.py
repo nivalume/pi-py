@@ -15,7 +15,9 @@ at its ownership boundary: it copies JSON and round-trips messages through the s
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -36,6 +38,8 @@ __all__ = [
     "encode_messages",
     "encode_ops",
     "encode_storage_write",
+    "json_parse",
+    "json_stringify",
 ]
 
 _MESSAGE_TYPES = (SystemMessage, UserMessage, AssistantMessage, ToolResultMessage)
@@ -202,3 +206,41 @@ def clone_value(value: Any) -> Any:
     if isinstance(value, _MESSAGE_TYPES):
         return _message(to_json_value(value))
     raise TypeError(f"Value contains a non-JSON {kind.__name__}; expected strict JSON")
+
+
+_SURROGATES = re.compile("[\ud800-\udfff]")
+_SURROGATE_PAIR = re.compile("[\ud800-\udbff][\udc00-\udfff]")
+
+
+def _escape_surrogate(match: re.Match[str]) -> str:
+    return f"\\u{ord(match.group()):04x}"
+
+
+def _join_surrogate_pair(match: re.Match[str]) -> str:
+    high, low = match.group()
+    return chr(0x10000 + ((ord(high) - 0xD800) << 10) + (ord(low) - 0xDC00))
+
+
+def json_stringify(value: Any) -> str:
+    """``JSON.stringify(value)`` for JSON values: the text TypeScript pi-durable writes.
+
+    Compact separators, non-ASCII kept as is, and lone UTF-16 surrogates escaped as ``\\udXXX`` (an
+    adjacent high/low surrogate pair is the character it encodes), so the text always encodes as
+    UTF-8 and indexed strings compare equal to JavaScript's. Tuples are arrays; non-finite floats and
+    values that are not JSON raise (:class:`ValueError`, :class:`TypeError`), cycles raise
+    :class:`ValueError`. Floats use Python's shortest round-trip form (``1e-07``, ``2.0``), which
+    JavaScript parses to the same number.
+    """
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    if _SURROGATES.search(text) is None:
+        return text
+    return _SURROGATES.sub(_escape_surrogate, _SURROGATE_PAIR.sub(_join_surrogate_pair, text))
+
+
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"Unexpected token {name} in JSON")
+
+
+def json_parse(text: str | bytes) -> Any:
+    """``JSON.parse(text)``: strict JSON, rejecting Python's ``NaN`` and ``Infinity`` extensions."""
+    return json.loads(text, parse_constant=_reject_constant)

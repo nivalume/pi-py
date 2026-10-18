@@ -25,7 +25,11 @@ from pi_durable import (
     hook,
     id_from_number,
 )
+from pi_durable.env import ExecutionEnv, FileSystem
+from pi_durable.env.local import LocalExecutionEnv
 from pi_durable.harness.types import CompactionResult, SubmissionDraft
+from pi_durable.storage.jsonl import JsonlStorage
+from pi_durable.storage.sqlite import SqliteStorage
 from pi_durable.types import (
     ContextEdit,
     ConversationId,
@@ -303,3 +307,13 @@ async def typed_waits(
 def memory_storage_is_a_storage() -> None:
     storage: Storage = MemoryStorage()
     del storage
+
+
+def builtin_backends_are_storages_and_environments(
+    sqlite: SqliteStorage, jsonl: JsonlStorage, local: LocalExecutionEnv
+) -> None:
+    storage: Storage = sqlite
+    storage = jsonl
+    env: ExecutionEnv = local
+    file_system: FileSystem = local
+    del storage, env, file_system

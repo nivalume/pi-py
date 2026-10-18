@@ -85,6 +85,7 @@ from .harness.types import (
     Wrap,
 )
 from .ids import id_from_number, seq_from_number
+from .session import create_session
 from .storage.memory import MemoryStorage
 from .tasks import define_task
 from .types import (
@@ -355,4 +356,6 @@ __all__ = [
     "TypedEntryDraft",
     "WatchEnd",
     "WatchHandle",
+    # session
+    "create_session",
 ]

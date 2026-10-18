@@ -38,11 +38,12 @@ async def apply_sqlite_migrations(
     current_version = migrations[-1].version if migrations else 0
 
     async def migrate(transaction: SqliteExecutor) -> None:
+        # Upstream's text, whitespace included: SQLite keeps it in `sqlite_schema`.
         await transaction.exec(
-            f"CREATE TABLE IF NOT EXISTS {table} ("
-            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
-            "version INTEGER NOT NULL CHECK (version >= 0)"
-            ") STRICT"
+            f"CREATE TABLE IF NOT EXISTS {table} (\n"
+            "\t\t\tsingleton INTEGER PRIMARY KEY CHECK (singleton = 1),\n"
+            "\t\t\tversion INTEGER NOT NULL CHECK (version >= 0)\n"
+            "\t\t) STRICT"
         )
         await transaction.run(f"INSERT OR IGNORE INTO {table} (singleton, version) VALUES (1, 0)")
         row = await transaction.get(f"SELECT version FROM {table} WHERE singleton = 1")

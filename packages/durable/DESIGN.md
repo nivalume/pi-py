@@ -38,7 +38,7 @@ Tests are `packages/durable/tests/test_<upstream-name>.py`.
 | `JsonValue` payloads in records (entry `data`, task input/checkpoint/result, memos, `detail`) | `Any` (must be strict JSON at runtime); `JsonValue`/`JsonObject` from `pi_chord.json` where upstream means storage-internal JSON (document values, cursors) | |
 | `Message` inside records (`EntryRecord["model"]`, `ContextEdit["messages"]`, `ContextView`) | `pi_ai` message dataclasses | `"model": [UserMessage("hi")]` |
 | `Op` | `pi_chord.delta.Op` tuples (`("s", ("count",), 2)`) | |
-| `Promise<T>` method | `async def` | |
+| `Promise<T>` method | `async def`; **eager** ones (§5) are `def ... -> Awaitable[T]` returning a started future | `storage.commit(...)`; `session.commit(...)` |
 | `Promise<T>` property (`closed`) | property returning an awaitable (`asyncio.Future`, awaitable many times) | `await session.closed` |
 | `T \| Promise<T>` callback results | `T \| Awaitable[T]`; implementations `await` when `inspect.isawaitable(result)` | `commit(change, context)` |
 | `JsonRepresentation<T>` | no computed type: the value types are the `TypedDict`s themselves, and values must be strict JSON (`pi_chord.json.copy_json` accepts them) | |
@@ -157,6 +157,18 @@ pi-ai accepts one for tool parameters); `Static<T>` has no Python counterpart, s
   `TaskRuntime.now/set_timer/report`, `Registry.install`). Commit/close listeners are synchronous
   and must not block. A TS Promise kept unawaited for ordering (e.g. `closed`) becomes an
   `asyncio.Future` created on the running loop. Never block the loop.
+- **Eager operations** (stage 2a). A JavaScript `async` function runs synchronously until its first
+  `await`, and a Promise-returning method does its work before it returns; a Python coroutine does
+  nothing until awaited. Where upstream semantics depend on that synchronous part (admission to the
+  Session line, sealing on close, the read-after-write rule, staging order inside a transaction), the
+  protocol declares `def ... -> Awaitable[T]` and implementations run the synchronous part at the call
+  and return an already started `asyncio` future (a sync-part error becomes a failed future, as a
+  rejected Promise). This covers every `Tx` method that upstream returns as a Promise, `Session.commit`,
+  `close`, `document_state`, `DocumentReader.snapshot`/`snapshot_as_of`, `DocumentObserver.watch_doc`,
+  and `WatchHandle.stop`. Callers simply `await`; to start one without awaiting, keep the returned future
+  (use `asyncio.ensure_future`, not `create_task`, to wrap it). An implementation may still be
+  `async def` (a coroutine is an `Awaitable`) when nothing depends on eagerness, as `TaskRuntime` and the
+  harness APIs that extend `DocumentReader` may. `Storage` stays `async def`.
 - Callbacks typed `T | Promise<T>` accept sync or async functions; the caller awaits awaitables.
 - Timers (`SetTimer`, `host_timers`, `native_timer`) run on the loop (`loop.call_later`); a timer
   callback is synchronous.
@@ -224,3 +236,87 @@ class Storage(Protocol):
 - `get_or_undefined` is `get_or_none`; binary data is `bytes`.
 - Static checks: add `# pyright: ignore` lines (expected errors) and `assert_type` calls to
   `tests/typing_cases.py`; `tests/test_types.py` runs pyright on it.
+
+## 8. The Session (stage 2a)
+
+`pi_durable/session/` ports `src/session/`: `create_session(storage, *, now=None,
+document_retention_ms=None, set_timer=None) -> Session`, the concrete `SessionImpl` and `Transaction`,
+and the observers `CommittedStateSource` (a `pi_chord.state.ReplicatedStateSource`) and `CommittedWatch`
+(a `WatchHandle`). Methods documented *internal* (upstream "Internal:") serve the Harness and tests; those
+documented *protected* (upstream `protected`) are meant to be overridden by a subclass, as the Harness
+subclasses `SessionImpl`; both keep upstream's names, snake_cased, without a leading underscore:
+
+- `SessionImpl(storage, now=None, document_retention_ms=None, set_timer=None)`: positional like upstream;
+  `document_retention_ms` is a callable read at each use.
+- Internal: `commit_with(change, context, scope=None)` (scope is the `TransactionScope` TypedDict
+  `{"conversationId", "taskId"}`), `read_on_line(job)`, `conversation_document_on_line(token, cid, context)`
+  (returns `(record, version, value)` or `None`), `observe_commits`, `fail(error)`, `failure`
+  (`SessionFailure` with `.error`), `failed` (a future failing with `SessionFailed`), `assert_usable()`,
+  `report(error, info)`, `unload_documents()`, `document_cache_sizes` (`DocumentCacheSizes` named tuple).
+- Protected: `storage` (the guarded Storage), `conversation_created(tx, record)` (async), `before_close()`
+  (async), `write_at_close(writes)`.
+- `Transaction` internals: `create_root_conversation()`, `submission(id)`, `set_task(record)` (sync),
+  `staged_tasks()`, `staged_conversations()`, `settle_failure/settle_success/discard/adopt`.
+- Module helpers: `contained(callback, on_error)`, `document_retention(ms)`,
+  `set_default_document_retention(ms)` (tests; `PI_DURABLE_DOCUMENT_RETENTION_MS` in `tests/conftest.py`),
+  `date_now()` (`Date.now()` as an `int`).
+
+Rules:
+
+- Deliveries (state frames, watch frames) are scheduled with `loop.call_soon` (upstream `queueMicrotask`);
+  watch listeners and state subscribers may be sync or async.
+- Op lists the Session creates for publications are lists (`RETIREMENT_OPERATIONS == [("r", None)]`,
+  creation/retirement `ops == []`), immutable by contract.
+- `Tx.append_entry` copies entry JSON with `copy_json` and detaches pi-ai messages (`model`, edit
+  `messages`) through `storage.codec.clone_value`; everything else in table records must be strict JSON.
+- Error texts naming an API use the Python names (`Tx.scan_conversations() cannot read tables after the
+  first table write`, `Tx.create_task() requires options.conversationId`,
+  `Session.snapshot_as_of() requires an entry ID`).
+- A retention of `math.inf` arms no timer.
+
+## 9. Storage backends, the local environment, and the testing suites (stage 2b)
+
+| Upstream | Python |
+|---|---|
+| `storage/sqlite/{schema,migrations,storage,index}.ts` | `pi_durable/storage/sqlite/{schema,migrations,storage,__init__}.py` (portable: no driver loaded) |
+| `storage/sqlite/node.ts` | `pi_durable/storage/sqlite/stdlib.py`: `open_sqlite_storage(path, *, prefix=None, wal_auto_checkpoint_pages=None, busy_timeout_ms=None)`, re-exports `pi_chord.sqlite.stdlib` |
+| `storage/jsonl/{storage,index}.ts` | `pi_durable/storage/jsonl/{storage,__init__}.py` |
+| `storage/jsonl/node.ts` | `pi_durable/storage/jsonl/local.py`: `open_local_jsonl_storage(directory, context, *, fsync=False)` |
+| `env/node.ts`, `env/node-watch.ts` | `pi_durable/env/local.py` (`LocalExecutionEnv`), `pi_durable/env/local_watch.py` (`LocalFileWatcher`, `LocalWatchOptions`) |
+| `testing/*.ts` | `pi_durable/testing/*.py`; `register_storage_conformance(globals(), name, provider)` / `register_env_conformance(...)` define one parametrized pytest test |
+
+Rules:
+
+- **Wire text.** Serializing backends write `storage.codec.json_stringify(value)`, upstream's `JSON.stringify`:
+  compact, non-ASCII raw, lone UTF-16 surrogates escaped (`"\ud800"`), so every string survives UTF-8 and
+  SQLite and indexed strings (task kinds, request IDs, document kinds and keys, stored JSON-encoded as
+  upstream does) compare equal across implementations. Floats use Python's shortest repr (`0.0`, `1e-07`),
+  which parses to the same number; key order is the record's. `json_parse` is `JSON.parse` (no `NaN`).
+  Entries go through `encode_entry`/`decode_entry`; other records are stored as they are.
+- **Byte-compatible schema.** Migration statements are upstream's text, whitespace included (SQLite keeps it
+  in `sqlite_schema`); `tests/test_storage_interop.py` checks a TypeScript-written database and JSONL directory
+  (`tests/fixtures/storage_interop`) read identically here, and that Python-written ones read like them.
+- `SqliteStorage.open(db, *, prefix=None)` and `JsonlStorage.open(directory, fs, context, *, fsync=False)`:
+  trailing option objects are keyword-only; `SqliteStorageOptions`/`JsonlStorageOptions` are their
+  `TypedDict`s (usable as `**options`). Inside a transaction `SqliteStorage` issues independent statements
+  together and awaits them as one batch (in call order on the handle), so a threaded adapter pays one hop per
+  batch; a failure is raised after the batch settles, before COMMIT.
+- `SqliteStorage.close` is `async def`; repeated calls await the same close, which waits for admitted
+  multi-query reads (upstream returns the same Promise).
+- `LocalExecutionEnv(*, cwd, shell_path=None, shell_env=None, watch=None)`: a constructor takes keyword
+  arguments (upstream's required options object); `watch` is the `LocalWatchOptions` `TypedDict`
+  (`mode`, `pollIntervalMs`, `maxDirectories`). Its `id` is `"local"` (upstream `"node:local"`).
+  Blocking file calls run on the loop's default executor; a call already running keeps running when its
+  awaiting task is cancelled, and readers close their descriptor only after it finished. Commands run through
+  `loop.subprocess_exec` in a new session (process group), killed as a tree on timeout, abort, cancellation of
+  the awaiting task, or `cleanup()`. `FileError` messages are `str(OSError)`.
+- `LocalExecutionEnv.list_files` returns `not_supported` (upstream's Node environment has no `listFiles`).
+- Native watching is Linux inotify via `ctypes` (one instance per event loop, watch descriptors shared);
+  other platforms and unreliable file systems poll. Scans run on an executor thread.
+- Conformance cases are `StorageConformanceCase(name, run, timeout_ms=None)`; `create_assertions()` raises
+  `AssertionError` (upstream adapts a Vitest `expect`). The JavaScript-only prototype case is kept as "the
+  keys `__proto__`/`constructor` are ordinary detached data".
+- Benchmarks: `StorageReadBenchmark(name, run, expected)` and `StorageWriteBenchmark(name, expected, run)`
+  dataclasses; `benchmarks/bench_durable_storage.py` runs them for memory, SQLite and JSONL.
+- The package root does not import the SQLite/JSONL backends, the local environment or `testing`, as
+  upstream's `index.ts` (`tests/test_storage_runtime_boundary.py`).

@@ -1,0 +1,1116 @@
+[
+ {
+  "ok": {
+   "id": 1
+  }
+ },
+ {
+  "ok": {
+   "id": 9,
+   "parent": {
+    "conversationId": 1,
+    "at": 3
+   }
+  }
+ },
+ {
+  "ok": {
+   "id": 10,
+   "owner": {
+    "conversationId": 1,
+    "taskId": 5
+   }
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 1
+    },
+    {
+     "id": 9,
+     "parent": {
+      "conversationId": 1,
+      "at": 3
+     }
+    }
+   ],
+   "next": {
+    "after": 9,
+    "order": "ascending"
+   }
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 10,
+     "owner": {
+      "conversationId": 1,
+      "taskId": 5
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 10,
+     "owner": {
+      "conversationId": 1,
+      "taskId": 5
+     }
+    },
+    {
+     "id": 9,
+     "parent": {
+      "conversationId": 1,
+      "at": 3
+     }
+    },
+    {
+     "id": 1
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 2,
+    "conversationId": 1,
+    "kind": "pi.user",
+    "model": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "h\u00e9llo \ud800 \ud83d\ude00"
+       }
+      ],
+      "timestamp": 1700000000000
+     }
+    ],
+    "data": {
+     "text": "h\u00e9llo"
+    }
+   },
+   "commitSeq": 2
+  }
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 3,
+    "conversationId": 1,
+    "kind": "pi.assistant",
+    "model": [
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "text",
+        "text": "hi"
+       },
+       {
+        "type": "toolCall",
+        "id": "c1",
+        "name": "ls",
+        "arguments": {
+         "path": "."
+        }
+       }
+      ],
+      "api": "anthropic-messages",
+      "provider": "anthropic",
+      "model": "claude",
+      "usage": {
+       "input": 1,
+       "output": 2,
+       "cacheRead": 0,
+       "cacheWrite": 0,
+       "totalTokens": 3,
+       "cost": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "total": 0
+       }
+      },
+      "stopReason": "stop",
+      "timestamp": 1700000000001
+     }
+    ]
+   },
+   "commitSeq": 2
+  }
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 4,
+    "conversationId": 1,
+    "kind": "marker",
+    "head": 2,
+    "edits": [
+     {
+      "kind": "replace",
+      "from": 2,
+      "to": 3,
+      "messages": [
+       {
+        "role": "toolResult",
+        "toolCallId": "c1",
+        "toolName": "ls",
+        "content": [
+         {
+          "type": "text",
+          "text": "a\nb"
+         }
+        ],
+        "isError": false,
+        "timestamp": 1700000000002
+       }
+      ]
+     }
+    ]
+   },
+   "commitSeq": 2
+  }
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 11,
+    "conversationId": 9,
+    "kind": "fork",
+    "head": 11
+   },
+   "commitSeq": 5
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 2,
+    "conversationId": 1,
+    "kind": "pi.user",
+    "model": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "h\u00e9llo \ud800 \ud83d\ude00"
+       }
+      ],
+      "timestamp": 1700000000000
+     }
+    ],
+    "data": {
+     "text": "h\u00e9llo"
+    }
+   },
+   "commitSeq": 2
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 11,
+    "conversationId": 9,
+    "kind": "fork",
+    "head": 11
+   },
+   "commitSeq": 5
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "id": 4,
+   "conversationId": 1,
+   "kind": "marker",
+   "head": 2,
+   "edits": [
+    {
+     "kind": "replace",
+     "from": 2,
+     "to": 3,
+     "messages": [
+      {
+       "role": "toolResult",
+       "toolCallId": "c1",
+       "toolName": "ls",
+       "content": [
+        {
+         "type": "text",
+         "text": "a\nb"
+        }
+       ],
+       "isError": false,
+       "timestamp": 1700000000002
+      }
+     ]
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 4,
+     "conversationId": 1,
+     "kind": "marker",
+     "head": 2,
+     "edits": [
+      {
+       "kind": "replace",
+       "from": 2,
+       "to": 3,
+       "messages": [
+        {
+         "role": "toolResult",
+         "toolCallId": "c1",
+         "toolName": "ls",
+         "content": [
+          {
+           "type": "text",
+           "text": "a\nb"
+          }
+         ],
+         "isError": false,
+         "timestamp": 1700000000002
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "id": 3,
+     "conversationId": 1,
+     "kind": "pi.assistant",
+     "model": [
+      {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        },
+        {
+         "type": "toolCall",
+         "id": "c1",
+         "name": "ls",
+         "arguments": {
+          "path": "."
+         }
+        }
+       ],
+       "api": "anthropic-messages",
+       "provider": "anthropic",
+       "model": "claude",
+       "usage": {
+        "input": 1,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 3,
+        "cost": {
+         "input": 0,
+         "output": 0,
+         "cacheRead": 0,
+         "cacheWrite": 0,
+         "total": 0
+        }
+       },
+       "stopReason": "stop",
+       "timestamp": 1700000000001
+      }
+     ]
+    },
+    {
+     "id": 2,
+     "conversationId": 1,
+     "kind": "pi.user",
+     "model": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "h\u00e9llo \ud800 \ud83d\ude00"
+        }
+       ],
+       "timestamp": 1700000000000
+      }
+     ],
+     "data": {
+      "text": "h\u00e9llo"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 2,
+     "conversationId": 1,
+     "kind": "pi.user",
+     "model": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "h\u00e9llo \ud800 \ud83d\ude00"
+        }
+       ],
+       "timestamp": 1700000000000
+      }
+     ],
+     "data": {
+      "text": "h\u00e9llo"
+     }
+    },
+    {
+     "id": 3,
+     "conversationId": 1,
+     "kind": "pi.assistant",
+     "model": [
+      {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        },
+        {
+         "type": "toolCall",
+         "id": "c1",
+         "name": "ls",
+         "arguments": {
+          "path": "."
+         }
+        }
+       ],
+       "api": "anthropic-messages",
+       "provider": "anthropic",
+       "model": "claude",
+       "usage": {
+        "input": 1,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 3,
+        "cost": {
+         "input": 0,
+         "output": 0,
+         "cacheRead": 0,
+         "cacheWrite": 0,
+         "total": 0
+        }
+       },
+       "stopReason": "stop",
+       "timestamp": 1700000000001
+      }
+     ]
+    }
+   ],
+   "next": {
+    "after": 3,
+    "order": "ascending"
+   }
+  }
+ },
+ {
+  "ok": {
+   "id": 11,
+   "conversationId": 9,
+   "kind": "fork",
+   "head": 11
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 11,
+     "conversationId": 9,
+     "kind": "fork",
+     "head": 11
+    },
+    {
+     "id": 3,
+     "conversationId": 1,
+     "kind": "pi.assistant",
+     "model": [
+      {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        },
+        {
+         "type": "toolCall",
+         "id": "c1",
+         "name": "ls",
+         "arguments": {
+          "path": "."
+         }
+        }
+       ],
+       "api": "anthropic-messages",
+       "provider": "anthropic",
+       "model": "claude",
+       "usage": {
+        "input": 1,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 3,
+        "cost": {
+         "input": 0,
+         "output": 0,
+         "cacheRead": 0,
+         "cacheWrite": 0,
+         "total": 0
+        }
+       },
+       "stopReason": "stop",
+       "timestamp": 1700000000001
+      }
+     ]
+    },
+    {
+     "id": 2,
+     "conversationId": 1,
+     "kind": "pi.user",
+     "model": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "h\u00e9llo \ud800 \ud83d\ude00"
+        }
+       ],
+       "timestamp": 1700000000000
+      }
+     ],
+     "data": {
+      "text": "h\u00e9llo"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 2,
+     "conversationId": 1,
+     "kind": "pi.user",
+     "model": [
+      {
+       "role": "user",
+       "content": [
+        {
+         "type": "text",
+         "text": "h\u00e9llo \ud800 \ud83d\ude00"
+        }
+       ],
+       "timestamp": 1700000000000
+      }
+     ],
+     "data": {
+      "text": "h\u00e9llo"
+     }
+    },
+    {
+     "id": 3,
+     "conversationId": 1,
+     "kind": "pi.assistant",
+     "model": [
+      {
+       "role": "assistant",
+       "content": [
+        {
+         "type": "text",
+         "text": "hi"
+        },
+        {
+         "type": "toolCall",
+         "id": "c1",
+         "name": "ls",
+         "arguments": {
+          "path": "."
+         }
+        }
+       ],
+       "api": "anthropic-messages",
+       "provider": "anthropic",
+       "model": "claude",
+       "usage": {
+        "input": 1,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 3,
+        "cost": {
+         "input": 0,
+         "output": 0,
+         "cacheRead": 0,
+         "cacheWrite": 0,
+         "total": 0
+        }
+       },
+       "stopReason": "stop",
+       "timestamp": 1700000000001
+      }
+     ]
+    }
+   ],
+   "next": {
+    "after": 3,
+    "order": "ascending"
+   }
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "id": 5,
+   "conversationId": 1,
+   "kind": "t.\ud801",
+   "version": 1,
+   "input": {
+    "n": 1.5
+   },
+   "state": {
+    "status": "terminal",
+    "outcome": {
+     "status": "completed",
+     "result": {
+      "ok": true
+     }
+    }
+   },
+   "background": true,
+   "abortRequested": false
+  }
+ },
+ {
+  "ok": {
+   "id": 6,
+   "conversationId": 1,
+   "kind": "t.sleep",
+   "version": 2,
+   "input": null,
+   "state": {
+    "status": "sleeping",
+    "checkpoint": {
+     "phase": "b"
+    },
+    "until": 61000
+   },
+   "background": false,
+   "abortRequested": true,
+   "memos": {
+    "m": [
+     1,
+     2
+    ]
+   }
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 5,
+     "conversationId": 1,
+     "kind": "t.\ud801",
+     "version": 1,
+     "input": {
+      "n": 1.5
+     },
+     "state": {
+      "status": "terminal",
+      "outcome": {
+       "status": "completed",
+       "result": {
+        "ok": true
+       }
+      }
+     },
+     "background": true,
+     "abortRequested": false
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 5,
+     "conversationId": 1,
+     "kind": "t.\ud801",
+     "version": 1,
+     "input": {
+      "n": 1.5
+     },
+     "state": {
+      "status": "terminal",
+      "outcome": {
+       "status": "completed",
+       "result": {
+        "ok": true
+       }
+      }
+     },
+     "background": true,
+     "abortRequested": false
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 6,
+     "conversationId": 1,
+     "kind": "t.sleep",
+     "version": 2,
+     "input": null,
+     "state": {
+      "status": "sleeping",
+      "checkpoint": {
+       "phase": "b"
+      },
+      "until": 61000
+     },
+     "background": false,
+     "abortRequested": true,
+     "memos": {
+      "m": [
+       1,
+       2
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 6,
+     "conversationId": 1,
+     "kind": "t.sleep",
+     "version": 2,
+     "input": null,
+     "state": {
+      "status": "sleeping",
+      "checkpoint": {
+       "phase": "b"
+      },
+      "until": 61000
+     },
+     "background": false,
+     "abortRequested": true,
+     "memos": {
+      "m": [
+       1,
+       2
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "id": 7,
+   "conversationId": 1,
+   "requestId": "req-\ud800",
+   "type": "input",
+   "status": "done",
+   "entry": 2,
+   "answer": 3
+  }
+ },
+ {
+  "ok": {
+   "id": 8,
+   "conversationId": 1,
+   "type": "write",
+   "status": "queued"
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 7,
+     "conversationId": 1,
+     "requestId": "req-\ud800",
+     "type": "input",
+     "status": "done",
+     "entry": 2,
+     "answer": 3
+    },
+    {
+     "id": 8,
+     "conversationId": 1,
+     "type": "write",
+     "status": "queued"
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 8,
+     "conversationId": 1,
+     "type": "write",
+     "status": "queued"
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "id": 7,
+   "conversationId": 1,
+   "requestId": "req-\ud800",
+   "type": "input",
+   "status": "done",
+   "entry": 2,
+   "answer": 3
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 12,
+    "kind": "session.settings",
+    "scope": {
+     "kind": "session"
+    },
+    "createdAt": 5
+   },
+   "version": 1,
+   "value": {
+    "count": 1,
+    "items": [
+     "x",
+     "y"
+    ]
+   },
+   "deltasSinceBase": 1
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 2,
+   "value": {
+    "text": "replaced"
+   },
+   "deltasSinceBase": 1
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 15,
+    "kind": "latest",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "latest",
+    "fork": "current",
+    "createdAt": 5
+   },
+   "version": 3,
+   "value": {
+    "v": 2
+   },
+   "deltasSinceBase": 0
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 16,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 9
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 9
+   },
+   "version": 1,
+   "value": {
+    "text": "ab"
+   },
+   "deltasSinceBase": 0
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 1,
+   "value": {
+    "text": "a"
+   },
+   "deltasSinceBase": 0
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 1,
+   "value": {
+    "text": "ab"
+   },
+   "deltasSinceBase": 1
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 2,
+   "value": {
+    "text": "ab!"
+   },
+   "deltasSinceBase": 0
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 2,
+   "value": {
+    "text": "replaced"
+   },
+   "deltasSinceBase": 1
+  }
+ },
+ {
+  "ok": {
+   "record": {
+    "id": 13,
+    "kind": "notes",
+    "scope": {
+     "kind": "conversation",
+     "conversationId": 1
+    },
+    "history": "rewindable",
+    "fork": "asOf",
+    "createdAt": 5
+   },
+   "version": 2,
+   "value": {
+    "text": "replaced"
+   },
+   "deltasSinceBase": 1
+  }
+ },
+ {
+  "ok": {
+   "id": 13,
+   "kind": "notes",
+   "scope": {
+    "kind": "conversation",
+    "conversationId": 1
+   },
+   "history": "rewindable",
+   "fork": "asOf",
+   "createdAt": 5
+  }
+ },
+ {
+  "ok": {
+   "id": 14,
+   "kind": "fam",
+   "key": "k-\ud800",
+   "scope": {
+    "kind": "task",
+    "taskId": 5
+   },
+   "createdAt": 5,
+   "retiredAt": 9
+  }
+ },
+ {
+  "ok": null
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 13,
+     "kind": "notes",
+     "scope": {
+      "kind": "conversation",
+      "conversationId": 1
+     },
+     "history": "rewindable",
+     "fork": "asOf",
+     "createdAt": 5
+    },
+    {
+     "id": 15,
+     "kind": "latest",
+     "scope": {
+      "kind": "conversation",
+      "conversationId": 1
+     },
+     "history": "latest",
+     "fork": "current",
+     "createdAt": 5
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 12,
+     "kind": "session.settings",
+     "scope": {
+      "kind": "session"
+     },
+     "createdAt": 5
+    }
+   ]
+  }
+ },
+ {
+  "ok": {
+   "items": [
+    {
+     "id": 14,
+     "kind": "fam",
+     "key": "k-\ud800",
+     "scope": {
+      "kind": "task",
+      "taskId": 5
+     },
+     "createdAt": 5,
+     "retiredAt": 9
+    }
+   ]
+  }
+ },
+ {
+  "ok": 17
+ },
+ {
+  "ok": 10
+ },
+ {
+  "ok": {
+   "entry": {
+    "id": 100,
+    "conversationId": 9,
+    "kind": "after"
+   },
+   "commitSeq": 10
+  }
+ },
+ {
+  "ok": 101
+ }
+]

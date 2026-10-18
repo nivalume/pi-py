@@ -24,7 +24,10 @@ How the TypeScript types map to Python (see ``packages/durable/DESIGN.md`` for t
   attributes, built by ``define_doc``/``define_doc_family``/``define_entry``/``define_task``.
 - **Interfaces with behavior** (``Storage``, ``Session``, ``Tx``, ``TaskRuntime``, ``WatchHandle``)
   are ``Protocol`` s with snake_case methods. Methods that return a Promise upstream are
-  ``async def``; synchronous ones stay synchronous. ``context`` keeps its upstream position.
+  ``async def``, except the eager ones of ``Tx``, ``Session``, ``DocumentReader``,
+  ``DocumentObserver`` and ``WatchHandle.stop``: those are ``def ... -> Awaitable[T]``, doing their
+  synchronous part (admission, staging) at the call as upstream does, and callers ``await`` the
+  result (DESIGN.md §5). Synchronous ones stay synchronous. ``context`` keeps its upstream position.
 """
 
 from __future__ import annotations
@@ -1295,61 +1298,61 @@ class Tx(Protocol):
     commit state. Overloaded methods take positional arguments only, as upstream passes them.
     """
 
-    async def conversation(self, id: ConversationId, /) -> ConversationRecord | None: ...
+    def conversation(self, id: ConversationId, /) -> Awaitable[ConversationRecord | None]: ...
 
     @overload
-    async def entry(self, id: EntryId, /) -> EntryRecord | None: ...
+    def entry(self, id: EntryId, /) -> Awaitable[EntryRecord | None]: ...
     @overload
-    async def entry(self, token: Entry[D], id: EntryId, /) -> TypedEntry[D] | None:
+    def entry(self, token: Entry[D], id: EntryId, /) -> Awaitable[TypedEntry[D] | None]:
         """``None`` when the entry is absent or has another kind."""
         ...
 
-    async def task(self, id: TaskId[Any], /) -> AnyTaskRecord | None: ...
+    def task(self, id: TaskId[Any], /) -> Awaitable[AnyTaskRecord | None]: ...
 
-    async def scan_conversations(
+    def scan_conversations(
         self, query: ConversationQuery, limit: int, cursor: Cursor | None = None, /
-    ) -> Page[ConversationRecord]: ...
+    ) -> Awaitable[Page[ConversationRecord]]: ...
 
-    async def scan_entries(
+    def scan_entries(
         self, query: EntryQuery, limit: int, cursor: Cursor | None = None, /
-    ) -> Page[EntryRecord]: ...
+    ) -> Awaitable[Page[EntryRecord]]: ...
 
-    async def latest_head_marker(self, conversation_id: ConversationId, /) -> HeadMarker | None:
+    def latest_head_marker(self, conversation_id: ConversationId, /) -> Awaitable[HeadMarker | None]:
         """Newest visible entry of the conversation that carries a ``head``."""
         ...
 
-    async def scan_tasks(
+    def scan_tasks(
         self, query: TaskQuery, limit: int, cursor: Cursor | None = None, /
-    ) -> Page[AnyTaskRecord]: ...
+    ) -> Awaitable[Page[AnyTaskRecord]]: ...
 
-    async def submission_by_request(
+    def submission_by_request(
         self, conversation_id: ConversationId, request_id: str, /
-    ) -> SubmissionRecord | None:
+    ) -> Awaitable[SubmissionRecord | None]:
         """Committed submission with a conversation-scoped request ID."""
         ...
 
-    async def create_conversation(self, options: OwnershipOptions, /) -> ConversationRecord:
+    def create_conversation(self, options: OwnershipOptions, /) -> Awaitable[ConversationRecord]:
         """Create a conversation with explicitly selected ownership: ``{"ownership": ...}``."""
         ...
 
-    async def fork_conversation(
+    def fork_conversation(
         self, parent_conversation_id: ConversationId, at: EntryId, options: OwnershipOptions, /
-    ) -> ConversationRecord:
+    ) -> Awaitable[ConversationRecord]:
         """Create a history fork at one concrete visible entry with explicitly selected ownership."""
         ...
 
     @overload
-    async def append_entry(self, conversation_id: ConversationId, value: EntryDraft, /) -> EntryRecord: ...
+    def append_entry(self, conversation_id: ConversationId, value: EntryDraft, /) -> Awaitable[EntryRecord]: ...
     @overload
-    async def append_entry(
+    def append_entry(
         self, token: Entry[D], conversation_id: ConversationId, value: TypedEntryDraft[D], /
-    ) -> TypedEntry[D]:
+    ) -> Awaitable[TypedEntry[D]]:
         """The token supplies ``kind`` and types ``data``."""
         ...
 
-    async def create_task(self, task: Task[I, S, R, H], input: I, options: TaskOptions, /) -> TaskId[R]: ...
+    def create_task(self, task: Task[I, S, R, H], input: I, options: TaskOptions, /) -> Awaitable[TaskId[R]]: ...
 
-    async def create_submission(self, create: SubmissionCreate, /) -> SubmissionRecord:
+    def create_submission(self, create: SubmissionCreate, /) -> Awaitable[SubmissionRecord]:
         """Create a raw submission record with a fresh ID. No admission rules apply."""
         ...
 
@@ -1362,34 +1365,36 @@ class Tx(Protocol):
         ...
 
     @overload
-    async def doc(self, token: SessionDocToken[T], /) -> Draft[T]: ...
+    def doc(self, token: SessionDocToken[T], /) -> Awaitable[Draft[T]]: ...
     @overload
-    async def doc(self, token: ConversationDocToken[T], conversation_id: ConversationId, /) -> Draft[T]: ...
+    def doc(self, token: ConversationDocToken[T], conversation_id: ConversationId, /) -> Awaitable[Draft[T]]: ...
     @overload
-    async def doc(self, token: TaskDocToken[T], task_id: TaskId[Any], /) -> Draft[T]: ...
+    def doc(self, token: TaskDocToken[T], task_id: TaskId[Any], /) -> Awaitable[Draft[T]]: ...
     @overload
-    async def doc(self, token: SessionDocFamilyToken[T, I], key: str, seed: I, /) -> Draft[T]: ...
+    def doc(self, token: SessionDocFamilyToken[T, I], key: str, seed: I, /) -> Awaitable[Draft[T]]: ...
     @overload
-    async def doc(
+    def doc(
         self, token: ConversationDocFamilyToken[T, I], conversation_id: ConversationId, key: str, seed: I, /
-    ) -> Draft[T]: ...
+    ) -> Awaitable[Draft[T]]: ...
     @overload
-    async def doc(self, token: TaskDocFamilyToken[T, I], task_id: TaskId[Any], key: str, seed: I, /) -> Draft[T]: ...
+    def doc(
+        self, token: TaskDocFamilyToken[T, I], task_id: TaskId[Any], key: str, seed: I, /
+    ) -> Awaitable[Draft[T]]: ...
 
     @overload
-    async def retire_doc(self, token: SessionDocToken[Any], /) -> None: ...
+    def retire_doc(self, token: SessionDocToken[Any], /) -> Awaitable[None]: ...
     @overload
-    async def retire_doc(self, token: ConversationDocToken[Any], conversation_id: ConversationId, /) -> None: ...
+    def retire_doc(self, token: ConversationDocToken[Any], conversation_id: ConversationId, /) -> Awaitable[None]: ...
     @overload
-    async def retire_doc(self, token: TaskDocToken[Any], task_id: TaskId[Any], /) -> None: ...
+    def retire_doc(self, token: TaskDocToken[Any], task_id: TaskId[Any], /) -> Awaitable[None]: ...
     @overload
-    async def retire_doc(self, token: SessionDocFamilyToken[Any, Any], key: str, /) -> None: ...
+    def retire_doc(self, token: SessionDocFamilyToken[Any, Any], key: str, /) -> Awaitable[None]: ...
     @overload
-    async def retire_doc(
+    def retire_doc(
         self, token: ConversationDocFamilyToken[Any, Any], conversation_id: ConversationId, key: str, /
-    ) -> None: ...
+    ) -> Awaitable[None]: ...
     @overload
-    async def retire_doc(self, token: TaskDocFamilyToken[Any, Any], task_id: TaskId[Any], key: str, /) -> None: ...
+    def retire_doc(self, token: TaskDocFamilyToken[Any, Any], task_id: TaskId[Any], key: str, /) -> Awaitable[None]: ...
 
 
 #: Disposable, read-only Chord state bound to one committed document incarnation.
@@ -1431,7 +1436,7 @@ class WatchHandle(Protocol[T_co]):
         """Install the sole asynchronous listener. Never invokes it inline."""
         ...
 
-    async def stop(self) -> WatchEnd:
+    def stop(self) -> Awaitable[WatchEnd]:
         """Idempotently stop future callbacks and return this watch's terminal result."""
         ...
 
@@ -1448,35 +1453,35 @@ class DocumentReader(Protocol):
     """Committed document reads (``Pick<Session, "snapshot" | "snapshotAsOf">``)."""
 
     @overload
-    async def snapshot(self, token: SessionDocToken[T], context: Context, /) -> T | None: ...
+    def snapshot(self, token: SessionDocToken[T], context: Context, /) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot(
+    def snapshot(
         self, token: ConversationDocToken[T], conversation_id: ConversationId, context: Context, /
-    ) -> T | None: ...
+    ) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot(self, token: TaskDocToken[T], task_id: TaskId[Any], context: Context, /) -> T | None: ...
+    def snapshot(self, token: TaskDocToken[T], task_id: TaskId[Any], context: Context, /) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot(self, token: SessionDocFamilyToken[T, Any], key: str, context: Context, /) -> T | None: ...
+    def snapshot(self, token: SessionDocFamilyToken[T, Any], key: str, context: Context, /) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot(
+    def snapshot(
         self, token: ConversationDocFamilyToken[T, Any], conversation_id: ConversationId, key: str, context: Context, /
-    ) -> T | None: ...
+    ) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot(
+    def snapshot(
         self, token: TaskDocFamilyToken[T, Any], task_id: TaskId[Any], key: str, context: Context, /
-    ) -> T | None: ...
+    ) -> Awaitable[T | None]: ...
 
     @overload
-    async def snapshot_as_of(
+    def snapshot_as_of(
         self,
         token: RewindableConversationDocToken[T],
         conversation_id: ConversationId,
         at: EntryId,
         context: Context,
         /,
-    ) -> T | None: ...
+    ) -> Awaitable[T | None]: ...
     @overload
-    async def snapshot_as_of(
+    def snapshot_as_of(
         self,
         token: RewindableConversationDocFamilyToken[T, Any],
         conversation_id: ConversationId,
@@ -1484,34 +1489,34 @@ class DocumentReader(Protocol):
         at: EntryId,
         context: Context,
         /,
-    ) -> T | None: ...
+    ) -> Awaitable[T | None]: ...
 
 
 class DocumentObserver(Protocol):
     """Non-creating document watch acquisition shared by Session and later invocation APIs."""
 
     @overload
-    async def watch_doc(self, token: SessionDocToken[T], context: Context, /) -> WatchHandle[T | None] | None: ...
+    def watch_doc(self, token: SessionDocToken[T], context: Context, /) -> Awaitable[WatchHandle[T | None] | None]: ...
     @overload
-    async def watch_doc(
+    def watch_doc(
         self, token: ConversationDocToken[T], conversation_id: ConversationId, context: Context, /
-    ) -> WatchHandle[T | None] | None: ...
+    ) -> Awaitable[WatchHandle[T | None] | None]: ...
     @overload
-    async def watch_doc(
+    def watch_doc(
         self, token: TaskDocToken[T], task_id: TaskId[Any], context: Context, /
-    ) -> WatchHandle[T | None] | None: ...
+    ) -> Awaitable[WatchHandle[T | None] | None]: ...
     @overload
-    async def watch_doc(
+    def watch_doc(
         self, token: SessionDocFamilyToken[T, Any], key: str, context: Context, /
-    ) -> WatchHandle[T | None] | None: ...
+    ) -> Awaitable[WatchHandle[T | None] | None]: ...
     @overload
-    async def watch_doc(
+    def watch_doc(
         self, token: ConversationDocFamilyToken[T, Any], conversation_id: ConversationId, key: str, context: Context, /
-    ) -> WatchHandle[T | None] | None: ...
+    ) -> Awaitable[WatchHandle[T | None] | None]: ...
     @overload
-    async def watch_doc(
+    def watch_doc(
         self, token: TaskDocFamilyToken[T, Any], task_id: TaskId[Any], key: str, context: Context, /
-    ) -> WatchHandle[T | None] | None: ...
+    ) -> Awaitable[WatchHandle[T | None] | None]: ...
 
 
 class SessionEndClosed(TypedDict):
@@ -1533,7 +1538,7 @@ CommitListener: TypeAlias = Callable[[CommitPublication, Context], None]
 class Session(DocumentObserver, DocumentReader, Protocol):
     """Owner of one mutation line, its records, and its tracked documents."""
 
-    async def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> T:
+    def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> Awaitable[T]:
         """Run one atomic transaction on the Session mutation line.
 
         Inside the callback read only through ``tx``: other Session reads may queue on the line the
@@ -1541,7 +1546,7 @@ class Session(DocumentObserver, DocumentReader, Protocol):
         """
         ...
 
-    async def close(self, context: Context) -> None:
+    def close(self, context: Context) -> Awaitable[None]:
         """Seal admission, settle admitted commits, then close storage."""
         ...
 
@@ -1559,29 +1564,29 @@ class Session(DocumentObserver, DocumentReader, Protocol):
         ...
 
     @overload
-    async def document_state(
+    def document_state(
         self, token: SessionDocToken[T], context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
     @overload
-    async def document_state(
+    def document_state(
         self, token: ConversationDocToken[T], conversation_id: ConversationId, context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
     @overload
-    async def document_state(
+    def document_state(
         self, token: TaskDocToken[T], task_id: TaskId[Any], context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
     @overload
-    async def document_state(
+    def document_state(
         self, token: SessionDocFamilyToken[T, Any], key: str, context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
     @overload
-    async def document_state(
+    def document_state(
         self, token: ConversationDocFamilyToken[T, Any], conversation_id: ConversationId, key: str, context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
     @overload
-    async def document_state(
+    def document_state(
         self, token: TaskDocFamilyToken[T, Any], task_id: TaskId[Any], key: str, context: Context, /
-    ) -> AttachedReplicatedState[T | None] | None: ...
+    ) -> Awaitable[AttachedReplicatedState[T | None] | None]: ...
 
 
 class TaskRuntime(DocumentObserver, DocumentReader, Protocol[I, S, R, H_co]):
