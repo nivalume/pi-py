@@ -112,6 +112,16 @@ async def test_abort_scope_interrupts_pending_awaits() -> None:
             await asyncio.sleep(10)
 
 
+async def test_abort_scope_does_not_leak_an_undelivered_cancellation() -> None:
+    # The abort fires inside the scope, but the body finishes without awaiting again,
+    # so the task cancellation is never delivered inside the scope.
+    controller = AbortController()
+    async with abort_scope(controller.signal):
+        controller.abort()
+    await asyncio.sleep(0)  # must not raise CancelledError
+    assert asyncio.current_task().cancelling() == 0  # type: ignore[union-attr]
+
+
 async def test_abort_scope_raises_immediately_for_aborted_signal() -> None:
     with pytest.raises(AbortError):
         async with abort_scope(AbortSignal.abort("stop")):

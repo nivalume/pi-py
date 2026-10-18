@@ -13,6 +13,7 @@ deadline into :class:`TimeoutError`.
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -242,9 +243,18 @@ class abort_scope:
             self._remove()
             self._remove = None
         if self._fired and self._task is not None:
-            if self._task.uncancel() <= self._cancelling and exc_type is asyncio.CancelledError:
-                assert self._signal is not None
-                raise AbortError(self._signal.reason) from exc
+            if self._task.uncancel() <= self._cancelling:
+                if exc_type is asyncio.CancelledError:
+                    assert self._signal is not None
+                    raise AbortError(self._signal.reason) from exc
+                if sys.version_info < (3, 13):
+                    # The body finished before the cancellation was delivered. Python 3.13's
+                    # uncancel() drops that pending cancellation; older versions would raise it
+                    # at the caller's next await, so take it here.
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        pass
         return None
 
 
