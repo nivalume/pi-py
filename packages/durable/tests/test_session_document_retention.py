@@ -2,20 +2,19 @@
 
 The Session's document cache is bounded by use: unattached documents leave it after the retention
 period and load from Storage again; documents with a watch or a document state never leave it.
-
-Deferred to stage 3 (they need the Harness): "follows a Harness settings change at the next use" and
-"gives the same events with documents evicted right after use as with documents kept".
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import time
 from typing import Any
 
 import pytest
+from durable_harness_support import add_tool, chat_setup, open_chat
 from durable_session_support import (
     StorageBackend,
     context,
@@ -27,7 +26,8 @@ from durable_session_support import (
     settle_line,
 )
 
-from pi_durable import define_doc, define_doc_family
+from pi_ai import Type, faux_assistant_message, faux_text, faux_tool_call
+from pi_durable import MemoryStorage, define_doc, define_doc_family, define_tool, watch_events
 from pi_durable.session import SessionImpl, date_now, set_default_document_retention
 
 CounterDoc = define_doc(
@@ -71,6 +71,16 @@ Failing = define_doc(
     scope="session",
     initial=lambda: {"count": 0},
     checkpoint_when=_failing_checkpoint,
+)
+
+#: A conversation document any Harness test can read.
+TestDoc = define_doc(
+    kind="test.retention.harness",
+    version=1,
+    scope="conversation",
+    history="latest",
+    fork="initial",
+    initial=lambda: {"count": 0},
 )
 
 #: The default retention of this run, as the environment set it.
@@ -507,6 +517,69 @@ async def test_keeps_no_timer_where_the_host_declines_background_timers_and_evic
     await settle_line(session)
     assert session.document_cache_sizes.cached == 0
     await session.close(context)
+
+
+async def test_follows_a_harness_settings_change_at_the_next_use(restore_default_retention: Any) -> None:
+    setup = chat_setup()
+    opened = await open_chat(MemoryStorage(), setup)
+    harness, root = opened.harness, opened.root
+
+    async def change(tx: Any) -> None:
+        (await tx.doc(TestDoc, root.id))["count"] += 1
+
+    await root.commit(change, context)
+    assert harness.document_cache_sizes.cached > 0
+    setup.settings["documentRetentionMs"] = 0
+    await harness.snapshot(TestDoc, root.id, context)
+
+    async def evicted() -> bool:
+        await settle_line(harness)
+        return harness.document_cache_sizes.cached == 0
+
+    await eventually(evicted)
+    await harness.close(context)
+
+
+async def test_gives_the_same_events_with_documents_evicted_right_after_use_as_with_documents_kept() -> None:
+    async def run(document_retention_ms: float) -> list[str]:
+        setup = chat_setup()
+        setup.settings["documentRetentionMs"] = document_retention_ms
+        setup.settings["progress"] = {"outputIntervalMs": 0}
+
+        async def steps(_args: Any, api: Any, _context: Any) -> Any:
+            for step in ("a\n", "b\n", "c\n"):
+                api.output(step)
+                await asyncio.sleep(0.005)
+            return {}
+
+        add_tool(
+            setup.registry,
+            define_tool(name="steps", description="Streams three steps", parameters=Type.Object({}), execute=steps),
+        )
+        setup.faux.set_responses(
+            [
+                faux_assistant_message([faux_tool_call("steps", {}, id="s1")], stop_reason="toolUse"),
+                faux_assistant_message([faux_text("done")]),
+            ]
+        )
+        opened = await open_chat(MemoryStorage(), setup)
+        harness, root = opened.harness, opened.root
+        stream = await watch_events(harness, root.id, context)
+        events: list[Any] = []
+        stream.start(lambda batch, _context: events.extend(batch))
+        await (await root.submit({"type": "input", "content": "go"}, context)).wait(context)
+        await harness.wait_for_idle(context)
+        await stream.stop()
+        await harness.close(context)
+        # Ids and times differ between runs; the sequence of event types and tool outputs must not.
+        return [
+            f"update:{json.dumps(event['output'])}" if event["type"] == "tool_execution_update" else event["type"]
+            for event in events
+        ]
+
+    kept = await run(600_000)
+    assert any(event.startswith("update:") for event in kept)
+    assert await run(0) == kept
 
 
 async def test_keeps_a_reloaded_newer_version_cached_while_an_observer_of_the_older_one_is_attached(

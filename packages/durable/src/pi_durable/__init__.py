@@ -4,9 +4,10 @@ Conversations, model turns, tool calls, and application state are committed to s
 anything is shown; reopening the storage picks work up where it stopped. See
 ``packages/durable/DESIGN.md`` for how the TypeScript API maps to Python.
 
-This root re-exports the ported foundation: records and interfaces (:mod:`pi_durable.types`),
-document, entry and task definitions, errors, the memory storage, and the harness definition
-helpers and types. Later modules (session, harness, SQLite and JSONL storages) extend it.
+This root mirrors upstream ``index.ts``: records and interfaces (:mod:`pi_durable.types`), document,
+entry and task definitions, errors, the memory storage, the Session, and the Harness with its built-in
+documents, tasks, registry, and events. The SQLite and JSONL storages, the local environment, and the
+testing suites are imported from their own modules, so importing the root loads none of them.
 """
 
 from __future__ import annotations
@@ -24,7 +25,41 @@ from .entries import (
     define_entry,
 )
 from .errors import ConversationBusy, ReadAfterWrite, SessionFailed, StorageRequestError, error_message
+from .harness.agent import (
+    DEFAULT_COMPACTION_POLICY,
+    DEFAULT_PROGRESS_POLICY,
+    DEFAULT_RESTART_LIMIT,
+    DEFAULT_RETRY_POLICY,
+    AgentDoc,
+    configure,
+)
+from .harness.compaction import CompactionCheckpoint, CompactionInput, CompactionTask, SummaryRequest
 from .harness.define import define_extension, define_tool, hook, section, wrap_section, wrap_tool
+from .harness.events import AgentEvent, AgentEventStream, MessageChange, SnapshotEvent, ToolEventCall, watch_events
+from .harness.generation import GenerationCheckpoint, GenerationInput, GenerationResult, GenerationTask
+from .harness.harness import Harness
+from .harness.inbox import InboxDoc, InboxItem, InboxState
+from .harness.live import (
+    CompactionFailure,
+    CompactionStatus,
+    LiveDoc,
+    LiveState,
+    NestedToolSlot,
+    NestedToolSummary,
+    ToolSlot,
+)
+from .harness.provider import ProviderDoc, ProviderState
+from .harness.registry import create_registry
+from .harness.scheduler import BlockedReason
+from .harness.task_graph import TaskGraph, TaskGraphNode, TaskGraphState, TaskGraphWatch
+from .harness.tool import (
+    NestedCallDoc,
+    NestedCallState,
+    ToolTask,
+    ToolTaskCheckpoint,
+    ToolTaskInput,
+    ToolTaskResult,
+)
 from .harness.types import (
     AfterFailedRun,
     Agent,
@@ -46,7 +81,6 @@ from .harness.types import (
     EnvTarget,
     Extension,
     GenerationHooks,
-    Harness,
     HarnessInspection,
     HarnessOptions,
     HarnessSettings,
@@ -84,6 +118,8 @@ from .harness.types import (
     Wake,
     Wrap,
 )
+from .harness.usage import UsageDoc, UsageState
+from .harness.view import ConversationView
 from .ids import id_from_number, seq_from_number
 from .session import create_session
 from .storage.memory import MemoryStorage
@@ -211,6 +247,55 @@ __all__ = [
     "seq_from_number",
     # storage
     "MemoryStorage",
+    # harness
+    "Harness",
+    "create_registry",
+    "watch_events",
+    "configure",
+    "AgentDoc",
+    "InboxDoc",
+    "LiveDoc",
+    "ProviderDoc",
+    "UsageDoc",
+    "NestedCallDoc",
+    "GenerationTask",
+    "ToolTask",
+    "CompactionTask",
+    "DEFAULT_COMPACTION_POLICY",
+    "DEFAULT_PROGRESS_POLICY",
+    "DEFAULT_RESTART_LIMIT",
+    "DEFAULT_RETRY_POLICY",
+    "AgentEvent",
+    "AgentEventStream",
+    "BlockedReason",
+    "CompactionCheckpoint",
+    "CompactionFailure",
+    "CompactionInput",
+    "CompactionStatus",
+    "ConversationView",
+    "GenerationCheckpoint",
+    "GenerationInput",
+    "GenerationResult",
+    "InboxItem",
+    "InboxState",
+    "LiveState",
+    "MessageChange",
+    "NestedCallState",
+    "NestedToolSlot",
+    "NestedToolSummary",
+    "ProviderState",
+    "SnapshotEvent",
+    "SummaryRequest",
+    "TaskGraph",
+    "TaskGraphNode",
+    "TaskGraphState",
+    "TaskGraphWatch",
+    "ToolEventCall",
+    "ToolSlot",
+    "ToolTaskCheckpoint",
+    "ToolTaskInput",
+    "ToolTaskResult",
+    "UsageState",
     # harness types
     "AfterFailedRun",
     "Agent",
@@ -232,7 +317,6 @@ __all__ = [
     "EnvTarget",
     "Extension",
     "GenerationHooks",
-    "Harness",
     "HarnessInspection",
     "HarnessOptions",
     "HarnessSettings",

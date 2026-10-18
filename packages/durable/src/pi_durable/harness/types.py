@@ -15,8 +15,9 @@ Port of ``harness/types.ts`` (types only; the Harness implementation lives in th
 - Interfaces with behavior (``Conversation``, ``Harness``, ``ToolExecutionApi``, ``RegistrySnapshot``)
   are ``Protocol`` s with snake_case members.
 
-Types defined by later harness modules (``ConversationView``, ``TaskGraph``, ``TaskGraphWatch``,
-``UsageState``) are ``Any`` aliases here until those modules exist.
+``ConversationView``, ``TaskGraph``, ``TaskGraphWatch`` and ``UsageState`` are defined by
+:mod:`pi_durable.harness.view`, :mod:`pi_durable.harness.task_graph` and :mod:`pi_durable.harness.usage`
+and re-exported here for type checkers.
 """
 
 from __future__ import annotations
@@ -79,6 +80,9 @@ if TYPE_CHECKING:
     from pi_ai.models import Models
 
     from ..env import ExecutionEnv, ShellOutputSkip, ShellOutputWindow
+    from .task_graph import TaskGraph, TaskGraphWatch
+    from .usage import UsageState
+    from .view import ConversationView
 
 __all__ = [
     "ModelRef",
@@ -180,15 +184,6 @@ __all__ = [
 T = TypeVar("T")
 R = TypeVar("R")
 
-#: ``ConversationView`` of ``harness/view.ts`` (stage 3 replaces this alias).
-ConversationView: TypeAlias = Any
-#: ``TaskGraph`` of ``harness/task-graph.ts`` (stage 3 replaces this alias).
-TaskGraph: TypeAlias = Any
-#: ``TaskGraphWatch`` of ``harness/task-graph.ts`` (stage 3 replaces this alias).
-TaskGraphWatch: TypeAlias = Any
-#: ``UsageState`` of ``harness/usage.ts`` (stage 3 replaces this alias).
-UsageState: TypeAlias = Any
-
 
 class ModelRef(TypedDict):
     """Provider and model ID resolved through pi-ai ``Models``."""
@@ -243,9 +238,9 @@ class Submission(Protocol):
 
     @property
     def id(self) -> SubmissionId: ...
-    async def status(self, context: Context) -> SubmissionRecord: ...
-    async def wait(self, context: Context) -> SettledSubmissionRecord: ...
-    async def abort(self, context: Context) -> Literal["aborted", "already_placed", "settled"]: ...
+    def status(self, context: Context) -> Awaitable[SubmissionRecord]: ...
+    def wait(self, context: Context) -> Awaitable[SettledSubmissionRecord]: ...
+    def abort(self, context: Context) -> Awaitable[Literal["aborted", "already_placed", "settled"]]: ...
 
 
 class SettledTask(TaskRecord[Any, Any, R]):
@@ -259,12 +254,12 @@ class ConversationHandle(Protocol):
 
     @property
     def id(self) -> ConversationId: ...
-    async def submit(self, submission: InputSubmissionDraft, context: Context) -> Submission: ...
-    async def abort(self, context: Context, *, background: bool = False) -> None:
+    def submit(self, submission: InputSubmissionDraft, context: Context) -> Awaitable[Submission]: ...
+    def abort(self, context: Context, *, background: bool = False) -> Awaitable[None]:
         """``Conversation.abort()``: withdraw queued inputs, abort the ordinary ownership scope, wait until idle."""
         ...
 
-    async def wait_for_idle(self, context: Context) -> None:
+    def wait_for_idle(self, context: Context) -> Awaitable[None]:
         """Resolve when the conversation's ordinary ownership scope has no live non-background task."""
         ...
 
@@ -342,7 +337,7 @@ class ToolExecutionApi(DocumentObserver, DocumentReader, Protocol):
         """The tool task's phase snapshot."""
         ...
 
-    async def agent(self, context: Context) -> Agent:
+    def agent(self, context: Context) -> Awaitable[Agent]:
         """The calling conversation's agent, as the tool task's phase resolved it."""
         ...
 
@@ -377,27 +372,27 @@ class ToolExecutionApi(DocumentObserver, DocumentReader, Protocol):
         """Record a model-visible remark about this call."""
         ...
 
-    async def details(self, value: Any, context: Context) -> None:
+    def details(self, value: Any, context: Context) -> Awaitable[None]:
         """Replace running details; the last value becomes the result details when the result omits them."""
         ...
 
-    async def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> T: ...
+    def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> Awaitable[T]: ...
 
     @overload
-    async def memo(self, name: str, context: Context, /) -> Any: ...
+    def memo(self, name: str, context: Context, /) -> Awaitable[Any]: ...
     @overload
-    async def memo(self, name: str, candidate: T, context: Context, /) -> T: ...
+    def memo(self, name: str, candidate: T, context: Context, /) -> Awaitable[T]: ...
 
-    async def create_task(
+    def create_task(
         self, task: Task[Any, Any, R, Any], input: Any, options: TaskOptions, context: Context
-    ) -> TaskId[R]:
+    ) -> Awaitable[TaskId[R]]:
         """Create a task in one commit (``options`` without ``conversationId``)."""
         ...
 
-    async def get_task(self, id: TaskId[R], context: Context) -> TaskRecord[Any, Any, R] | None: ...
-    async def wait_for_task(self, id: TaskId[R], context: Context) -> SettledTask[R]: ...
-    async def conversation(self, id: ConversationId, context: Context) -> ConversationHandle | None: ...
-    async def execute_tool(
+    def get_task(self, id: TaskId[R], context: Context) -> Awaitable[TaskRecord[Any, Any, R] | None]: ...
+    def wait_for_task(self, id: TaskId[R], context: Context) -> Awaitable[SettledTask[R]]: ...
+    def conversation(self, id: ConversationId, context: Context) -> Awaitable[ConversationHandle | None]: ...
+    def execute_tool(
         self,
         name: str,
         args: JsonObject,
@@ -405,7 +400,7 @@ class ToolExecutionApi(DocumentObserver, DocumentReader, Protocol):
         *,
         key: str | None = None,
         progress: bool | None = None,
-    ) -> NestedToolExecutionResult:
+    ) -> Awaitable[NestedToolExecutionResult]:
         """Run tool ``name`` as a nested call of this one and wait for its result (see upstream for the rules)."""
         ...
 
@@ -896,7 +891,7 @@ class ContextView(TypedDict):
     messages: ReadOnly[Sequence[Message]]
 
 
-ConversationWatch: TypeAlias = WatchHandle[ConversationView]
+ConversationWatch: TypeAlias = "WatchHandle[ConversationView]"
 
 
 class Conversation(Protocol):
@@ -904,55 +899,55 @@ class Conversation(Protocol):
 
     @property
     def id(self) -> ConversationId: ...
-    async def agent(self, context: Context) -> Agent:
+    def agent(self, context: Context) -> Awaitable[Agent]:
         """Resolved with the current registry snapshot and settings."""
         ...
 
-    async def configure(self, change: AgentChange, context: Context) -> None:
+    def configure(self, change: AgentChange, context: Context) -> Awaitable[None]:
         """``configure()`` in its own commit."""
         ...
 
-    async def submit(self, submission: SubmissionDraft, context: Context) -> Submission:
+    def submit(self, submission: SubmissionDraft, context: Context) -> Awaitable[Submission]:
         """Durably admit user input or a passive entry write."""
         ...
 
-    async def reset(self, handoff: str | None, context: Context) -> None:
+    def reset(self, handoff: str | None, context: Context) -> Awaitable[None]:
         """Admit a write of a ``pi.reset`` entry that starts a new context."""
         ...
 
-    async def compact(self, instructions: str | None, context: Context) -> TaskId[CompactionResult]:
+    def compact(self, instructions: str | None, context: Context) -> Awaitable[TaskId[CompactionResult]]:
         """Admit a manual compaction task and return its ID."""
         ...
 
-    async def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> T:
+    def commit(self, change: Callable[[Tx], T | Awaitable[T]], context: Context) -> Awaitable[T]:
         """Session commit whose ``tx.create_task()`` defaults to this conversation."""
         ...
 
-    async def context(self, context: Context, *, at: EntryId | None = None) -> ContextView:
+    def context(self, context: Context, *, at: EntryId | None = None) -> Awaitable[ContextView]:
         """Committed raw active transcript and model context; with ``at``, as of that visible entry."""
         ...
 
-    async def entries(
+    def entries(
         self,
         query: EntriesQuery,
         limit: int,
         cursor: Cursor | None,
         context: Context,
-    ) -> Page[EntryRecord]:
+    ) -> Awaitable[Page[EntryRecord]]:
         """Fork-aware history of this conversation, newest first unless ``query["order"]`` is ``ascending``."""
         ...
 
-    async def fork(self, at: EntryId, options: ConversationCreateOptions, context: Context) -> Conversation: ...
-    async def abort(self, context: Context, *, background: bool = False) -> None:
+    def fork(self, at: EntryId, options: ConversationCreateOptions, context: Context) -> Awaitable[Conversation]: ...
+    def abort(self, context: Context, *, background: bool = False) -> Awaitable[None]:
         """Withdraw queued inputs, mark every live non-background task of the scope, and resolve once idle."""
         ...
 
-    async def wait_for_idle(self, context: Context) -> None: ...
-    async def view_state(self, context: Context) -> AttachedReplicatedState[ConversationView]:
+    def wait_for_idle(self, context: Context) -> Awaitable[None]: ...
+    def view_state(self, context: Context) -> Awaitable[AttachedReplicatedState[ConversationView]]:
         """The structural view (spec §9.3) as a disposable read-only Chord state."""
         ...
 
-    async def watch(self, context: Context) -> ConversationWatch:
+    def watch(self, context: Context) -> Awaitable[ConversationWatch]:
         """The structural view as a serialized exact-frame watch with bounded pending frames."""
         ...
 
@@ -976,46 +971,46 @@ class Harness(Session, Protocol):
         """When this Session next needs a running process, from the scheduler's memory."""
         ...
 
-    async def root(
+    def root(
         self,
         context: Context,
         *,
         agent: AgentChange | None = None,
         init: ConversationInit | None = None,
-    ) -> Conversation:
+    ) -> Awaitable[Conversation]:
         """Return the reserved root conversation, creating it with ``agent`` and ``init`` in one commit when absent."""
         ...
 
-    async def conversation(self, id: ConversationId, context: Context) -> Conversation | None: ...
-    async def create_conversation(self, options: ConversationCreateOptions, context: Context) -> Conversation: ...
-    async def get_task(self, id: TaskId[R], context: Context) -> TaskRecord[Any, Any, R] | None: ...
-    async def inspect(self, context: Context) -> HarnessInspection:
+    def conversation(self, id: ConversationId, context: Context) -> Awaitable[Conversation | None]: ...
+    def create_conversation(self, options: ConversationCreateOptions, context: Context) -> Awaitable[Conversation]: ...
+    def get_task(self, id: TaskId[R], context: Context) -> Awaitable[TaskRecord[Any, Any, R] | None]: ...
+    def inspect(self, context: Context) -> Awaitable[HarnessInspection]:
         """Live tasks and unsettled submissions. Writes nothing and runs no task code."""
         ...
 
-    async def submission(self, id: SubmissionId, context: Context) -> Submission | None:
+    def submission(self, id: SubmissionId, context: Context) -> Awaitable[Submission | None]:
         """Reacquire a submission, for example after reopen."""
         ...
 
-    async def abort_submission(
+    def abort_submission(
         self, id: SubmissionId, context: Context, conversation_id: ConversationId | None = None
-    ) -> Literal["aborted", "already_placed", "settled", "not_found"]: ...
-    async def abort_task(self, id: TaskId[Any], context: Context) -> Literal["marked", "terminal"]: ...
-    async def retry_task(self, id: TaskId[Any], context: Context) -> None:
+    ) -> Awaitable[Literal["aborted", "already_placed", "settled", "not_found"]]: ...
+    def abort_task(self, id: TaskId[Any], context: Context) -> Awaitable[Literal["marked", "terminal"]]: ...
+    def retry_task(self, id: TaskId[Any], context: Context) -> Awaitable[None]:
         """Run a task parked by ``settings.restartLimit`` again."""
         ...
 
-    async def wait_for_task(self, id: TaskId[R], context: Context) -> SettledTask[R]:
+    def wait_for_task(self, id: TaskId[R], context: Context) -> Awaitable[SettledTask[R]]:
         """Resolve with the terminal receipt; cancelling ``context`` cancels only this wait."""
         ...
 
-    async def wait_for_idle(self, context: Context) -> None: ...
-    async def usage(self, context: Context) -> UsageState:
+    def wait_for_idle(self, context: Context) -> Awaitable[None]: ...
+    def usage(self, context: Context) -> Awaitable[UsageState]:
         """Session total: every conversation's ``pi.usage`` summed."""
         ...
 
-    async def task_graph(self, context: Context) -> AttachedReplicatedState[TaskGraph]: ...
-    async def watch_task_graph(self, context: Context) -> TaskGraphWatch: ...
+    def task_graph(self, context: Context) -> Awaitable[AttachedReplicatedState[TaskGraph]]: ...
+    def watch_task_graph(self, context: Context) -> Awaitable[TaskGraphWatch]: ...
 
 
 class HookApi(DocumentReader, Protocol):
@@ -1121,3 +1116,20 @@ class CompactionHooks(TypedDict, total=False):
     """
 
     before_compact: Callable[[CompactionHookInput, HookApi, Context], HookResult[CompactionDecline | CompactionSummary]]
+
+
+def __getattr__(name: str) -> Any:
+    """The types later harness modules define, imported on first access (they import this module)."""
+    if name == "ConversationView":
+        from .view import ConversationView
+
+        return ConversationView
+    if name in ("TaskGraph", "TaskGraphWatch"):
+        from . import task_graph
+
+        return getattr(task_graph, name)
+    if name == "UsageState":
+        from .usage import UsageState
+
+        return UsageState
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

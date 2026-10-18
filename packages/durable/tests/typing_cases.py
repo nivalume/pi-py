@@ -28,6 +28,8 @@ from pi_durable import (
 from pi_durable.env import ExecutionEnv, FileSystem
 from pi_durable.env.local import LocalExecutionEnv
 from pi_durable.harness.types import CompactionResult, SubmissionDraft
+from pi_durable.harness.types import Conversation as ConversationProtocol
+from pi_durable.harness.types import Harness as HarnessProtocol
 from pi_durable.storage.jsonl import JsonlStorage
 from pi_durable.storage.sqlite import SqliteStorage
 from pi_durable.types import (
@@ -302,6 +304,12 @@ async def typed_waits(
         lambda tx: tx.create_task(Stepper, {"steps": "two"}, {"ownership": {"kind": "conversation"}}),  # pyright: ignore
         context,
     )
+
+
+async def harness_implements_its_protocols(harness: Harness, context: Context) -> None:
+    as_protocol: HarnessProtocol = harness
+    root: ConversationProtocol = await harness.root(context)
+    del as_protocol, root
 
 
 def memory_storage_is_a_storage() -> None:

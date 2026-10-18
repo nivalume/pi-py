@@ -226,8 +226,9 @@ class Storage(Protocol):
 
 ## 7. Notes for later stages
 
-- `harness/types.py` aliases `ConversationView`, `TaskGraph`, `TaskGraphWatch`, `UsageState` to `Any`
-  until `harness/view.py`, `task_graph.py`, `usage.py` exist; replace the aliases with imports.
+- (Done in stage 3.) `harness/types.py` imports `ConversationView`, `TaskGraph`, `TaskGraphWatch`,
+  `UsageState` from `harness/view.py`, `task_graph.py`, `usage.py` under `TYPE_CHECKING` and exports them
+  lazily through a module `__getattr__` (those modules import `harness/types.py`).
 - `GenerationContinue` is `{"continue": input}` (functional `TypedDict`, `continue` is a keyword).
 - `ToolHookCall` subclasses `pi_ai.ToolCall` with a keyword-only `parent`.
 - `ToolRegistration` subclasses `pi_ai.Tool`; it is hashed and compared by identity.
@@ -320,3 +321,85 @@ Rules:
   dataclasses; `benchmarks/bench_durable_storage.py` runs them for memory, SQLite and JSONL.
 - The package root does not import the SQLite/JSONL backends, the local environment or `testing`, as
   upstream's `index.ts` (`tests/test_storage_runtime_boundary.py`).
+
+## 10. The Harness (stage 3)
+
+`pi_durable/harness/` ports `src/harness/` file for file (`task-graph.ts` is `task_graph.py`):
+`harness, scheduler, generation, tool, compaction, context, agent, events, inbox, live, prompt, provider,
+registry, submissions, task_graph, usage, util, view`, plus `stream.py` (no upstream module: it converts the
+stored camelCase `ConversationStreamOptions` to pi-ai's snake_case keyword options, and a resolved
+`ConversationRetryPolicy` to `pi_ai.utils.retry.RetryPolicy`). `pi_durable/__init__.py` now mirrors
+`index.ts` completely (except `src/tools/`, not ported in phase 1).
+
+API shape:
+
+- `Harness` is the concrete class (`class Harness(SessionImpl)`), opened with
+  `await Harness.open(storage, options, context)`; `options` is the `HarnessOptions` dict with upstream's
+  keys (`models`, `registry`, `settings`, `env`, `now`, `setTimer`, `onWake`, `onReport`,
+  `conversationCreated`). `settings` may be a dict or a function returning one; it is read at every use
+  (upstream's getters). The `Harness` protocol stays in `pi_durable.harness.types`; the class satisfies it
+  (`tests/typing_cases.py` checks).
+- **Eager methods.** As the Session's (section 5), the Harness and conversation methods whose upstream body
+  admits work to the Session line before its first `await` are plain `def`s returning an already started
+  `asyncio.Future`: `Conversation.configure/submit/reset/compact/commit/context/entries/fork/abort/
+  wait_for_idle/agent`, `Harness.root/conversation/create_conversation/get_task/inspect/submission/
+  abort_submission/abort_task/retry_task/wait_for_task/wait_for_idle/task_graph/watch_task_graph`,
+  `Submission.status/wait/abort`, and `ToolExecutionApi.details` (its checks and the update run at the
+  call). The protocols in `harness/types.py` declare these `def ... -> Awaitable[T]`. Helpers in
+  `harness/util.py`: `eager(awaitable, then)` keeps a started operation as a future; `chain(future, then,
+  context=None)` is `promise.then(then)` through done callbacks (no extra task hop; a cancelled `context`
+  rejects only the wait).
+- The scheduler's `queueMicrotask` is `loop.call_soon`; its drain and reconcile tasks are spawned directly
+  (one loop hop, like a microtask).
+- Hook tables are dicts keyed by snake_case names (section 2): `GenerationTask` `before_request`,
+  `after_response`, `on_yield`, `after_tools`; `ToolTask` `before_tool`, `after_tool`; `CompactionTask`
+  `before_compact`. Handlers take upstream's arguments, `context` last, and may be sync or async.
+  Internally `agent_hooks()` returns `(extension_name, handlers)` tuples.
+- Messages live in documents and task checkpoints as **JSON** (`pi_ai.serialization.to_json_value`,
+  read back with `message_from_dict`): `pi.live` `generation.message`, the deferred handle, nested
+  `ToolCall`s, `pi.usage` (`Usage` as camelCase JSON: `usage_json(usage)`), inbox write items (`entry`
+  holds the draft with its `model` messages serialized). Entries keep pi-ai dataclasses (section 8).
+- Runtime commit callbacks are `change(tx, current)`; `Conversation.commit`/`Session.commit` take
+  `change(tx)`. `subscribe_commits` listeners are `listener(publication, context)`.
+- `watch_events(harness, conversation_id, context) -> AgentEventStream`; `stream.start(listener)` calls
+  `listener(events, context)` (sync or async); `stop()` returns a future.
+- `Conversation.abort(context, *, background=False)` replaces upstream's `ConversationAbortOptions`.
+- Tool `execute(args, api, context)` receives arguments validated against `parameters` (a JSON Schema
+  dict, or a Pydantic model, which then receives the model instance). `api.output(chunk, skipped=None)`
+  takes an `OutputSkip` or the `ShellOutputSkip` dict.
+- Error texts are upstream's except where Python's differ by nature (a non-JSON value reports Python's
+  `json` message, "... is not JSON serializable").
+
+Test helpers (`tests/durable_harness_support.py`, ports of `harness-support.ts`, `task-support.ts`,
+`chat-support.ts`; import with `from durable_harness_support import ...`):
+
+- Registries: `tool(name)` (empty-object schema, no output), `add_tool/add_task/add_hooks/add_section`
+  (each installs a one-item extension and returns an `Installed` with `dispose()`), `counting_reader`.
+- `open_harness(storage, tool_names, *, registry=None, on_report=None) -> OpenedHarness(harness, registry)`.
+- `open_tasks(storage, tasks, *, registry=None, now=None, settings=None, on_wake=None, set_timer=None) ->
+  OpenedTasks(harness, registry, reports, infos)`; `completed(result)`, `aborted_with(reason)`.
+- Chat: `chat_setup(**faux_options) -> ChatSetup(faux, models, registry, reports, settings, now)` (faux
+  options are snake_case, `tokens_per_second=200, token_size={"min": 1, "max": 1}` to stream slowly);
+  `open_chat(storage, setup, *, env=None) -> OpenedChat(harness, root)` opens over the same models,
+  registry and **live** `setup.settings` dict (assign keys such as `setup.settings["followUpMode"] = "all"`
+  between decisions) and configures the root with `faux/faux-1`. Script the model with
+  `setup.faux.set_responses([...])`: messages (`faux_assistant_message`, `faux_text`, `faux_tool_call`) or
+  step functions `step(request, options, state, model)` (`request.messages` holds the request's
+  `SystemMessage`s with `sections`, `tools_added`, `tools_removed`; `options["signal"]` is the abort
+  signal). `setup.faux.state.call_count` counts requests.
+- Fake clocks: `setup.now = lambda: 7` (read through a lambda, so it can be replaced after opening);
+  `open_tasks(..., now=..., set_timer=...)` for scheduler timers (a `set_timer(callback, delay_ms,
+  options)` that records callbacks lets a test fire them by hand).
+- Waiting: `flush()` (25 loop turns), `eventually(check)` (polls with `flush`), `wait_for(check,
+  timeout_ms=5000)` (real time, for throttle windows and timers), `settled(awaitable)`, `aborted(signal)`
+  (raises the reason when it aborts), `unanswered()` (a faux step that blocks until cancelled; `reached`
+  resolves once the request was sent). `durable_session_support.deferred()`/`resolve()` are gates.
+- `all_entries(conversation)`, `text_of(message)`, `describe_message`, `tools_named(setup, *names)`.
+- Deterministic driving: a Harness schedules nothing until `harness.resume()` (or a `submit`, `compact`,
+  `abort`, `wait_for_task` or `wait_for_idle`, which resume); `ControlledStorage(MemoryStorage(), STORAGE_BACKENDS["memory"])` gives
+  `hold_commits()` (returns a gate with `entered`/`release()` to occupy the Session line),
+  `fail_next_commit(error)`, `crash()` and `reopen()`. Prefer gates (`deferred()`) inside tool `execute`
+  functions, faux steps and task phases to sleeps.
+- Races: Python commits settle in fewer loop turns than JavaScript's (an `await` of a completed
+  awaitable does not yield), so a test that relies on a JS microtask interleaving may need an explicit
+  gate. `test_harness_tasks.py`'s double-abort case holds the abort handler on a gate for that reason.
