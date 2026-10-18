@@ -47,7 +47,8 @@ OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp, ...).
 ## Installation
 
 ```bash
-pip install pi-ai               # runtime dependency: httpx
+pip install pi-ai               # httpx + official SDKs: anthropic, openai, google-genai
+pip install "pi-ai[bedrock]"    # + boto3 for Amazon Bedrock
 pip install "pi-ai[fast]"       # + orjson for faster stream decoding
 pip install "pi-ai[websocket]"  # + websockets for the OpenAI Codex WebSocket transport
 pip install "pi-ai[pydantic]"   # + pydantic, to use models as tool parameter schemas
@@ -543,8 +544,8 @@ immediately. You can also stop consuming and cancel the request with
 `is_context_overflow(message, context_window)` detects context overflow across providers
 (error messages, silent overflow, truncated length stops); `is_retryable_assistant_error`
 and `retry_assistant_call(produce, RetryPolicy(...), signal)` implement pi's retry policy.
-Requests also accept `max_retries`, `max_retry_delay_ms` and `timeout_ms` (SDK-compatible
-HTTP retries honoring `retry-after`).
+Requests also accept `max_retries`, `max_retry_delay_ms` and `timeout_ms` (HTTP retries
+honoring `retry-after`; Bedrock maps `max_retries` onto botocore's retry config).
 
 ### Debugging payloads and raw events
 
@@ -632,8 +633,11 @@ module on first request.
 ### Using a custom HTTP client
 
 Every request accepts `http_client=httpx.AsyncClient(...)` (the analog of pi's `fetch`
-option): useful for custom TLS, transports, or `httpx.MockTransport` in tests. Without it,
-requests share a pooled client per event loop; `await pi_ai.aclose_http_clients()` closes it.
+option): useful for custom TLS, transports, or `httpx.MockTransport` in tests. It is handed
+to the vendor SDK (`http_client=` for `anthropic`/`openai`, `HttpOptions(httpx_async_client=...)`
+for `google-genai`). Without it, requests share a pooled client per event loop;
+`await pi_ai.aclose_http_clients()` closes it. Bedrock goes through boto3 and does not use
+`http_client`.
 
 ## Faux provider for tests
 
@@ -768,15 +772,16 @@ Credentials are saved to `auth.json` in the current directory.
 
 API key (`GOOGLE_CLOUD_API_KEY` or `api_key=`), or Application Default Credentials:
 `gcloud auth application-default login` locally or `GOOGLE_APPLICATION_CREDENTIALS` with
-a service account file, plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`. Service
-account signing uses `google-auth` (or `cryptography`) when installed.
+a service account file, plus `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`. The
+`google-genai` SDK resolves ADC through `google-auth`.
 
 ### Amazon Bedrock
 
-Requests are signed with SigV4 by pi-ai itself. Credentials resolve from explicit
-options, env access keys, `AWS_BEARER_TOKEN_BEDROCK`, profiles in `~/.aws`, ECS task roles
-and web identity tokens; when `botocore` is installed its full credential chain (SSO etc.)
-is used first.
+Requires `pip install "pi-ai[bedrock]"` (boto3). Requests go through the boto3
+`bedrock-runtime` client, so credentials, region and endpoints resolve through botocore's
+standard chain (env keys, `~/.aws` profiles, SSO, ECS/EC2 roles, web identity), plus
+`AWS_BEARER_TOKEN_BEDROCK` or the `credentials=` option. boto3 is synchronous; the stream
+is read on a worker thread and abort closes it.
 
 ## Legacy global API
 
@@ -800,8 +805,11 @@ New code should use `create_models()` and provider factories.
   large arguments (`benchmarks/bench_partial_json.py`).
 - Streamed text and thinking accumulate in amortized linear time (`append_text`): plain
   `block.text += delta` copies the whole string on every delta in CPython.
-- End to end, the openai-completions and anthropic-messages adapters handle about 100,000
-  events per second on one core (`benchmarks/bench_stream.py`).
+- End to end on one core (`benchmarks/bench_stream.py`): anthropic-messages handles about
+  110,000 events per second, openai-completions about 70,000 (the openai SDK's SSE decoder
+  dominates). The google-genai SDK validates every streamed chunk with pydantic, roughly
+  100 µs per chunk; real Gemini chunks carry many tokens, so this is a few milliseconds per
+  response.
 - With `pi-ai[fast]`, SSE chunks decode with orjson.
 - Tool-argument validators compile once per schema and are cached.
 - Catalogs load lazily per provider; API implementations and OAuth flows import on first use.
@@ -815,8 +823,9 @@ New code should use `create_models()` and provider factories.
 - Tool schemas are JSON Schema dicts (`Type` builder included) or Pydantic models; TypeBox
   is not needed.
 - `fetch` is replaced by `http_client` (an `httpx.AsyncClient`).
-- Vendor SDKs are not used; error messages reproduce the SDK wording that pi's overflow and
-  retry detection rely on.
+- The adapters use the Python editions of the SDKs pi uses (`anthropic`, `openai`,
+  `google-genai`, and `boto3` in place of `@aws-sdk/client-bedrock-runtime`). Error messages
+  keep the JS SDK wording that pi's overflow and retry detection rely on.
 - Cloudflare Workers AI *bindings* (Workers runtime only) are not available.
 - Telemetry options (`telemetry_context`) are accepted and ignored.
 

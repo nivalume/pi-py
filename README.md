@@ -78,15 +78,19 @@ definitions and `auth.json` credential files are interchangeable with TypeScript
 
 ## Design notes
 
-* **No vendor SDKs.** Provider adapters speak the HTTP/SSE wire protocols directly
-  over a shared, pooled `httpx.AsyncClient`. The only runtime dependency is `httpx`
-  (`orjson`, `websockets`, `pydantic` are optional extras).
+* **Official vendor SDKs.** As in pi, the Anthropic, OpenAI (Chat Completions,
+  Responses, Azure, OpenRouter images), Google (Gemini, Vertex) and Bedrock adapters use
+  the vendors' official SDKs: `anthropic`, `openai`, `google-genai` and `boto3`
+  (`pi-ai[bedrock]`). The SDK clients share one pooled `httpx.AsyncClient` per event loop.
+  APIs that pi calls without an SDK (Mistral, OpenAI Codex, pi-messages, classifiers)
+  use `httpx` directly.
 * **Fast streaming path.** Slotted data classes, an allocation-light event queue,
   zero-copy forwarding between wrapped streams, an incremental partial-JSON parser
   for tool-call arguments (about 60x faster than re-parsing each delta on large
   arguments), linear-time accumulation of streamed text, optional `orjson` decoding,
-  and compiled, cached tool-argument validators. The adapters process roughly
-  100,000 stream events per second on one core (see `benchmarks/`).
+  and compiled, cached tool-argument validators. On one core the anthropic-messages
+  adapter processes about 110,000 stream events per second and openai-completions about
+  70,000, where the openai SDK's SSE decoder is the limit (see `benchmarks/`).
 * **Lazy everything.** Model catalogs load per provider on first use; API
   implementations and OAuth flows import on first request.
 * **Async-native cancellation.** `AbortSignal` aborts interrupt pending network reads

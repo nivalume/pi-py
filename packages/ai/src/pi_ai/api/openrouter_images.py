@@ -21,9 +21,9 @@ from ..types import (
 from ..utils import fastjson
 from ..utils.callbacks import maybe_await
 from ..utils.error_body import format_provider_error, normalize_provider_error
-from ..utils.http import build_headers, send_request
 from ..utils.misc import headers_to_record, provider_headers_to_record, sanitize_surrogates
 from ..utils.model_operations import image_error_result
+from .openai_sdk import create_openai_client, openai_request, sdk_body_arguments
 
 __all__ = ["generate_images"]
 
@@ -43,27 +43,23 @@ async def generate_images(
         api_key = options.get("api_key")
         if not api_key:
             raise ValueError(f"No API key for provider: {model.provider}")
+        client = create_openai_client(
+            api_key=api_key,
+            base_url=model.base_url,
+            headers=provider_headers_to_record(model.headers, options.get("headers")) or {},
+            options=options,
+        )
         params: Any = _build_params(model, context)
         on_payload = options.get("on_payload")
         if on_payload is not None:
             next_params = await maybe_await(on_payload(params, model))
             if next_params is not None:
                 params = next_params
-        headers = build_headers(
-            {"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-            provider_headers_to_record(model.headers, options.get("headers")),
-        )
+        create = client.chat.completions.with_raw_response.create
+        body_arguments = sdk_body_arguments(params, "model", "messages")
         try:
             async with abort_scope(signal):
-                response = await send_request(
-                    "POST",
-                    _chat_completions_url(model.base_url),
-                    headers=headers,
-                    body=params,
-                    options=options,
-                    stream=False,
-                    error_style="openai",
-                )
+                response = await openai_request(lambda: create(**body_arguments), options)
         except AbortError as error:
             raise AbortError("Request aborted") from error
         on_response = options.get("on_response")
@@ -109,11 +105,6 @@ async def generate_images(
         failed.usage = output.usage
         failed.timestamp = output.timestamp
         return failed
-
-
-def _chat_completions_url(base_url: str) -> str:
-    # The OpenAI SDK joins its base URL and path without doubling one trailing slash.
-    return f"{base_url[:-1] if base_url.endswith('/') else base_url}/chat/completions"
 
 
 def _build_params(model: ImageModel, context: ImagesContext) -> dict[str, Any]:

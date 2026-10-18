@@ -1,38 +1,59 @@
 """End-to-end streaming tests for the Google adapters against the in-process mock server.
 
 Ports of upstream test/google-raw-stop-reason.test.ts, google-thinking-level-map.test.ts and
-google-vertex-api-key-resolution.test.ts (which mock ``@google/genai``), plus REST-level checks
-of URLs, headers, errors and ADC token loading.
+google-vertex-api-key-resolution.test.ts (which mock ``@google/genai``), plus wire-level checks
+of the official ``google-genai`` SDK's URLs, headers, errors and ADC credentials.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
+import datetime
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
+import google.auth
+import google.oauth2.credentials
 import httpx
 import pytest
+from google.auth.credentials import Credentials
+from google.auth.exceptions import RefreshError
+from google.genai import types as genai_types
+from google.genai import version as genai_version
 
-import pi_ai.auth.google_adc as google_adc
 from pi_ai import AbortController, Context, Model, Tool, UserMessage, normalize_context
-from pi_ai.api import google_generative_ai, google_vertex
+from pi_ai.api import google_generative_ai, google_shared, google_vertex
 from pi_ai.providers.catalog import get_builtin_model
 from pi_ai.utils.misc import get_pi_user_agent
 
 CONTEXT = normalize_context(Context(messages=[UserMessage("hello")]))
+#: The label the SDK puts in front of the User-Agent and sends as x-goog-api-client.
+SDK_LABEL = f"google-genai-sdk/{genai_version.__version__} gl-python/{sys.version.split()[0]}"
+PI_USER_AGENT = f"{SDK_LABEL} {get_pi_user_agent()}"
 
 
 @pytest.fixture(autouse=True)
-def _isolate_adc(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Use the built-in credentials file support even when google-auth happens to be installed.
-    monkeypatch.setattr(google_adc, "_import_google_auth", lambda: None)
-    for name in ("GOOGLE_CLOUD_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GOOGLE_VERTEX_BASE_URL"):
+def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SDK reads these from os.environ; keep the developer's environment out of the tests.
+    for name in (
+        "GOOGLE_CLOUD_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
+        "GOOGLE_VERTEX_BASE_URL",
+        "GOOGLE_CLOUD_PROJECT",
+        "GCLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+        "GOOGLE_GENAI_USE_ENTERPRISE",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ):
         monkeypatch.delenv(name, raising=False)
-    google_adc.clear_google_auth_cache()
 
 
 @pytest.fixture
@@ -50,6 +71,19 @@ def adc_file(tmp_path: Path) -> Path:
         )
     )
     return path
+
+
+class FakeCredentials(Credentials):
+    """ADC credentials whose refresh hands out a fixed token without network access."""
+
+    def __init__(self, token: str = "adc-token") -> None:
+        super().__init__()
+        self.next_token = token
+        self.refreshes = 0
+
+    def refresh(self, request: Any) -> None:
+        self.refreshes += 1
+        self.token = self.next_token
 
 
 def google_model(id: str = "gemini-2.5-flash", **overrides: Any) -> Model:
@@ -150,8 +184,10 @@ async def test_text_and_thinking_stream(mock_server: Any) -> None:
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
     )
     assert request.headers["x-goog-api-key"] == "key"
-    assert request.headers["user-agent"] == get_pi_user_agent()
-    assert request.headers["x-goog-api-client"].startswith("google-genai-sdk/")
+    # The SDK prefixes pi's User-Agent with its own label and sends that label as x-goog-api-client.
+    assert request.headers["user-agent"] == PI_USER_AGENT
+    assert request.headers["x-goog-api-client"] == SDK_LABEL
+    assert request.headers["content-type"] == "application/json"
     assert request.json() == {"contents": [{"role": "user", "parts": [{"text": "hello"}]}], "generationConfig": {}}
 
 
@@ -211,15 +247,18 @@ def vertex_options(mock_server: Any, **extra: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def fake_adc(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
-    calls: list[dict[str, Any]] = []
+def fake_adc(monkeypatch: pytest.MonkeyPatch) -> list[FakeCredentials]:
+    """Replace ``google.auth.default()`` (what the SDK calls for ADC); records the credentials it hands out."""
+    issued: list[FakeCredentials] = []
 
-    async def fake_headers(**kwargs: Any) -> dict[str, str]:
-        calls.append(kwargs)
-        return {"authorization": "Bearer adc-token"}
+    def fake_default(scopes: Any = None, **_kwargs: Any) -> tuple[Credentials, str]:
+        assert scopes == ["https://www.googleapis.com/auth/cloud-platform"]
+        credentials = FakeCredentials()
+        issued.append(credentials)
+        return credentials, "adc-project"
 
-    monkeypatch.setattr(google_vertex, "get_google_auth_headers", fake_headers)
-    return calls
+    monkeypatch.setattr(google.auth, "default", fake_default)
+    return issued
 
 
 async def test_raw_finish_reason_google(mock_server: Any) -> None:
@@ -292,7 +331,13 @@ async def test_forwards_provider_stream_events(mock_server: Any, fake_adc: Any, 
         model = vertex_model()
         s = google_vertex.stream(model, CONTEXT, vertex_options(mock_server, on_provider_stream_event=on_event))
     result = await s.result()
-    assert received == chunks
+    # Like upstream, the hook receives the SDK's GenerateContentResponse objects.
+    assert all(isinstance(chunk, genai_types.GenerateContentResponse) for chunk in received)
+    dumped = [
+        chunk.model_dump(mode="json", by_alias=True, exclude_none=True, exclude={"sdk_http_response"})
+        for chunk in received
+    ]
+    assert dumped == chunks
     assert models == [model, model]
     assert result.stop_reason == "stop"
     assert result.response_id == "resp_google"
@@ -321,7 +366,7 @@ async def test_user_agent_defaults_and_overrides(mock_server: Any) -> None:
     await google_generative_ai.stream(
         google_model(), CONTEXT, {"api_key": "k", "http_client": mock_server.client()}
     ).result()
-    assert mock_server.last.headers["user-agent"] == get_pi_user_agent()
+    assert mock_server.last.headers["user-agent"] == PI_USER_AGENT
     mock_server.add_sse([stop_chunk()])
     await google_generative_ai.stream(
         google_model(),
@@ -332,7 +377,7 @@ async def test_user_agent_defaults_and_overrides(mock_server: Any) -> None:
             "headers": {"User-Agent": "custom-agent", "x-goog-api-key": "mine"},
         },
     ).result()
-    assert mock_server.last.headers["user-agent"] == "custom-agent"
+    assert mock_server.last.headers["user-agent"] == f"{SDK_LABEL} custom-agent"
     # Like the SDK, an explicit API key header is not overwritten.
     assert mock_server.last.headers["x-goog-api-key"] == "mine"
 
@@ -571,8 +616,8 @@ async def test_vertex_falls_back_to_adc(mock_server: Any, fake_adc: Any, api_key
     )
     assert request.headers["authorization"] == "Bearer adc-token"
     assert "x-goog-api-key" not in request.headers
-    assert request.headers["user-agent"] == get_pi_user_agent()
-    assert len(fake_adc) == 1
+    assert request.headers["user-agent"] == PI_USER_AGENT
+    assert len(fake_adc) == 1 and fake_adc[0].refreshes == 1
 
 
 async def test_vertex_placeholder_env_key_uses_adc(
@@ -641,7 +686,7 @@ async def test_vertex_project_and_location_from_env(mock_server: Any, fake_adc: 
     assert mock_server.last.url.startswith(
         "https://asia-east1-aiplatform.googleapis.com/v1/projects/env-project/locations/asia-east1/"
     )
-    assert fake_adc[0]["env"] == env
+    assert mock_server.last.headers["authorization"] == "Bearer adc-token"
 
 
 async def test_vertex_requires_project_and_location(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -658,175 +703,232 @@ async def test_vertex_requires_project_and_location(monkeypatch: pytest.MonkeyPa
 
 
 # ---------------------------------------------------------------------------
-# ADC token loading
+# ADC credentials (google-auth through the SDK)
 # ---------------------------------------------------------------------------
 
+# google.auth.load_credentials_from_file (what keyFilename maps to) warns that it accepts any type.
+_load_file_warning = pytest.mark.filterwarnings("ignore:The load_credentials_from_file method is deprecated")
 
-async def test_vertex_adc_authorized_user_file(mock_server: Any, adc_file: Path) -> None:
-    mock_server.add(token_response())
+
+@pytest.fixture
+def fake_refresh(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Refresh authorized_user credentials without calling oauth2.googleapis.com."""
+    refreshed: list[str] = []
+
+    def refresh(self: google.oauth2.credentials.Credentials, request: Any) -> None:
+        refreshed.append(self.refresh_token or "")
+        self.token = "ya29.token"
+        self.expiry = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) + datetime.timedelta(hours=1)
+
+    monkeypatch.setattr(google.oauth2.credentials.Credentials, "refresh", refresh)
+    return refreshed
+
+
+@_load_file_warning
+async def test_vertex_adc_credentials_file(mock_server: Any, adc_file: Path, fake_refresh: list[str]) -> None:
     mock_server.add_sse([stop_chunk()])
     mock_server.add_sse([stop_chunk()])
-    options = vertex_options(mock_server, env={"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)})
+    client = mock_server.client()
+    options = {
+        **vertex_options(mock_server, env={"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)}),
+        "http_client": client,
+    }
     message = await google_vertex.stream(vertex_model(), CONTEXT, options).result()
     assert message.stop_reason == "stop", message.error_message
+    request = mock_server.last
+    assert request.headers["authorization"] == "Bearer ya29.token"
+    assert request.headers["x-goog-user-project"] == "quota-project"
+    assert fake_refresh == ["refresh-token"]
 
-    token_request, model_request = mock_server.requests
-    assert token_request.url == "https://oauth2.googleapis.com/token"
-    assert token_request.headers["content-type"] == "application/x-www-form-urlencoded"
-    form = dict(pair.split("=", 1) for pair in token_request.body.decode().split("&"))
-    assert form == {
-        "grant_type": "refresh_token",
-        "client_id": "client-id",
-        "client_secret": "client-secret",
-        "refresh_token": "refresh-token",
-    }
-    assert model_request.headers["authorization"] == "Bearer ya29.token"
-    assert model_request.headers["x-goog-user-project"] == "quota-project"
-
-    # The token is cached until it nears expiry.
+    # The SDK client (and with it the credentials and their token) is reused.
     await google_vertex.stream(vertex_model(), CONTEXT, options).result()
-    assert len(mock_server.requests) == 3
-    assert mock_server.last.headers["authorization"] == "Bearer ya29.token"
-
-
-async def test_adc_token_refreshes_when_expiring(mock_server: Any, adc_file: Path) -> None:
-    mock_server.add(httpx.Response(200, json={"access_token": "short", "expires_in": 60}))
-    mock_server.add(httpx.Response(200, json={"access_token": "second", "expires_in": 3600}))
-    env = {"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)}
-    first = await google_adc.get_google_auth_headers(env=env, http_client=mock_server.client())
-    second = await google_adc.get_google_auth_headers(env=env, http_client=mock_server.client())
-    assert first["authorization"] == "Bearer short"
-    assert second["authorization"] == "Bearer second"
-    assert await google_adc.get_google_access_token(env=env, http_client=mock_server.client()) == "second"
     assert len(mock_server.requests) == 2
+    assert mock_server.last.headers["authorization"] == "Bearer ya29.token"
+    assert fake_refresh == ["refresh-token"]
 
 
-async def test_adc_well_known_file(mock_server: Any, adc_file: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-    config_dir = adc_file.parent / "gcloud"
-    config_dir.mkdir()
-    os.replace(adc_file, config_dir / "application_default_credentials.json")
-    mock_server.add(token_response())
-    headers = await google_adc.get_google_auth_headers(
-        env={"CLOUDSDK_CONFIG": str(config_dir)}, http_client=mock_server.client()
-    )
-    assert headers["authorization"] == "Bearer ya29.token"
+async def test_vertex_default_adc_is_loaded_once_per_client(mock_server: Any, fake_adc: list[FakeCredentials]) -> None:
+    client = mock_server.client()
+    for _ in range(3):
+        mock_server.add_sse([stop_chunk()])
+        message = await google_vertex.stream(
+            vertex_model(), CONTEXT, {**vertex_options(mock_server), "http_client": client}
+        ).result()
+        assert message.stop_reason == "stop", message.error_message
+    assert len(fake_adc) == 1 and fake_adc[0].refreshes == 1
 
 
-async def test_adc_errors(mock_server: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-    with pytest.raises(google_adc.GoogleAuthError, match="Could not load the default credentials"):
-        await google_adc.get_google_auth_headers(env={"CLOUDSDK_CONFIG": str(tmp_path / "none")})
-    with pytest.raises(google_adc.GoogleAuthError, match="does not exist"):
-        await google_adc.get_google_auth_headers(env={"GOOGLE_APPLICATION_CREDENTIALS": str(tmp_path / "missing.json")})
-
-    external = tmp_path / "external.json"
-    external.write_text(json.dumps({"type": "external_account"}))
-    with pytest.raises(google_adc.GoogleAuthError, match="pip install google-auth"):
-        await google_adc.get_google_auth_headers(env={"GOOGLE_APPLICATION_CREDENTIALS": str(external)})
-
-    incomplete = tmp_path / "incomplete.json"
-    incomplete.write_text(json.dumps({"type": "authorized_user", "client_id": "x"}))
-    with pytest.raises(google_adc.GoogleAuthError, match="does not contain a client_secret field"):
-        await google_adc.get_google_auth_headers(env={"GOOGLE_APPLICATION_CREDENTIALS": str(incomplete)})
+@_load_file_warning
+async def test_vertex_missing_credentials_file(tmp_path: Path) -> None:
+    options = {
+        "project": "p",
+        "location": "us-central1",
+        "env": {"GOOGLE_APPLICATION_CREDENTIALS": str(tmp_path / "x")},
+    }
+    message = await google_vertex.stream(vertex_model(), CONTEXT, options).result()
+    assert message.stop_reason == "error"
+    assert "was not found" in (message.error_message or "")
 
 
-async def test_adc_token_endpoint_failures(mock_server: Any, adc_file: Path) -> None:
-    env = {"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)}
-    mock_server.add_json(
-        {"error": "invalid_grant", "error_description": "Token has been expired or revoked."}, status=400
-    )
-    with pytest.raises(Exception, match="invalid_grant: Token has been expired or revoked."):
-        await google_adc.get_google_auth_headers(env=env, http_client=mock_server.client())
+@_load_file_warning
+async def test_vertex_adc_refresh_failure_becomes_stream_error(
+    mock_server: Any, adc_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refresh(self: Any, request: Any) -> None:
+        raise RefreshError("invalid_grant: Token has been expired or revoked.")
 
-    def refuse(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connect ECONNREFUSED", request=request)
-
-    mock_server.add(refuse)
-    with pytest.raises(
-        google_adc.GoogleAuthError, match=r"request to https://oauth2.googleapis.com/token failed, reason:"
-    ):
-        await google_adc.get_google_auth_headers(env=env, http_client=mock_server.client())
-
-
-async def test_vertex_adc_failure_becomes_stream_error(mock_server: Any, adc_file: Path) -> None:
-    mock_server.add_json({"error": "invalid_grant"}, status=400)
+    monkeypatch.setattr(google.oauth2.credentials.Credentials, "refresh", refresh)
     options = vertex_options(mock_server, env={"GOOGLE_APPLICATION_CREDENTIALS": str(adc_file)})
     message = await google_vertex.stream(vertex_model(), CONTEXT, options).result()
     assert message.stop_reason == "error"
     assert "invalid_grant" in (message.error_message or "")
+    assert mock_server.requests == []
 
 
-def _have_rsa_signer() -> bool:
-    try:
-        import cryptography  # noqa: F401  # type: ignore[import-not-found]
-    except ImportError:
+# ---------------------------------------------------------------------------
+# SDK transport details
+# ---------------------------------------------------------------------------
+
+
+async def test_sdk_client_is_cached_per_http_client(mock_server: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    built: list[Any] = []
+    real_client = google_generative_ai.Client
+
+    def counting_client(*args: Any, **kwargs: Any) -> Any:
+        built.append(kwargs)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(google_generative_ai, "Client", counting_client)
+    client = mock_server.client()
+    for headers in ({"x-session": "a"}, {"x-session": "b"}):
+        mock_server.add_sse([stop_chunk()])
+        await google_generative_ai.stream(
+            google_model(), CONTEXT, {"api_key": "k", "http_client": client, "headers": headers}
+        ).result()
+        # Request headers are sent per request, so they do not split the cache.
+        assert mock_server.last.headers["x-session"] == headers["x-session"]
+    assert len(built) == 1
+    assert built[0]["http_options"].httpx_async_client is client
+
+    mock_server.add_sse([stop_chunk()])
+    await google_generative_ai.stream(google_model(), CONTEXT, {"api_key": "other", "http_client": client}).result()
+    assert len(built) == 2
+    assert mock_server.last.headers["x-goog-api-key"] == "other"
+
+
+async def test_on_response_and_timeout(mock_server: Any) -> None:
+    mock_server.add_sse([stop_chunk()], headers={"x-request-id": "req-1"})
+    responses: list[Any] = []
+    message = await google_generative_ai.stream(
+        google_model(),
+        CONTEXT,
+        {
+            "api_key": "k",
+            "http_client": mock_server.client(),
+            "timeout_ms": 30_500,
+            "on_response": lambda response, _model: responses.append(response),
+        },
+    ).result()
+    assert message.stop_reason == "stop"
+    assert [(response.status, response.headers.get("x-request-id")) for response in responses] == [(200, "req-1")]
+    # HttpOptions.timeout is also announced to the server.
+    assert mock_server.last.headers["x-server-timeout"] == "31"
+
+
+async def test_non_json_error_body(mock_server: Any) -> None:
+    mock_server.add(httpx.Response(502, text="bad gateway", headers={"content-type": "text/html"}))
+    message = await google_generative_ai.stream(
+        google_model(), CONTEXT, {"api_key": "k", "http_client": mock_server.client()}
+    ).result()
+    assert message.stop_reason == "error"
+    assert json.loads(message.error_message or "") == {
+        "error": {"message": "bad gateway", "code": 502, "status": "Bad Gateway"}
+    }
+
+
+async def test_in_stream_error_is_not_retried(mock_server: Any) -> None:
+    error_chunk = {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}}
+    mock_server.add_sse([error_chunk])
+    mock_server.add_sse([stop_chunk()])
+    message = await google_generative_ai.stream(
+        google_model(), CONTEXT, {"api_key": "k", "http_client": mock_server.client(), "max_retries": 2}
+    ).result()
+    assert message.error_message == f"got status: UNAVAILABLE. {json.dumps(error_chunk, separators=(',', ':'))}"
+    assert len(mock_server.requests) == 1
+
+
+async def test_empty_stream_and_thought_signature_round_trip(mock_server: Any) -> None:
+    mock_server.add_sse([])
+    message = await google_generative_ai.stream(
+        google_model(), CONTEXT, {"api_key": "k", "http_client": mock_server.client()}
+    ).result()
+    assert message.error_message == "Google stream ended without a finish reason"
+
+    # The SDK decodes thoughtSignature to bytes; pi keeps the base64 text it received.
+    mock_server.add_sse(
+        [
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "a", "thoughtSignature": "AAAAAAAA/+8="}]}, "finishReason": "STOP"}
+                ]
+            }
+        ]
+    )
+    model = google_model("gemini-3-flash-preview")
+    first = await google_generative_ai.stream(
+        model, CONTEXT, {"api_key": "k", "http_client": mock_server.client()}
+    ).result()
+    assert first.content[0].text_signature == "AAAAAAAA/+8="
+    mock_server.add_sse([stop_chunk()])
+    context = normalize_context(Context(messages=[UserMessage("hello"), first, UserMessage("again")]))
+    await google_generative_ai.stream(model, context, {"api_key": "k", "http_client": mock_server.client()}).result()
+    replayed = mock_server.last.json()["contents"][1]
+    assert replayed["role"] == "model"
+    [part] = replayed["parts"]
+    assert part["text"] == "a"
+    # The SDK re-encodes the bytes as URL-safe base64, which the API accepts for bytes fields.
+    assert part["thoughtSignature"] == "AAAAAAAA_-8="
+    assert base64.urlsafe_b64decode(part["thoughtSignature"]) == base64.b64decode("AAAAAAAA/+8=")
+
+
+async def test_abort_closes_the_response() -> None:
+    controller = AbortController()
+    closed = asyncio.Event()
+
+    async def body() -> Any:
         try:
-            import google.auth.crypt  # noqa: F401  # type: ignore[import-not-found]
-        except ImportError:
-            return False
-    return True
+            yield b'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n'
+            await asyncio.sleep(10)
+            yield b""
+        finally:
+            closed.set()
 
-
-@pytest.mark.skipif(_have_rsa_signer(), reason="an RSA signer is installed")
-async def test_service_account_without_signer(tmp_path: Path) -> None:
-    path = tmp_path / "sa.json"
-    path.write_text(
-        json.dumps({"type": "service_account", "client_email": "sa@p.iam.gserviceaccount.com", "private_key": "x"})
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=body(), headers={"content-type": "text/event-stream"})
+        )
     )
-    with pytest.raises(google_adc.GoogleAuthError, match=r"pip install google-auth"):
-        await google_adc.get_google_auth_headers(env={"GOOGLE_APPLICATION_CREDENTIALS": str(path)})
-
-
-@pytest.mark.skipif(not _have_rsa_signer(), reason="needs cryptography or google-auth")
-async def test_service_account_jwt_grant(mock_server: Any, tmp_path: Path) -> None:
-    from cryptography.hazmat.primitives import serialization  # type: ignore[import-not-found]
-    from cryptography.hazmat.primitives.asymmetric import rsa  # type: ignore[import-not-found]
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pem = key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-    ).decode()
-    path = tmp_path / "sa.json"
-    path.write_text(
-        json.dumps({"type": "service_account", "client_email": "sa@p.iam.gserviceaccount.com", "private_key": pem})
+    s = google_vertex.stream(
+        vertex_model(), CONTEXT, {"api_key": "AIzaKey", "http_client": client, "signal": controller.signal}
     )
-    mock_server.add(token_response())
-    headers = await google_adc.get_google_auth_headers(
-        env={"GOOGLE_APPLICATION_CREDENTIALS": str(path)}, http_client=mock_server.client()
-    )
-    assert headers == {"authorization": "Bearer ya29.token"}
-    assert b"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer" in mock_server.last.body
+    async for event in s:
+        if event.type == "text_delta":
+            controller.abort()
+    message = await s.result()
+    assert message.stop_reason == "aborted"
+    await asyncio.wait_for(closed.wait(), 1)
 
 
-async def test_google_auth_library_is_preferred(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    import types
+def test_google_api_error_wording() -> None:
+    from google.genai import errors as genai_errors
 
-    class FakeCredentials:
-        def __init__(self) -> None:
-            self.valid = False
-            self.refreshed = 0
-
-        def refresh(self, request: Any) -> None:
-            self.refreshed += 1
-            self.valid = True
-
-        def apply(self, headers: dict[str, str]) -> None:
-            headers["authorization"] = "Bearer from-google-auth"
-
-    credentials = FakeCredentials()
-    transport = types.SimpleNamespace(Request=object, Response=object)
-    fake = types.SimpleNamespace(
-        default=lambda scopes: (credentials, "project"),
-        load_credentials_from_file=lambda path, scopes: (credentials, None),
-        transport=transport,
-        exceptions=types.SimpleNamespace(TransportError=OSError),
-    )
-    monkeypatch.setattr(google_adc, "_import_google_auth", lambda: fake)
-    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
-    assert await google_adc.get_google_auth_headers() == {"authorization": "Bearer from-google-auth"}
-    assert await google_adc.get_google_auth_headers() == {"authorization": "Bearer from-google-auth"}
-    assert credentials.refreshed == 1
+    request = httpx.Request("POST", "https://example.test")
+    body = {"error": {"code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED"}}
+    response = httpx.Response(403, json=body, request=request)
+    converted = google_shared.google_api_error(genai_errors.ClientError(403, body, response))
+    assert str(converted) == json.dumps(body, separators=(",", ":"))
+    assert converted.status == 403
+    assert converted.headers is None
 
 
 # ---------------------------------------------------------------------------

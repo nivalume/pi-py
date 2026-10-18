@@ -1,7 +1,7 @@
 """Google Generative AI (Gemini API) adapter.
 
-Streams ``models/{model}:streamGenerateContent?alt=sse`` over REST with the request body,
-headers and error wording that ``@google/genai`` (used by pi upstream) produces.
+Streams through the official ``google-genai`` SDK (``client.aio.models.generate_content_stream``),
+as pi upstream does with ``@google/genai``.
 """
 
 from __future__ import annotations
@@ -9,15 +9,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
+from google.genai import Client
+from google.genai import types as genai_types
+
 from ..event_stream import AssistantMessageEventStream
 from ..models import clamp_thinking_level
 from ..types import Model, StreamOptions, TranscriptContext
+from ..utils.http import get_http_client
 from ..utils.misc import get_provider_env_value
 from .google_shared import (
-    GoogleClient,
     GoogleThinkingOptions,
     ResolvedGoogleThinkingLevel,
-    build_google_client_headers,
+    get_google_client,
     new_google_output,
     resolve_google_thinking_level,
     run_google_stream,
@@ -29,7 +32,6 @@ from .simple_options import build_base_options
 __all__ = ["GoogleOptions", "stream", "stream_simple", "get_google_budget"]
 
 _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/"
-_DEFAULT_API_VERSION = "v1beta"
 
 
 class GoogleOptions(StreamOptions, total=False):
@@ -96,32 +98,29 @@ def stream_simple(
     )
 
 
-def _create_client(model: Model, options: Mapping[str, Any]) -> GoogleClient:
+async def _create_client(model: Model, options: Mapping[str, Any]) -> Client:
     api_key = options.get("api_key")
     if not api_key:
         raise ValueError(f"No API key for provider: {model.provider}")
 
+    base_url: str | None
+    api_version: str | None = None
     if model.base_url:
         # The catalog baseUrl already includes the version path; don't append one.
         base_url, api_version = model.base_url, ""
     else:
-        env_base_url = (get_provider_env_value("GOOGLE_GEMINI_BASE_URL", options.get("env")) or "").strip()
-        base_url, api_version = env_base_url or _DEFAULT_BASE_URL, _DEFAULT_API_VERSION
-    prefix = base_url[:-1] if base_url.endswith("/") else base_url
-    if api_version:
-        prefix = f"{prefix}/{api_version}"
+        # The SDK reads GOOGLE_GEMINI_BASE_URL from os.environ itself; this also honors the provider env.
+        base_url = (get_provider_env_value("GOOGLE_GEMINI_BASE_URL", options.get("env")) or "").strip() or None
+    http_client = get_http_client(base_url or _DEFAULT_BASE_URL, options)
 
-    async def auth_headers() -> dict[str, str]:
-        if api_key.startswith("auth_tokens/"):
-            raise ValueError("Ephemeral tokens are only supported by the live API.")
-        return {"x-goog-api-key": api_key}
+    async def factory() -> Client:
+        http_options = genai_types.HttpOptions(
+            base_url=base_url, api_version=api_version, httpx_async_client=http_client
+        )
+        return Client(vertexai=False, api_key=api_key, http_options=http_options)
 
-    return GoogleClient(
-        vertex=False,
-        url=lambda model_path: f"{prefix}/{model_path}:streamGenerateContent?alt=sse",
-        headers=build_google_client_headers(model, options),
-        auth_headers=auth_headers,
-    )
+    # Headers are sent per request (see run_google_stream), so they are not part of the key.
+    return await get_google_client(http_client, ("gemini", api_key, base_url, api_version), factory)
 
 
 def get_google_budget(

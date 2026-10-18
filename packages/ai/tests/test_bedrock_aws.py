@@ -1,418 +1,746 @@
-"""Tests for the AWS plumbing behind the Bedrock adapter (SigV4, event streams, credentials)."""
+"""Wire-level tests for the Bedrock adapter's AWS SDK (boto3) transport.
+
+A real boto3 ``bedrock-runtime`` client signs and sends each request; a botocore
+``before-send`` hook captures it and returns a canned response, with event-stream
+frames encoded by :func:`encode_event_stream_message`. Payload and event conversion
+are covered with a fake client in ``test_bedrock_converse_stream.py``.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import dataclasses
+import json
+import struct
 import sys
-import uuid
-from datetime import UTC, datetime
+import threading
+import zlib
+from collections.abc import Callable, Iterator
 from typing import Any
 
-import httpx
 import pytest
+from botocore.awsrequest import AWSResponse
+from botocore.exceptions import EndpointConnectionError
 
-from pi_ai.utils import aws
-from pi_ai.utils.aws import (
-    AwsCredentials,
-    AwsCredentialsError,
-    EventStreamDecoder,
-    EventStreamError,
-    derive_signing_key,
-    encode_event_stream_message,
-    load_shared_profiles,
-    resolve_aws_credentials,
-    resolve_profile_region,
-    sign_request,
+from pi_ai import AbortController, AbortSignal, Context, Model, normalize_context
+from pi_ai.api import bedrock_converse_stream as bcs
+from pi_ai.api.bedrock_converse_stream import BOTO3_INSTALL_HINT, BedrockCredentials, stream, stream_simple
+from pi_ai.providers.catalog import get_builtin_model
+from pi_ai.types import AssistantMessage, ImageContent, TextContent, ToolResultMessage, UserMessage
+from pi_ai.utils.overflow import is_context_overflow
+
+_AWS_ENV = (
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "AWS_BEDROCK_SKIP_AUTH",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    "AWS_USE_FIPS_ENDPOINT",
+    "AWS_RETRY_MODE",
+    "AWS_MAX_ATTEMPTS",
+    "AWS_AUTH_SCHEME_PREFERENCE",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "PI_CACHE_RETENTION",
 )
-
-# -- SigV4 (vectors from the AWS docs / aws-sig-v4-test-suite) --------------------------------------
-
-EXAMPLE = AwsCredentials("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
-TEST_SUITE_DATE = datetime(2015, 8, 30, 12, 36, 0, tzinfo=UTC)
-
-
-def _signature(headers: dict[str, str]) -> str:
-    return headers["authorization"].rsplit("Signature=", 1)[1]
-
-
-def test_signing_key_example():
-    key = derive_signing_key("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20120215", "us-east-1", "iam")
-    assert key.hex() == "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
-
-
-@pytest.mark.parametrize(
-    ("method", "url", "headers", "body", "credentials", "service", "signed", "signature"),
-    [
-        # get-vanilla
-        (
-            "GET",
-            "https://example.amazonaws.com/",
-            {"Host": "example.amazonaws.com"},
-            b"",
-            EXAMPLE,
-            "service",
-            "host;x-amz-date",
-            "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31",
-        ),
-        # post-vanilla
-        (
-            "POST",
-            "https://example.amazonaws.com/",
-            {},
-            b"",
-            EXAMPLE,
-            "service",
-            "host;x-amz-date",
-            "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b",
-        ),
-        # get-vanilla-query-order-key-case
-        (
-            "GET",
-            "https://example.amazonaws.com/?Param2=value2&Param1=value1",
-            {},
-            b"",
-            EXAMPLE,
-            "service",
-            "host;x-amz-date",
-            "b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500",
-        ),
-        # post-x-www-form-urlencoded
-        (
-            "POST",
-            "https://example.amazonaws.com/",
-            {"Content-Type": "application/x-www-form-urlencoded"},
-            b"Param1=value1",
-            EXAMPLE,
-            "service",
-            "content-type;host;x-amz-date",
-            "ff11897932ad3f4e8b18135d722051e5ac45fc38421b1da7b9d196a0fe09473a",
-        ),
-        # IAM ListUsers example from the SigV4 documentation
-        (
-            "GET",
-            "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08",
-            {"content-type": "application/x-www-form-urlencoded; charset=utf-8"},
-            b"",
-            EXAMPLE,
-            "iam",
-            "content-type;host;x-amz-date",
-            "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7",
-        ),
-        # post-sts-token/post-sts-header-before
-        (
-            "POST",
-            "https://example.amazonaws.com/",
-            {},
-            b"",
-            AwsCredentials(
-                EXAMPLE.access_key_id,
-                EXAMPLE.secret_access_key,
-                "AQoDYXdzEPT//////////wEXAMPLEtc764bNrC9SAPBSM22wDOk4x4HIZ8j4FZTwdQWLWsKWHGBuFqwAeMicRXmxfpSPfIeoIYRqTflfKD8YUuwthAx7mSEI/qkPpKPi/kMcGdQrmGdeehM4IC1NtBmUpp2wUE8phUZampKsburEDy0KPkyQDYwT7WZ0wq5VSXDvp75YU9HFvlRd8Tx6q6fE8YQcHNVXAkiY9q6d+xo0rKwT38xVqr7ZD0u0iPPkUL64lIZbqBAz+scqKmlzm8FDrypNC9Yjc8fPOLn9FX9KSYvKTr4rvx3iSIlTJabIQwj2ICCR/oLxBA==",
-            ),
-            "service",
-            "host;x-amz-date;x-amz-security-token",
-            "85d96828115b5dc0cfc3bd16ad9e210dd772bbebba041836c64533a82be05ead",
-        ),
-    ],
-)
-def test_sigv4_test_vectors(method, url, headers, body, credentials, service, signed, signature):
-    result = sign_request(
-        method,
-        url,
-        headers,
-        body,
-        credentials,
-        region="us-east-1",
-        service=service,
-        now=TEST_SUITE_DATE,
-        apply_checksum=False,
-    )
-    assert f"SignedHeaders={signed}," in result["authorization"]
-    assert _signature(result) == signature
-    assert result["x-amz-date"] == "20150830T123600Z"
-
-
-def test_sigv4_matches_the_aws_js_sdk_for_bedrock_requests():
-    # Produced by @smithy/signature-v4 (the AWS JS SDK signer): double-encoded ARN path, session
-    # token, x-amz-content-sha256, header whitespace normalization, unsigned user-agent.
-    body = b'{"messages":[{"role":"user","content":[{"text":"hi"}]}]}'
-    result = sign_request(
-        "POST",
-        "https://bedrock-runtime.us-west-2.amazonaws.com/model/arn%3Aaws%3Abedrock%3Aus-west-2%3A123%3Aapplication-inference-profile%2Fabc/converse-stream",
-        {"content-type": "application/json", "x-custom": "  a   b ", "user-agent": "pi"},
-        body,
-        AwsCredentials("AKID", "SECRET", "TOKEN"),
-        region="us-west-2",
-        service="bedrock",
-        now=datetime(2026, 10, 18, 6, 0, 0, tzinfo=UTC),
-    )
-    assert result["x-amz-content-sha256"] == "c3335e07d6e89650bf94cb98664be69f8774dbc3198df221f113db0a59ea14f0"
-    assert result["authorization"] == (
-        "AWS4-HMAC-SHA256 Credential=AKID/20261018/us-west-2/bedrock/aws4_request, "
-        "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token;x-custom, "
-        "Signature=c069fae1b619d5fcd409574647d8bd2d83c5209e40ebe093649af90cc4c61334"
-    )
-
-
-def test_sign_request_replaces_stale_auth_headers():
-    result = sign_request(
-        "POST",
-        "http://127.0.0.1:8080/x",
-        {"Authorization": "old", "X-Amz-Date": "old"},
-        b"",
-        EXAMPLE,
-        region="r",
-        service="s",
-        now=TEST_SUITE_DATE,
-    )
-    assert result["host"] == "127.0.0.1:8080"
-    assert "Authorization" not in result and "X-Amz-Date" not in result
-    assert result["authorization"].startswith("AWS4-HMAC-SHA256 ")
-
-
-# -- event stream codec -----------------------------------------------------------------------------
-
-# Encoded by @smithy/eventstream-codec (the AWS JS SDK codec).
-JS_EVENT_FRAME = bytes.fromhex(
-    "0000009f00000057c37babff0d3a6d6573736167652d747970650700056576656e740b3a6576656e742d74797065070011636f6e74656e74"
-    "426c6f636b44656c74610d3a636f6e74656e742d747970650700106170706c69636174696f6e2f6a736f6e7b22636f6e74656e74426c6f63"
-    "6b496e646578223a302c2264656c7461223a7b2274657874223a226869227d2c2270223a2261626364227dcf16db44"
-)
-JS_ALL_HEADER_TYPES_FRAME = bytes.fromhex(
-    "00000050000000402bed5132017400016601016904fffffffb0262790207017303012c0362696e0600030102030175096f1c2b9e1c2d4e5f"
-    "8a9b0c1d2e3f4a5b027473080000018bcfe5687b5cc9322f"
-)
-
-
-def test_encoder_matches_the_js_codec():
-    encoded = encode_event_stream_message(
-        {":message-type": "event", ":event-type": "contentBlockDelta", ":content-type": "application/json"},
-        b'{"contentBlockIndex":0,"delta":{"text":"hi"},"p":"abcd"}',
-    )
-    assert encoded == JS_EVENT_FRAME
-
-
-def test_decodes_all_header_types_bytewise():
-    decoder = EventStreamDecoder()
-    messages = []
-    for index in range(len(JS_ALL_HEADER_TYPES_FRAME)):
-        messages.extend(decoder.feed(JS_ALL_HEADER_TYPES_FRAME[index : index + 1]))
-    decoder.finish()
-    assert len(messages) == 1
-    assert messages[0].payload == b""
-    assert messages[0].headers == {
-        "t": True,
-        "f": False,
-        "i": -5,
-        "by": 7,
-        "s": 300,
-        "bin": b"\x01\x02\x03",
-        "u": uuid.UUID("6f1c2b9e-1c2d-4e5f-8a9b-0c1d2e3f4a5b"),
-        "ts": 1700000000123,
-    }
-
-
-def test_round_trip_multiple_messages_in_one_chunk():
-    frames = encode_event_stream_message({"a": "1"}, b"one") + encode_event_stream_message({"b": 2**40}, b"two")
-    decoder = EventStreamDecoder()
-    messages = decoder.feed(frames + frames[:5])
-    assert [(m.headers, m.payload) for m in messages] == [({"a": "1"}, b"one"), ({"b": 2**40}, b"two")]
-    with pytest.raises(EventStreamError, match="incomplete message"):
-        decoder.finish()
-
-
-def test_checksum_mismatches_are_detected():
-    frame = bytearray(JS_EVENT_FRAME)
-    frame[9] ^= 1
-    with pytest.raises(EventStreamError, match="prelude checksum"):
-        EventStreamDecoder().feed(bytes(frame))
-    frame = bytearray(JS_EVENT_FRAME)
-    frame[40] ^= 1
-    with pytest.raises(EventStreamError, match="message checksum"):
-        EventStreamDecoder().feed(bytes(frame))
-
-
-# -- shared files and credential chain --------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch, tmp_path):
-    for name in (
-        "AWS_PROFILE",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-        "AWS_ROLE_ARN",
-        "AWS_ROLE_SESSION_NAME",
-    ):
+def aws_env(monkeypatch, tmp_path):
+    for name in _AWS_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    monkeypatch.setattr(aws, "_botocore_available", lambda: False)
-    aws.clear_credentials_cache()
-    yield
-    aws.clear_credentials_cache()
 
 
-def test_shared_profiles_merge_config_and_credentials(tmp_path):
-    (tmp_path / "config").write_text(
-        "[default]\nregion = us-west-1\n\n[profile dev]\nregion=eu-west-1 # comment\ns3 =\n  max_concurrent_requests = 5\n"
-        "[sso-session corp]\nsso_region = us-east-1\n[ignored]\nregion = nope\n"
+@pytest.fixture
+def keys(monkeypatch):
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDTEST")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+
+
+# -- event-stream encoding + fake HTTP ---------------------------------------------------------------
+
+
+def encode_event_stream_message(headers: dict[str, str], payload: bytes = b"") -> bytes:
+    """An ``application/vnd.amazon.eventstream`` frame with string headers."""
+    encoded = b"".join(
+        bytes([len(name)]) + name.encode() + b"\x07" + struct.pack(">H", len(value.encode())) + value.encode()
+        for name, value in headers.items()
     )
-    (tmp_path / "credentials").write_text("; comment\n[dev]\naws_access_key_id = AKIDDEV\naws_secret_access_key = s\n")
-    profiles = load_shared_profiles()
-    assert profiles["default"] == {"region": "us-west-1"}
-    assert profiles["dev"] == {
-        "region": "eu-west-1",
-        "s3.max_concurrent_requests": "5",
-        "aws_access_key_id": "AKIDDEV",
-        "aws_secret_access_key": "s",
-    }
-    assert "ignored" not in profiles and "corp" not in profiles
-    assert resolve_profile_region("dev") == "eu-west-1"
-    assert resolve_profile_region(None) == "us-west-1"
+    prelude = struct.pack(">II", 12 + len(encoded) + len(payload) + 4, len(encoded))
+    prelude += struct.pack(">I", zlib.crc32(prelude))
+    message = prelude + encoded + payload
+    return message + struct.pack(">I", zlib.crc32(message))
 
 
-async def test_env_keys_are_skipped_for_explicit_profiles(monkeypatch, tmp_path):
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDENV")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s")
-    (tmp_path / "credentials").write_text(
-        "[p]\naws_access_key_id = AKIDFILE\naws_secret_access_key = s2\naws_session_token = t\n"
+def event(event_type: str, payload: dict[str, Any]) -> bytes:
+    return encode_event_stream_message(
+        {":message-type": "event", ":event-type": event_type, ":content-type": "application/json"},
+        json.dumps(payload).encode(),
     )
-    assert (await resolve_aws_credentials()).access_key_id == "AKIDENV"
-    assert await resolve_aws_credentials(profile="p") == AwsCredentials("AKIDFILE", "s2", "t")
 
 
-async def test_no_credentials():
-    with pytest.raises(AwsCredentialsError, match="Could not load credentials from any providers"):
-        await resolve_aws_credentials()
-
-
-async def test_container_credentials(mock_server, monkeypatch, tmp_path):
-    monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/abc")
-    (tmp_path / "token").write_text("secret-token\n")
-    monkeypatch.setenv("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", str(tmp_path / "token"))
-    mock_server.add_json(
-        {"AccessKeyId": "AKIDECS", "SecretAccessKey": "s", "Token": "t", "Expiration": "2099-01-01T00:00:00Z"}
+def exception(exception_type: str, payload: dict[str, Any]) -> bytes:
+    return encode_event_stream_message(
+        {":message-type": "exception", ":exception-type": exception_type, ":content-type": "application/json"},
+        json.dumps(payload).encode(),
     )
-    client = mock_server.client()
-    credentials = await resolve_aws_credentials(http_client=client)
-    assert credentials.access_key_id == "AKIDECS"
-    assert credentials.session_token == "t"
-    assert credentials.expiration == datetime(2099, 1, 1, tzinfo=UTC).timestamp()
-    assert mock_server.last.url == "http://169.254.170.2/v2/credentials/abc"
-    assert mock_server.last.headers["authorization"] == "secret-token"
-    # Cached until shortly before expiration.
-    assert (await resolve_aws_credentials(http_client=client)).access_key_id == "AKIDECS"
-    assert len(mock_server.requests) == 1
 
 
-async def test_container_full_uri_must_be_local_or_https(monkeypatch):
-    monkeypatch.setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://evil.example.com/creds")
-    with pytest.raises(AwsCredentialsError, match="Unsupported host"):
-        await resolve_aws_credentials()
+def items_to_frames(items: list[dict[str, Any]]) -> list[bytes]:
+    frames = []
+    for item in items:
+        ((name, payload),) = item.items()
+        if name.endswith("Exception"):
+            frames.append(exception(name, payload))
+        else:
+            frames.append(event(name, payload))
+    return frames
 
 
-STS_RESPONSE = """<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleWithWebIdentityResult>
-    <Credentials>
-      <AccessKeyId>ASIASTS</AccessKeyId>
-      <SecretAccessKey>stssecret</SecretAccessKey>
-      <SessionToken>ststoken</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleWithWebIdentityResult>
-</AssumeRoleWithWebIdentityResponse>"""
+class FakeRaw:
+    """Stands in for the urllib3 response botocore reads the body from."""
+
+    def __init__(self, chunks: list[bytes], gate: threading.Event | None = None) -> None:
+        self._chunks = chunks
+        self._gate = gate
+        self.closed = False
+        self.shut_down = False
+
+    def stream(self, *_args: Any, **_kwargs: Any) -> Iterator[bytes]:
+        yield from self._chunks
+        if self._gate is not None:
+            # Block like a socket read until shutdown() interrupts it.
+            self._gate.wait(10)
+            if self.shut_down:
+                raise ConnectionResetError("socket shut down")
+
+    def read(self, *_args: Any, **_kwargs: Any) -> bytes:
+        return b"".join(self._chunks)
+
+    def shutdown(self) -> None:
+        self.shut_down = True
+        if self._gate is not None:
+            self._gate.set()
+
+    def close(self) -> None:
+        self.closed = True
 
 
-async def test_web_identity_token_file(mock_server, monkeypatch, tmp_path):
-    (tmp_path / "jwt").write_text("eyJ.token\n")
-    monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", str(tmp_path / "jwt"))
-    monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::123:role/r")
-    monkeypatch.setenv("AWS_ROLE_SESSION_NAME", "sess")
-    mock_server.add(httpx.Response(200, text=STS_RESPONSE))
-    credentials = await resolve_aws_credentials(region="eu-west-1", http_client=mock_server.client())
-    assert credentials == AwsCredentials(
-        "ASIASTS", "stssecret", "ststoken", datetime(2099, 1, 1, tzinfo=UTC).timestamp()
+class FakeResponse:
+    def __init__(self, status: int, headers: dict[str, str], chunks: list[bytes], gate: threading.Event | None = None):
+        self.status = status
+        self.headers = headers
+        self.raw = FakeRaw(chunks, gate)
+
+
+class WireRequest:
+    def __init__(self, request: Any) -> None:
+        self.url: str = request.url
+        self.headers = {
+            name.lower(): value.decode() if isinstance(value, bytes) else value
+            for name, value in request.headers.items()
+        }
+        body = request.body
+        self.body: bytes = body if isinstance(body, bytes) else (body or b"")
+
+    def json(self) -> Any:
+        return json.loads(self.body)
+
+
+class Wire:
+    """Queue of canned responses for the boto3 client; records every request."""
+
+    def __init__(self) -> None:
+        self.responses: list[FakeResponse | Callable[[WireRequest], FakeResponse]] = []
+        self.requests: list[WireRequest] = []
+        self.keys: list[Any] = []
+
+    def add(self, response: FakeResponse | Callable[[WireRequest], FakeResponse]) -> None:
+        self.responses.append(response)
+
+    @property
+    def last(self) -> WireRequest:
+        return self.requests[-1]
+
+    def handler(self, request: Any, **_kwargs: Any) -> AWSResponse:
+        recorded = WireRequest(request)
+        self.requests.append(recorded)
+        item = self.responses.pop(0) if self.responses else FakeResponse(500, {}, [b'{"message":"no response"}'])
+        response = item(recorded) if callable(item) else item
+        return AWSResponse(request.url, response.status, response.headers, response.raw)
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    fake = Wire()
+    original = bcs._new_client
+
+    def new_client(key: Any) -> Any:
+        client = original(key)
+        fake.keys.append(key)
+        client.meta.events.register("before-send.bedrock-runtime.ConverseStream", fake.handler)
+        return client
+
+    monkeypatch.setattr(bcs, "_new_client", new_client)
+    # No real backoff between SDK retries.
+    monkeypatch.setattr("botocore.retries.standard.ExponentialBackoff.delay_amount", lambda *_a, **_k: 0)
+    bcs._client_cache.clear()
+    yield fake
+    bcs._client_cache.clear()
+
+
+def eventstream_response(
+    items: list[dict[str, Any]], headers: dict[str, str] | None = None, chunked: bool = False
+) -> FakeResponse:
+    data = b"".join(items_to_frames(items))
+    chunks = [data[index : index + 7] for index in range(0, len(data), 7)] if chunked else [data]
+    return FakeResponse(
+        200,
+        {"content-type": "application/vnd.amazon.eventstream", "x-amzn-requestid": "request-id", **(headers or {})},
+        chunks,
     )
-    request = mock_server.last
-    assert request.url == "https://sts.eu-west-1.amazonaws.com/"
-    assert "authorization" not in request.headers
-    form = dict(pair.split("=", 1) for pair in request.body.decode().split("&"))
-    assert form["Action"] == "AssumeRoleWithWebIdentity"
-    assert form["RoleSessionName"] == "sess"
-    assert form["WebIdentityToken"] == "eyJ.token"
 
 
-async def test_assume_role_with_source_profile(mock_server, tmp_path):
-    (tmp_path / "config").write_text(
-        "[profile admin]\nrole_arn = arn:aws:iam::123:role/admin\nsource_profile = base\nexternal_id = ext\n"
-    )
-    (tmp_path / "credentials").write_text("[base]\naws_access_key_id = AKIDBASE\naws_secret_access_key = s\n")
-    mock_server.add(httpx.Response(200, text=STS_RESPONSE.replace("WithWebIdentity", "")))
-    credentials = await resolve_aws_credentials(profile="admin", http_client=mock_server.client())
-    assert credentials.access_key_id == "ASIASTS"
-    request = mock_server.last
-    assert request.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDBASE/")
-    assert "/us-east-1/sts/aws4_request" in request.headers["authorization"]
-    assert b"Action=AssumeRole&" in request.body and b"ExternalId=ext" in request.body
+def simple_stop(stop_reason: str = "end_turn") -> list[dict[str, Any]]:
+    return [{"messageStart": {"role": "assistant"}}, {"messageStop": {"stopReason": stop_reason}}]
 
 
-async def test_sts_errors_are_reported(mock_server, tmp_path):
-    (tmp_path / "config").write_text("[profile admin]\nrole_arn = arn:aws:iam::123:role/admin\nsource_profile = base\n")
-    (tmp_path / "credentials").write_text("[base]\naws_access_key_id = A\naws_secret_access_key = s\n")
-    mock_server.add(
-        httpx.Response(
-            403, text="<ErrorResponse><Error><Code>AccessDenied</Code><Message>no</Message></Error></ErrorResponse>"
+def _model(model_id: str = "us.anthropic.claude-opus-4-8") -> Model:
+    model = get_builtin_model("amazon-bedrock", model_id)
+    assert model is not None
+    return model
+
+
+def _hello():
+    return normalize_context(Context(messages=[UserMessage("hello")]))
+
+
+NOVA_MODEL = Model(
+    id="amazon.nova-lite-v1:0",
+    name="Nova Lite",
+    api="bedrock-converse-stream",
+    provider="amazon-bedrock",
+    base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    reasoning=False,
+    input=["text", "image"],
+    context_window=300000,
+    max_tokens=5000,
+)
+
+
+async def _stream(model: Model | None = None, **options: Any) -> AssistantMessage:
+    return await stream(model or _model(), _hello(), {"cache_retention": "none", **options}).result()
+
+
+# -- requests ------------------------------------------------------------------------------------------
+
+
+async def test_sends_signed_converse_stream_request(wire, keys):
+    wire.add(
+        eventstream_response(
+            [
+                *simple_stop()[:1],
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}},
+                simple_stop()[1],
+            ]
         )
     )
-    with pytest.raises(AwsCredentialsError, match="STS AssumeRole failed: AccessDenied: no"):
-        await resolve_aws_credentials(profile="admin", http_client=mock_server.client())
+    model = dataclasses.replace(_model(), id="us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    message = await _stream(model)
 
-
-async def test_credential_process(tmp_path):
-    script = tmp_path / "creds.py"
-    script.write_text(
-        'import json; print(json.dumps({"Version": 1, "AccessKeyId": "AKIDPROC", "SecretAccessKey": "s"}))'
+    assert message.stop_reason == "stop", message.error_message
+    assert message.content == [TextContent("hi")]
+    request = wire.last
+    assert request.url == (
+        "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse-stream"
     )
-    (tmp_path / "config").write_text(f"[profile proc]\ncredential_process = {sys.executable} {script}\n")
-    assert (await resolve_aws_credentials(profile="proc")).access_key_id == "AKIDPROC"
+    assert request.headers["content-type"] == "application/json"
+    authorization = request.headers["authorization"]
+    assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDTEST/")
+    assert "/us-east-1/bedrock/aws4_request" in authorization
+    assert request.headers["user-agent"].startswith("Boto3/")
+    body = request.json()
+    assert "modelId" not in body
+    assert body["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
+    assert body["inferenceConfig"] == {"maxTokens": model.max_tokens}
 
 
-async def test_sso_profiles_require_botocore(tmp_path):
-    (tmp_path / "config").write_text("[profile sso]\nsso_session = corp\nsso_account_id = 1\n")
-    with pytest.raises(AwsCredentialsError, match="install botocore"):
-        await resolve_aws_credentials(profile="sso")
-
-
-async def test_instance_metadata_v2(mock_server, monkeypatch):
-    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "false")
-    responses: list[Any] = [
-        httpx.Response(200, text="imds-token"),
-        httpx.Response(200, text="my-role\n"),
-        httpx.Response(200, json={"Code": "Success", "AccessKeyId": "AKIDIMDS", "SecretAccessKey": "s", "Token": "t"}),
+async def test_image_bytes_are_base64_on_the_wire(wire, keys):
+    messages = [
+        ToolResultMessage("call-1", "codemode", [TextContent("Script failed"), ImageContent("AAAA", "image/png")], True)
     ]
-    for response in responses:
-        mock_server.add(response)
-    credentials = await resolve_aws_credentials(http_client=mock_server.client())
-    assert credentials.access_key_id == "AKIDIMDS"
-    assert [r.method for r in mock_server.requests] == ["PUT", "GET", "GET"]
-    assert mock_server.requests[2].url == "http://169.254.169.254/latest/meta-data/iam/security-credentials/my-role"
-    assert mock_server.requests[2].headers["x-aws-ec2-metadata-token"] == "imds-token"
+    wire.add(eventstream_response(simple_stop()))
+    await stream(NOVA_MODEL, normalize_context(Context(messages=messages)), {"cache_retention": "none"}).result()
+    content = wire.last.json()["messages"][0]["content"][0]["toolResult"]["content"][1]
+    assert content == {"image": {"source": {"bytes": "AAAA"}, "format": "png"}}
 
 
-async def test_botocore_chain_is_preferred_when_available(monkeypatch):
-    calls: list[Any] = []
+async def test_bearer_token_auth(wire):
+    wire.add(eventstream_response(simple_stop()))
+    message = await _stream(api_key="bedrock-api-key")
+    assert message.stop_reason == "stop", message.error_message
+    assert wire.last.headers["authorization"] == "Bearer bedrock-api-key"
 
-    def fake(profile: str | None) -> AwsCredentials:
-        calls.append(profile)
-        return AwsCredentials("AKIDBOTO", "s")
 
-    monkeypatch.setattr(aws, "_botocore_credentials", fake)
-    assert (await resolve_aws_credentials(profile="p", use_botocore=True)).access_key_id == "AKIDBOTO"
-    assert calls == ["p"]
+async def test_bearer_token_from_environment(wire, keys, monkeypatch):
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "env-token")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream()
+    assert wire.last.headers["authorization"] == "Bearer env-token"
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(env={"AWS_BEARER_TOKEN_BEDROCK": "scoped-token"})
+    assert wire.last.headers["authorization"] == "Bearer scoped-token"
+
+
+async def test_skip_auth_signs_with_dummy_credentials(wire, monkeypatch):
+    # botocore would otherwise prefer the ambient bearer token.
+    monkeypatch.setenv("AWS_BEARER_TOKEN_BEDROCK", "ambient-token")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(api_key="ignored", env={"AWS_BEDROCK_SKIP_AUTH": "1"})
+    assert wire.last.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=dummy-access-key/")
+
+
+async def test_explicit_credentials_option(wire, keys):
+    async def provider() -> BedrockCredentials:
+        return BedrockCredentials("AKIDEXPLICIT", "s", "token")
+
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(credentials=provider)
+    headers = wire.last.headers
+    assert headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXPLICIT/")
+    assert headers["x-amz-security-token"] == "token"
+
+
+async def test_custom_headers_are_signed_and_reserved_headers_skipped(wire, keys):
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(
+        headers={
+            "x-custom": "v",
+            "User-Agent": "custom-agent",
+            "authorization": "evil",
+            "x-amz-date": "evil",
+            "Authorization": "evil2",
+            "X-Amz-Date": "evil2",
+            "HOST": "evil3",
+            "x-removed": None,
+        },
+    )
+    headers = wire.last.headers
+    assert headers["x-custom"] == "v"
+    assert headers["user-agent"] == "custom-agent"
+    assert headers["authorization"].startswith("AWS4-HMAC-SHA256")
+    assert headers["x-amz-date"] not in ("evil", "evil2")
+    assert headers.get("host") in (None, "bedrock-runtime.us-east-1.amazonaws.com")
+    assert "x-removed" not in headers
+    signed = headers["authorization"].split("SignedHeaders=")[1].split(",")[0].split(";")
+    assert "x-custom" in signed
+
+
+async def test_custom_headers_apply_to_every_attempt_and_do_not_leak(wire, keys):
+    wire.add(FakeResponse(503, {"x-amzn-errortype": "ServiceUnavailableException"}, [b'{"message":"busy"}']))
+    wire.add(eventstream_response(simple_stop()))
+    message = await _stream(headers={"x-custom": "v"})
+    assert message.stop_reason == "stop", message.error_message
+    assert [request.headers.get("x-custom") for request in wire.requests] == ["v", "v"]
+    # The cached client is reused without the previous call's headers.
+    wire.add(eventstream_response(simple_stop()))
+    await _stream()
+    assert "x-custom" not in wire.last.headers
+    assert len(wire.keys) == 1
+
+
+async def test_stream_simple_forwards_headers(wire, keys):
+    wire.add(eventstream_response(simple_stop()))
+    await stream_simple(_model(), _hello(), {"headers": {"x-custom": "v"}}).result()
+    assert wire.last.headers["x-custom"] == "v"
+
+
+# -- region, endpoint and credentials resolution ---------------------------------------------------------
+
+
+async def test_request_url_follows_resolved_region_and_endpoint(wire, keys, monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "us-east-2")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream()
+    assert wire.last.url.startswith("https://bedrock-runtime.us-east-2.amazonaws.com/model/")
+    assert "/us-east-2/bedrock/aws4_request" in wire.last.headers["authorization"]
+
+    model = dataclasses.replace(_model(), base_url="https://bedrock-vpc.example.com/prefix/")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(model)
+    assert wire.last.url == "https://bedrock-vpc.example.com/prefix/model/us.anthropic.claude-opus-4-8/converse-stream"
+
+    monkeypatch.setenv("AWS_REGION", "cn-north-1")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream()
+    assert wire.last.url.startswith("https://bedrock-runtime.cn-north-1.amazonaws.com.cn/")
+
+
+async def test_region_and_credentials_from_shared_profile(wire, monkeypatch, tmp_path):
+    (tmp_path / "config").write_text("[profile work]\nregion = eu-west-3\n")
+    (tmp_path / "credentials").write_text("[work]\naws_access_key_id = AKIDPROFILE\naws_secret_access_key = s\n")
+    monkeypatch.setenv("AWS_PROFILE", "work")
+    wire.add(eventstream_response(simple_stop()))
+    message = await _stream()
+    assert message.stop_reason == "stop", message.error_message
+    assert wire.last.url.startswith("https://bedrock-runtime.eu-west-3.amazonaws.com/")
+    assert wire.last.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDPROFILE/20")
+
+
+async def test_scoped_profile_wins_over_ambient_keys(wire, keys, tmp_path):
+    (tmp_path / "credentials").write_text("[scoped]\naws_access_key_id = AKIDSCOPED\naws_secret_access_key = s\n")
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(env={"AWS_PROFILE": "scoped"})
+    assert wire.last.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDSCOPED/")
+
+
+async def test_region_missing_error(wire, tmp_path, monkeypatch):
+    (tmp_path / "config").write_text("[profile noregion]\n")
+    monkeypatch.setenv("AWS_PROFILE", "noregion")
+    message = await _stream()
+    assert message.stop_reason == "error"
+    assert message.error_message == "Region is missing"
+
+
+async def test_missing_credentials_error(wire):
+    message = await _stream()
+    assert message.error_message == "Could not load credentials from any providers"
+    assert not wire.requests
+
+
+# -- client configuration and cache -------------------------------------------------------------------
+
+
+async def test_clients_are_cached_by_configuration(wire, keys):
+    for _ in range(3):
+        wire.add(eventstream_response(simple_stop()))
+    await _stream()
+    await _stream()
+    await _stream(region="eu-west-1")
+    assert len(wire.requests) == 3
+    assert len(wire.keys) == 2
+    assert wire.keys[0].region == "us-east-1"
+    assert wire.keys[1].region == "eu-west-1"
+
+
+async def test_sdk_retry_and_timeout_configuration(wire, keys):
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(max_retries=5, timeout_ms=1500)
+    client = next(iter(bcs._client_cache.values()))
+    config = client.meta.config
+    assert config.retries == {"total_max_attempts": 6, "mode": "standard"}
+    assert (config.connect_timeout, config.read_timeout) == (1.5, 1.5)
+
+
+async def test_scoped_proxy_configuration(wire, keys):
+    wire.add(eventstream_response(simple_stop()))
+    await _stream(env={"HTTPS_PROXY": "http://proxy.local:8080"})
+    client = next(iter(bcs._client_cache.values()))
+    assert client.meta.config.proxies == {"http": "http://proxy.local:8080", "https": "http://proxy.local:8080"}
+
+
+async def test_missing_boto3_ends_the_stream_with_install_hint(monkeypatch, keys):
+    bcs._client_cache.clear()
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    message = await _stream()
+    assert message.stop_reason == "error"
+    assert message.error_message == BOTO3_INSTALL_HINT
+    assert 'pip install "pi-ai[bedrock]"' in BOTO3_INSTALL_HINT
+
+
+# -- response stream -------------------------------------------------------------------------------------
+
+
+async def test_decodes_chunked_event_stream(wire, keys):
+    arguments = '{"path":"/workspace/file.js","edits":[{"oldText":"a","newText":"b","":""}]}'
+    wire.add(
+        eventstream_response(
+            [
+                {"messageStart": {"role": "assistant", "p": "abcdefgh"}},
+                {
+                    "contentBlockStart": {
+                        "contentBlockIndex": 0,
+                        "start": {"toolUse": {"toolUseId": "t", "name": "edit"}},
+                    }
+                },
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"toolUse": {"input": arguments[:20]}}}},
+                {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"toolUse": {"input": arguments[20:]}}}},
+                {"contentBlockStop": {"contentBlockIndex": 0}},
+                {"unknownFutureEvent": {"x": 1}},
+                {"messageStop": {"stopReason": "tool_use"}},
+                {"metadata": {"usage": {"inputTokens": 3, "outputTokens": 4, "totalTokens": 7}}},
+            ],
+            chunked=True,
+        )
+    )
+    received: list[Any] = []
+    message = await _stream(on_provider_stream_event=lambda item, _m: received.append(item))
+    assert message.stop_reason == "toolUse", message.error_message
+    assert message.content[0].arguments == json.loads(arguments)
+    assert received[0] == {"messageStart": {"role": "assistant"}}  # padding is not a modeled member
+    assert len(received) == 7
+    assert (message.usage.input, message.usage.output, message.usage.total_tokens) == (3, 4, 7)
+
+
+async def test_redacted_reasoning_bytes(wire):
+    data = b"\x00\x01opaque\xff"
+    wire.add(
+        eventstream_response(
+            [
+                {"messageStart": {"role": "assistant"}},
+                {
+                    "contentBlockDelta": {
+                        "contentBlockIndex": 0,
+                        "delta": {"reasoningContent": {"redactedContent": base64.b64encode(data).decode()}},
+                    }
+                },
+                {"messageStop": {"stopReason": "end_turn"}},
+            ]
+        )
+    )
+    message = await _stream(api_key="k")
+    assert message.content[0].redacted is True
+    assert message.content[0].thinking_signature == base64.b64encode(data).decode()
+
+
+async def test_forwards_raw_response_headers_to_on_response(wire, keys):
+    model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    wire.add(
+        FakeResponse(
+            200,
+            {
+                "content-type": "application/vnd.amazon.eventstream",
+                "x-bifrost-provider": "bedrock",
+                "x-bifrost-resolved-model": model_id,
+                "x-amzn-requestid": "req-123",
+            },
+            [],
+        )
+    )
+    responses: list[Any] = []
+    result = await _stream(_model(model_id), on_response=lambda r, _m: responses.append(r))
+    # The empty event stream fails, but the header callback fired before stream consumption.
+    assert result.stop_reason == "error"
+    assert result.error_message == "Bedrock stream ended without a stop reason"
+    assert len(responses) == 1
+    assert responses[0].status == 200
+    assert responses[0].headers["x-amzn-requestid"] == "req-123"
+    assert responses[0].headers["x-bifrost-provider"] == "bedrock"
+    assert responses[0].headers["x-bifrost-resolved-model"] == model_id
+
+
+async def test_corrupted_event_stream_is_an_error(wire, keys):
+    frame = bytearray(event("messageStart", {"role": "assistant"}))
+    frame[-1] ^= 0xFF
+    wire.add(FakeResponse(200, {"content-type": "application/vnd.amazon.eventstream"}, [bytes(frame)]))
+    result = await _stream()
+    assert result.stop_reason == "error"
+    assert "checksum" in (result.error_message or "").lower()
+
+
+async def test_abort_mid_stream_interrupts_the_worker(wire, keys):
+    gate = threading.Event()
+    response = FakeResponse(
+        200,
+        {"content-type": "application/vnd.amazon.eventstream"},
+        [
+            event("messageStart", {"role": "assistant"}),
+            event("contentBlockDelta", {"contentBlockIndex": 0, "delta": {"text": "partial"}}),
+        ],
+        gate,
+    )
+    wire.add(response)
+    controller = AbortController()
+    s = stream(_model(), _hello(), {"cache_retention": "none", "signal": controller.signal})
+    async for item in s:
+        if item.type == "text_delta":
+            controller.abort()
+    message = await s.result()
+    assert message.stop_reason == "aborted"
+    assert message.content == [TextContent("partial")]
+    for _ in range(200):
+        if response.raw.closed and not any(thread.name == "pi-ai-bedrock" for thread in threading.enumerate()):
+            break
+        await asyncio.sleep(0.01)
+    assert response.raw.shut_down
+    assert response.raw.closed
+    assert not any(thread.name == "pi-ai-bedrock" for thread in threading.enumerate())
+
+
+async def test_already_aborted_signal_sends_nothing(wire, keys):
+    message = await _stream(signal=AbortSignal.abort())
+    assert message.stop_reason == "aborted"
+    assert not wire.requests
+
+
+# -- errors ----------------------------------------------------------------------------------------------
+
+DIAGNOSTIC_TYPE = "bedrock_response_failure"
+VALIDATION_MESSAGE = "The provided model identifier is invalid."
+REQUEST_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def _diagnostic(message: AssistantMessage) -> Any:
+    return next((d for d in message.diagnostics or [] if d.type == DIAGNOSTIC_TYPE), None)
+
+
+def _error_response(status: int, error_type: str | None, body: Any, request_id: str = REQUEST_ID) -> FakeResponse:
+    headers = {"x-amzn-requestid": request_id}
+    if error_type is not None:
+        headers["x-amzn-errortype"] = error_type
+    content = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return FakeResponse(status, headers, [content])
+
+
+async def _run_bedrock(**options: Any) -> AssistantMessage:
+    return await _stream(max_retries=0, **options)
+
+
+async def test_records_status_code_and_request_id_for_http_errors(wire, keys):
+    wire.add(
+        _error_response(
+            400,
+            "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
+            {"message": VALIDATION_MESSAGE},
+        )
+    )
+    message = await _run_bedrock()
+    diagnostic = _diagnostic(message)
+    assert message.stop_reason == "error"
+    assert message.error_message == f"Validation error: {VALIDATION_MESSAGE}"
+    assert diagnostic.details == {"status": 400, "errorCode": "ValidationException", "requestId": REQUEST_ID}
+    assert diagnostic.error is None
+
+
+async def test_context_overflow_validation_error(wire, keys):
+    wire.add(_error_response(400, "ValidationException", {"message": "Input is too long for requested model."}))
+    message = await _run_bedrock()
+    assert message.error_message == "Validation error: Input is too long for requested model."
+    assert is_context_overflow(message, 200_000)
+
+
+async def test_mid_stream_modeled_exception(wire, keys):
+    wire.add(
+        eventstream_response(
+            [
+                {"messageStart": {"role": "assistant"}},
+                {"throttlingException": {"message": "Too many tokens, please wait before trying again."}},
+            ],
+            headers={"x-amzn-requestid": REQUEST_ID},
+        )
+    )
+    received: list[Any] = []
+    message = await _run_bedrock(on_provider_stream_event=lambda item, _m: received.append(item))
+    assert message.stop_reason == "error"
+    assert message.error_message == "Throttling error: Too many tokens, please wait before trying again."
+    # Throttling must not be mistaken for a context overflow ("too many tokens").
+    assert not is_context_overflow(message, 200_000)
+    assert _diagnostic(message).details == {"errorCode": "ThrottlingException", "requestId": REQUEST_ID}
+    assert isinstance(received[-1]["throttlingException"], bcs.BedrockServiceError)
+
+
+async def test_unmodeled_mid_stream_error(wire, keys):
+    frames = event("messageStart", {"role": "assistant"}) + encode_event_stream_message(
+        {
+            ":message-type": "error",
+            ":error-code": "ModelStreamErrorException",
+            ":error-message": "Model stream terminated unexpectedly.",
+        }
+    )
+    wire.add(FakeResponse(200, {"x-amzn-requestid": REQUEST_ID}, [frames]))
+    message = await _run_bedrock()
+    assert message.error_message == "Model stream terminated unexpectedly."
+    assert _diagnostic(message).details == {"errorCode": "ModelStreamErrorException", "requestId": REQUEST_ID}
+
+
+async def test_unknown_exception_frame(wire, keys):
+    # botocore drops the code and body of exception types missing from its service model.
+    frames = event("messageStart", {"role": "assistant"}) + exception("fooException", {"message": "foo"})
+    wire.add(FakeResponse(200, {"x-amzn-requestid": REQUEST_ID}, [frames]))
+    message = await _run_bedrock()
+    assert message.stop_reason == "error"
+    assert message.error_message == "UnknownError"
+    assert _diagnostic(message).details == {"requestId": REQUEST_ID}
+
+
+async def test_transport_failure_has_no_provider_code(wire, keys):
+    def fail(request: WireRequest) -> FakeResponse:
+        raise EndpointConnectionError(endpoint_url=request.url)
+
+    wire.add(fail)
+    message = await _run_bedrock()
+    assert message.stop_reason == "error"
+    assert message.error_message.startswith("Could not connect to the endpoint URL")
+    assert _diagnostic(message) is None
+
+
+async def test_no_diagnostic_for_aborted_turn(wire, keys):
+    wire.add(_error_response(400, "ValidationException", {"message": VALIDATION_MESSAGE}))
+    message = await _run_bedrock(signal=AbortSignal.abort())
+    assert message.stop_reason == "aborted"
+    assert _diagnostic(message) is None
+
+
+async def test_drops_over_long_header_values(wire, keys):
+    wire.add(_error_response(400, f"{'E' * 5000}Exception", {"message": VALIDATION_MESSAGE}, "R" * 5000))
+    message = await _run_bedrock()
+    assert _diagnostic(message).details == {"status": 400}
+
+
+async def test_unknown_error_code_placeholder_and_raw_bodies(wire, keys):
+    wire.add(_error_response(403, None, {"message": "blocked by gw"}))
+    message = await _run_bedrock()
+    assert message.error_message == "Unknown: blocked by gw"
+    assert _diagnostic(message).details == {"status": 403, "requestId": REQUEST_ID}
+
+    wire.add(_error_response(403, None, b"<html>blocked</html>"))
+    message = await _run_bedrock()
+    assert message.error_message == "Unknown: 403: <html>blocked</html>"
+
+
+async def test_data_retention_hint(wire, keys):
+    wire.add(
+        _error_response(
+            400, "ValidationException", {"message": "data retention mode 'default' is not available for this model"}
+        )
+    )
+    message = await _run_bedrock()
+    assert message.error_message.endswith(
+        "See https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html for supported data retention modes."
+    )
+
+
+async def test_sdk_retries_throttling_by_default(wire, keys):
+    wire.add(_error_response(429, "ThrottlingException", {"message": "slow down"}))
+    wire.add(eventstream_response(simple_stop()))
+    message = await _stream()
+    assert message.stop_reason == "stop", message.error_message
+    assert len(wire.requests) == 2
+
+
+async def test_sdk_gives_up_after_three_attempts(wire, keys):
+    for _ in range(3):
+        wire.add(_error_response(429, "ThrottlingException", {"message": "slow down"}))
+    message = await _stream()
+    assert message.error_message == "Throttling error: slow down"
+    assert len(wire.requests) == 3
+
+
+async def test_max_retries_zero_disables_sdk_retries(wire, keys):
+    wire.add(_error_response(429, "ThrottlingException", {"message": "slow down"}))
+    message = await _run_bedrock()
+    assert message.error_message == "Throttling error: slow down"
+    assert len(wire.requests) == 1

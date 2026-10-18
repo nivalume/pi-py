@@ -10,9 +10,10 @@
 ## 安装
 
 ```bash
-pip install pi-ai pi-agent-core          # 运行时只依赖 httpx
+pip install pi-ai pi-agent-core          # 依赖 httpx 和官方 SDK：anthropic、openai、google-genai
+pip install "pi-ai[bedrock]"             # 可选：boto3，用于 Amazon Bedrock
 pip install "pi-ai[fast]"                # 可选：orjson 加速 JSON 解码
-pip install "pi-ai[all]"                 # 可选：orjson + websockets + pydantic
+pip install "pi-ai[all]"                 # 可选：orjson + websockets + pydantic + boto3
 ```
 
 开发环境：
@@ -92,10 +93,13 @@ provider id）。`pi_ai.serialization` 读写 pi 的 camelCase JSON，会话记�
 
 ## 设计改进
 
-* **不依赖厂商 SDK**：各 provider 适配器直接实现 HTTP/SSE 协议，复用连接池；运行时唯一依赖是 `httpx`。
+* **使用厂商官方 SDK**：与 pi 一致，Anthropic、OpenAI（Chat Completions、Responses、Azure、OpenRouter 图片）、
+  Google（Gemini、Vertex）和 Bedrock 适配器分别使用官方 SDK `anthropic`、`openai`、`google-genai`、`boto3`
+  （`pi-ai[bedrock]`），各 SDK 客户端共用每个事件循环一个的 `httpx.AsyncClient` 连接池。
+  pi 本身不经 SDK 调用的 API（Mistral、OpenAI Codex、pi-messages、分类器）直接使用 `httpx`。
 * **性能**：slots 数据类、低分配的事件队列、包装流之间零拷贝转发、增量式部分 JSON 解析
   （大参数工具调用比逐 delta 全量重解析快约 60 倍）、流式文本线性时间累加、可选 orjson、编译并缓存的参数校验器。
-  单核每秒约处理 10 万个流事件（见 `benchmarks/`）。
+  单核每秒处理流事件：anthropic-messages 约 11 万，openai-completions 约 7 万（瓶颈在 openai SDK 的 SSE 解码，见 `benchmarks/`）。
 * **全面懒加载**：模型目录按 provider 首次访问时加载；API 实现和 OAuth 流程在首次请求时导入。
 * **原生异步取消**：`AbortSignal` 可立即中断挂起的网络读取，被中止的请求以 `stop_reason == "aborted"` 结束而不是抛异常。
 * **Python 友好的扩展**：Pydantic 模型作为工具参数、`@agent_tool` 从类型注解生成工具、`Agent.events()` 异步迭代器、

@@ -1,22 +1,30 @@
 """Offline tests for the Bedrock adapter (ports of upstream ``test/bedrock-*.test.ts``).
 
-Upstream mocks the AWS SDK; here the ConverseStream HTTP call is served by ``mock_server``
-with binary event-stream fixtures built by :func:`encode_event_stream_message`.
+Upstream mocks the AWS SDK client's ``send``; here a fake boto3 client replaces the cached
+``bedrock-runtime`` client: ``converse_stream(**params)`` records the command input and
+returns an SDK-shaped response whose ``stream`` yields the given items. Wire-level behavior
+(signing, endpoints, error bodies, retries, event-stream decoding) is covered with a real
+boto3 client in ``test_bedrock_aws.py``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import json
-from datetime import UTC, datetime
+import threading
+from collections.abc import Iterator
 from typing import Any
 
-import httpx
 import pytest
+from botocore.credentials import Credentials
+from botocore.exceptions import ClientError, EndpointConnectionError, EventStreamError
 
-from pi_ai import AbortSignal, Context, Model, Tool, Type, normalize_context
+from pi_ai import AbortController, AbortSignal, Context, Model, Tool, Type, normalize_context
+from pi_ai.api import bedrock_converse_stream as bcs
 from pi_ai.api.bedrock_converse_stream import (
+    BedrockCredentials,
     BedrockServiceError,
     resolve_bedrock_client_config,
     stream,
@@ -32,8 +40,6 @@ from pi_ai.types import (
     ToolResultMessage,
     UserMessage,
 )
-from pi_ai.utils import aws
-from pi_ai.utils.aws import AwsCredentials, encode_event_stream_message
 from pi_ai.utils.overflow import is_context_overflow
 from pi_ai.utils.retry import is_retryable_assistant_error
 
@@ -47,16 +53,8 @@ _AWS_ENV = (
     "AWS_BEARER_TOKEN_BEDROCK",
     "AWS_BEDROCK_SKIP_AUTH",
     "AWS_BEDROCK_FORCE_CACHE",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME",
-    "AWS_ENDPOINT_URL",
-    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
-    "AWS_USE_FIPS_ENDPOINT",
+    "HTTPS_PROXY",
+    "https_proxy",
     "PI_CACHE_RETENTION",
 )
 
@@ -68,10 +66,6 @@ def aws_env(monkeypatch, tmp_path):
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
-    monkeypatch.setattr(aws, "_botocore_available", lambda: False)
-    aws.clear_credentials_cache()
-    yield
-    aws.clear_credentials_cache()
 
 
 @pytest.fixture
@@ -80,63 +74,100 @@ def keys(monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
 
 
-# -- fixtures ---------------------------------------------------------------------------------------
+# -- fake boto3 client ----------------------------------------------------------------------------------
 
 
-def event(event_type: str, payload: dict[str, Any]) -> bytes:
-    return encode_event_stream_message(
-        {":message-type": "event", ":event-type": event_type, ":content-type": "application/json"},
-        json.dumps(payload).encode(),
-    )
+class FakeEventStream:
+    """Iterates SDK stream items; exception items are raised the way botocore raises them."""
+
+    def __init__(self, items: list[Any], gate: threading.Event | None = None) -> None:
+        self._items = items
+        self._gate = gate
+        self.closed = False
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in self._items:
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+        if self._gate is not None:
+            self._gate.wait(10)
+            if self.closed:
+                raise ConnectionResetError("stream closed")
+
+    def close(self) -> None:
+        self.closed = True
+        if self._gate is not None:
+            self._gate.set()
 
 
-def exception(exception_type: str, payload: dict[str, Any]) -> bytes:
-    return encode_event_stream_message(
-        {":message-type": "exception", ":exception-type": exception_type, ":content-type": "application/json"},
-        json.dumps(payload).encode(),
-    )
+def stream_exception(name: str, message: str) -> EventStreamError:
+    return EventStreamError({"Error": {"Code": name, "Message": message}}, "ConverseStream")
 
 
-def items_to_frames(items: list[dict[str, Any]]) -> list[bytes]:
-    frames = []
-    for item in items:
-        ((name, payload),) = item.items()
-        if name.endswith("Exception"):
-            frames.append(exception(name, payload))
-        else:
-            frames.append(event(name, payload))
-    return frames
+def to_sdk_item(item: Any) -> Any:
+    if isinstance(item, BaseException):
+        return item
+    ((name, payload),) = item.items()
+    if name.endswith("Exception"):
+        return stream_exception(name, payload.get("message", ""))
+    return item
 
 
-def eventstream_response(
-    items: list[dict[str, Any]], headers: dict[str, str] | None = None, chunked: bool = False
-) -> httpx.Response:
-    data = b"".join(items_to_frames(items))
-    content: Any = data
-    if chunked:
-
-        async def chunks():
-            for index in range(0, len(data), 7):
-                yield data[index : index + 7]
-
-        content = chunks()
-    return httpx.Response(
-        200,
-        content=content,
-        headers={
-            "content-type": "application/vnd.amazon.eventstream",
-            "x-amzn-requestid": "request-id",
-            **(headers or {}),
+def sdk_response(
+    items: list[dict[str, Any]], headers: dict[str, str] | None = None, gate: threading.Event | None = None
+) -> dict[str, Any]:
+    all_headers = {"content-type": "application/vnd.amazon.eventstream", "x-amzn-requestid": "request-id"}
+    all_headers.update(headers or {})
+    return {
+        "ResponseMetadata": {
+            "RequestId": all_headers["x-amzn-requestid"],
+            "HTTPStatusCode": 200,
+            "HTTPHeaders": all_headers,
+            "RetryAttempts": 0,
         },
-    )
+        "stream": FakeEventStream([to_sdk_item(item) for item in items], gate),
+    }
+
+
+class FakeBedrockClient:
+    def __init__(self) -> None:
+        self.responses: list[Any] = []
+        self.calls: list[dict[str, Any]] = []
+        self.keys: list[Any] = []
+        #: Custom headers visible to botocore's request hooks during each call.
+        self.headers: list[Any] = []
+
+    def add(self, response: Any) -> None:
+        self.responses.append(response)
+
+    @property
+    def last(self) -> dict[str, Any]:
+        return self.calls[-1]
+
+    def converse_stream(self, **params: Any) -> Any:
+        self.calls.append(params)
+        self.headers.append(getattr(bcs._call_state, "headers", None))
+        response = self.responses.pop(0) if self.responses else sdk_response([])
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+@pytest.fixture
+def fake_client(monkeypatch):
+    fake = FakeBedrockClient()
+
+    def get_client(key: Any) -> FakeBedrockClient:
+        fake.keys.append(key)
+        return fake
+
+    monkeypatch.setattr(bcs, "_get_client", get_client)
+    return fake
 
 
 def simple_stop(stop_reason: str = "end_turn") -> list[dict[str, Any]]:
     return [{"messageStart": {"role": "assistant"}}, {"messageStop": {"stopReason": stop_reason}}]
-
-
-def b64(data: dict[str, Any]) -> dict[str, Any]:
-    return data
 
 
 def _model(model_id: str = "us.anthropic.claude-opus-4-8") -> Model:
@@ -211,9 +242,12 @@ async def capture_payload(
 # -- event stream + SigV4 basics are covered in test_bedrock_aws.py; adapter tests follow ----------
 
 
-async def test_sends_signed_converse_stream_request(mock_server, keys):
-    mock_server.add(
-        eventstream_response(
+# -- the SDK call --------------------------------------------------------------------------------------
+
+
+async def test_sdk_receives_the_command_input(fake_client, keys):
+    fake_client.add(
+        sdk_response(
             [
                 *simple_stop()[:1],
                 {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}},
@@ -222,77 +256,96 @@ async def test_sends_signed_converse_stream_request(mock_server, keys):
         )
     )
     model = dataclasses.replace(_model(), id="us.anthropic.claude-sonnet-4-5-20250929-v1:0")
-    message = await stream(model, _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
-
-    assert message.stop_reason == "stop"
+    captured: list[Any] = []
+    message = await stream(
+        model, _hello(), {"cache_retention": "none", "on_payload": lambda p, _m: captured.append(p)}
+    ).result()
+    assert message.stop_reason == "stop", message.error_message
     assert message.content == [TextContent("hi")]
-    request = mock_server.last
-    assert request.url == (
-        "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-5-20250929-v1%3A0/converse-stream"
-    )
-    assert request.headers["content-type"] == "application/json"
-    authorization = request.headers["authorization"]
-    assert authorization.startswith("AWS4-HMAC-SHA256 Credential=AKIDTEST/")
-    assert "/us-east-1/bedrock/aws4_request" in authorization
-    assert "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date," in authorization
-    body = request.json()
-    assert "modelId" not in body
-    assert body["messages"] == [{"role": "user", "content": [{"text": "hello"}]}]
-    assert body["inferenceConfig"] == {"maxTokens": model.max_tokens}
+    assert fake_client.last == {
+        "modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "messages": [{"role": "user", "content": [{"text": "hello"}]}],
+        "inferenceConfig": {"maxTokens": model.max_tokens},
+    }
+    assert fake_client.last == captured[0]
+    key = fake_client.keys[-1]
+    assert (key.region, key.endpoint, key.profile) == ("us-east-1", model.base_url, None)
+    assert key.credentials == ("AKIDTEST", "secret", None)
+    assert key.token is None
 
 
-async def test_bearer_token_auth(mock_server):
-    mock_server.add(eventstream_response(simple_stop()))
+async def test_on_payload_replacement_is_sent_and_binary_members_stay_bytes(fake_client, keys):
+    messages = [
+        ToolResultMessage("call-1", "codemode", [TextContent("Script failed"), ImageContent("AAAA", "image/png")], True)
+    ]
+
+    def on_payload(payload: Any, _model: Any) -> Any:
+        return {**payload, "requestMetadata": {"team": "a"}, "toolConfig": None}
+
+    fake_client.add(sdk_response(simple_stop()))
     await stream(
-        _model(),
-        _hello(),
-        {"cache_retention": "none", "api_key": "bedrock-api-key", "http_client": mock_server.client()},
+        NOVA_MODEL, normalize_context(Context(messages=messages)), {"cache_retention": "none", "on_payload": on_payload}
     ).result()
-    headers = mock_server.last.headers
-    assert headers["authorization"] == "Bearer bedrock-api-key"
-    assert "x-amz-date" not in headers
+    params = fake_client.last
+    assert params["requestMetadata"] == {"team": "a"}
+    assert "toolConfig" not in params  # None members are dropped
+    image = params["messages"][0]["content"][0]["toolResult"]["content"][1]
+    assert image == {"image": {"source": {"bytes": b"\x00\x00\x00"}, "format": "png"}}
 
 
-async def test_skip_auth_signs_with_dummy_credentials(mock_server):
-    mock_server.add(eventstream_response(simple_stop()))
+async def test_bearer_token_config(fake_client):
+    fake_client.add(sdk_response(simple_stop()))
+    await stream(_model(), _hello(), {"cache_retention": "none", "api_key": "bedrock-api-key"}).result()
+    key = fake_client.keys[-1]
+    assert key.token == "bedrock-api-key"
+    assert not key.force_sigv4
+
+
+async def test_skip_auth_uses_dummy_credentials(fake_client):
+    fake_client.add(sdk_response(simple_stop()))
+    await stream(
+        _model(), _hello(), {"cache_retention": "none", "api_key": "ignored", "env": {"AWS_BEDROCK_SKIP_AUTH": "1"}}
+    ).result()
+    key = fake_client.keys[-1]
+    assert key.credentials == ("dummy-access-key", "dummy-secret-key", None)
+    assert key.token is None
+    assert key.force_sigv4
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        BedrockCredentials("AKIDEXPLICIT", "s", "token"),
+        {"access_key_id": "AKIDEXPLICIT", "secret_access_key": "s", "session_token": "token"},
+        {"accessKeyId": "AKIDEXPLICIT", "secretAccessKey": "s", "sessionToken": "token"},
+        Credentials("AKIDEXPLICIT", "s", "token"),
+        lambda: BedrockCredentials("AKIDEXPLICIT", "s", "token"),
+    ],
+)
+async def test_explicit_credentials_option(fake_client, keys, credentials):
+    async def provider() -> Any:
+        return credentials() if callable(credentials) else credentials
+
+    for value in (credentials, provider):
+        fake_client.add(sdk_response(simple_stop()))
+        message = await stream(_model(), _hello(), {"cache_retention": "none", "credentials": value}).result()
+        assert message.stop_reason == "stop", message.error_message
+        assert fake_client.keys[-1].credentials == ("AKIDEXPLICIT", "s", "token")
+
+
+async def test_invalid_credentials_option(fake_client):
+    message = await stream(_model(), _hello(), {"cache_retention": "none", "credentials": {"x": 1}}).result()
+    assert message.error_message == "Bedrock credentials must provide access_key_id and secret_access_key"
+    assert not fake_client.calls
+
+
+async def test_custom_headers_reach_the_request_hooks_without_reserved_ones(fake_client, keys):
+    fake_client.add(sdk_response(simple_stop()))
     await stream(
         _model(),
         _hello(),
         {
             "cache_retention": "none",
-            "api_key": "ignored",
-            "env": {"AWS_BEDROCK_SKIP_AUTH": "1"},
-            "http_client": mock_server.client(),
-        },
-    ).result()
-    assert mock_server.last.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=dummy-access-key/")
-
-
-async def test_explicit_credentials_option(mock_server, keys):
-    mock_server.add(eventstream_response(simple_stop()))
-
-    async def provider() -> AwsCredentials:
-        return AwsCredentials("AKIDEXPLICIT", "s", "token")
-
-    await stream(
-        _model(), _hello(), {"cache_retention": "none", "credentials": provider, "http_client": mock_server.client()}
-    ).result()
-    headers = mock_server.last.headers
-    assert headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXPLICIT/")
-    assert headers["x-amz-security-token"] == "token"
-
-
-# -- custom headers ---------------------------------------------------------------------------------
-
-
-async def test_custom_headers_are_signed_and_reserved_headers_skipped(mock_server, keys):
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream(
-        _model(),
-        _hello(),
-        {
-            "cache_retention": "none",
-            "http_client": mock_server.client(),
             "headers": {
                 "x-custom": "v",
                 "authorization": "evil",
@@ -304,47 +357,36 @@ async def test_custom_headers_are_signed_and_reserved_headers_skipped(mock_serve
             },
         },
     ).result()
-    headers = mock_server.last.headers
-    assert headers["x-custom"] == "v"
-    assert headers["authorization"].startswith("AWS4-HMAC-SHA256")
-    assert headers["host"] == "bedrock-runtime.us-east-1.amazonaws.com"
-    assert headers["x-amz-date"] != "evil2"
-    assert "x-removed" not in headers
-    signed = headers["authorization"].split("SignedHeaders=")[1].split(",")[0].split(";")
-    assert "x-custom" in signed
+    assert fake_client.headers == [{"x-custom": "v"}]
+    assert getattr(bcs._call_state, "headers", None) is None
 
 
-async def test_custom_header_signature_verifies(mock_server, keys):
-    # Recompute the signature server-side from the received request.
-    mock_server.add(eventstream_response(simple_stop()))
+async def test_stream_simple_forwards_headers(fake_client, keys):
+    fake_client.add(sdk_response(simple_stop()))
+    await stream_simple(_model(), _hello(), {"headers": {"x-custom": "v"}}).result()
+    assert fake_client.headers == [{"x-custom": "v"}]
+
+
+async def test_client_options_from_stream_options(fake_client, keys):
+    fake_client.add(sdk_response(simple_stop()))
     await stream(
         _model(),
         _hello(),
-        {"cache_retention": "none", "http_client": mock_server.client(), "headers": {"x-custom": "v"}},
+        {
+            "cache_retention": "none",
+            "max_retries": 0,
+            "timeout_ms": 2500,
+            "env": {"HTTPS_PROXY": "http://proxy.local:3128"},
+        },
     ).result()
-    request = mock_server.last
-    signed_names = request.headers["authorization"].split("SignedHeaders=")[1].split(",")[0].split(";")
-    amz_date = request.headers["x-amz-date"]
-    now = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-    resigned = aws.sign_request(
-        "POST",
-        request.url,
-        {name: request.headers[name] for name in signed_names if not name.startswith("x-amz-")},
-        request.body,
-        AwsCredentials("AKIDTEST", "secret"),
-        region="us-east-1",
-        service="bedrock",
-        now=now,
-    )
-    assert resigned["authorization"] == request.headers["authorization"]
-
-
-async def test_stream_simple_forwards_headers(mock_server, keys):
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream_simple(
-        _model(), _hello(), {"headers": {"x-custom": "v"}, "http_client": mock_server.client()}
-    ).result()
-    assert mock_server.last.headers["x-custom"] == "v"
+    key = fake_client.keys[-1]
+    assert key.max_attempts == 1
+    assert key.timeout == 2.5
+    assert key.proxy == "http://proxy.local:3128"
+    fake_client.add(sdk_response(simple_stop()))
+    await stream(_model(), _hello(), {"cache_retention": "none"}).result()
+    key = fake_client.keys[-1]
+    assert (key.max_attempts, key.timeout, key.proxy) == (None, 600.0, None)
 
 
 # -- credentials priority + endpoint resolution -----------------------------------------------------
@@ -363,14 +405,14 @@ def test_prefers_explicit_and_scoped_profiles_over_ambient_keys(keys):
 def test_uses_ambient_keys_without_profile(keys):
     config = resolve_bedrock_client_config(_model(), {})
     assert config.profile is None
-    assert config.credentials == AwsCredentials("AKIDTEST", "secret")
+    assert config.credentials == BedrockCredentials("AKIDTEST", "secret")
 
 
 def test_uses_ambient_keys_when_only_ambient_profile_is_set(keys, monkeypatch):
     monkeypatch.setenv("AWS_PROFILE", "ambient-profile")
     config = resolve_bedrock_client_config(_model(), {})
     assert config.profile == "ambient-profile"
-    assert config.credentials == AwsCredentials("AKIDTEST", "secret")
+    assert config.credentials == BedrockCredentials("AKIDTEST", "secret")
 
 
 def test_eu_inference_profiles_use_eu_central_endpoint():
@@ -446,57 +488,6 @@ def test_generic_api_key_is_a_bearer_token():
     assert resolve_bedrock_client_config(_model(), {"api_key": "<authenticated>"}).token is None
 
 
-async def test_request_url_follows_resolved_region_and_endpoint(mock_server, keys, monkeypatch):
-    monkeypatch.setenv("AWS_REGION", "us-east-2")
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream(_model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
-    assert mock_server.last.url.startswith("https://bedrock-runtime.us-east-2.amazonaws.com/model/")
-    assert "/us-east-2/bedrock/aws4_request" in mock_server.last.headers["authorization"]
-
-    model = dataclasses.replace(_model(), base_url="https://bedrock-vpc.example.com/prefix/")
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream(model, _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
-    assert (
-        mock_server.last.url
-        == "https://bedrock-vpc.example.com/prefix/model/us.anthropic.claude-opus-4-8/converse-stream"
-    )
-
-    monkeypatch.setenv("AWS_REGION", "cn-north-1")
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream(_model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
-    assert mock_server.last.url.startswith("https://bedrock-runtime.cn-north-1.amazonaws.com.cn/")
-
-
-async def test_region_and_credentials_from_shared_profile(mock_server, monkeypatch, tmp_path):
-    (tmp_path / "config").write_text("[profile work]\nregion = eu-west-3\n")
-    (tmp_path / "credentials").write_text("[work]\naws_access_key_id = AKIDPROFILE\naws_secret_access_key = s\n")
-    monkeypatch.setenv("AWS_PROFILE", "work")
-    mock_server.add(eventstream_response(simple_stop()))
-    message = await stream(
-        _model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
-    assert message.stop_reason == "stop", message.error_message
-    assert mock_server.last.url.startswith("https://bedrock-runtime.eu-west-3.amazonaws.com/")
-    assert mock_server.last.headers["authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDPROFILE/20")
-
-
-async def test_region_missing_error(mock_server, monkeypatch):
-    monkeypatch.setenv("AWS_PROFILE", "noregion")
-    message = await stream(
-        _model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
-    assert message.stop_reason == "error"
-    assert message.error_message == "Region is missing"
-
-
-async def test_missing_credentials_error(mock_server):
-    message = await stream(
-        _model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
-    assert message.error_message == "Could not load credentials from any providers"
-    assert not mock_server.requests
-
-
 # -- message conversion -----------------------------------------------------------------------------
 
 
@@ -529,10 +520,10 @@ async def test_tool_choice_mapping():
     assert "toolConfig" not in await capture_payload(context, tool_choice="none")
 
 
-async def test_preserves_empty_property_names_in_streamed_tool_arguments(mock_server, keys):
+async def test_preserves_empty_property_names_in_streamed_tool_arguments(fake_client, keys):
     arguments = '{"path":"/workspace/foobar/file.js","edits":[{"oldText":"first","newText":"updated first"},{"oldText":"second","newText":"updated second","":""}]}'
-    mock_server.add(
-        eventstream_response(
+    fake_client.add(
+        sdk_response(
             [
                 {"messageStart": {"role": "assistant"}},
                 {
@@ -546,10 +537,9 @@ async def test_preserves_empty_property_names_in_streamed_tool_arguments(mock_se
                 {"contentBlockStop": {"contentBlockIndex": 0}},
                 {"messageStop": {"stopReason": "tool_use"}},
             ],
-            chunked=True,
         )
     )
-    s = stream(BASE_MODEL, _hello(), {"cache_retention": "none", "http_client": mock_server.client()})
+    s = stream(BASE_MODEL, _hello(), {"cache_retention": "none"})
     types = [e.type async for e in s]
     message = await s.result()
     assert types == ["start", "toolcall_start", "toolcall_delta", "toolcall_delta", "toolcall_end", "done"]
@@ -618,7 +608,7 @@ async def test_moves_images_of_error_tool_results_after_the_tool_results():
     assert content[3]["image"]["format"] == "png"
 
 
-async def test_keeps_images_in_error_tool_results_for_non_claude_models(mock_server, keys):
+async def test_keeps_images_in_error_tool_results_for_non_claude_models():
     messages = [
         ToolResultMessage("call-1", "codemode", [TextContent("Script failed"), ImageContent("AAAA", "image/png")], True)
     ]
@@ -635,15 +625,6 @@ async def test_keeps_images_in_error_tool_results_for_non_claude_models(mock_ser
             }
         }
     ]
-    # On the wire, image bytes are base64.
-    mock_server.add(eventstream_response(simple_stop()))
-    await stream(
-        NOVA_MODEL,
-        normalize_context(Context(messages=messages)),
-        {"cache_retention": "none", "http_client": mock_server.client()},
-    ).result()
-    wire = mock_server.last.json()["messages"][0]["content"][0]["toolResult"]["content"][1]
-    assert wire == {"image": {"source": {"bytes": "AAAA"}, "format": "png"}}
 
 
 async def test_removes_empty_property_names_only_from_replayed_input():
@@ -729,17 +710,17 @@ def _redacted_delta(index: int, data: bytes) -> dict[str, Any]:
     return {
         "contentBlockDelta": {
             "contentBlockIndex": index,
-            "delta": {"reasoningContent": {"redactedContent": base64.b64encode(data).decode()}},
+            "delta": {"reasoningContent": {"redactedContent": data}},
         }
     }
 
 
-async def _run_gpt(mock_server, items: list[dict[str, Any]]) -> AssistantMessage:
-    mock_server.add(eventstream_response(items))
-    return await stream(GPT_MODEL, _hello(), {"http_client": mock_server.client(), "api_key": "k"}).result()
+async def _run_gpt(fake_client, items: list[dict[str, Any]]) -> AssistantMessage:
+    fake_client.add(sdk_response(items))
+    return await stream(GPT_MODEL, _hello(), {"api_key": "k"}).result()
 
 
-async def test_redacted_reasoning_stream(mock_server):
+async def test_redacted_reasoning_stream(fake_client):
     items = [
         {"messageStart": {"role": "assistant"}},
         _redacted_delta(0, REDACTED_BYTES),
@@ -748,7 +729,7 @@ async def test_redacted_reasoning_stream(mock_server):
         {"contentBlockStop": {"contentBlockIndex": 1}},
         {"messageStop": {"stopReason": "end_turn"}},
     ]
-    response = await _run_gpt(mock_server, items)
+    response = await _run_gpt(fake_client, items)
     assert response.stop_reason == "stop", response.error_message
     assert [c.type for c in response.content] == ["thinking", "text"]
     assert response.content[1] == TextContent("done")
@@ -757,17 +738,17 @@ async def test_redacted_reasoning_stream(mock_server):
     assert thinking.thinking_signature == REDACTED_B64
 
 
-async def test_redacted_reasoning_without_content_block_stop(mock_server):
+async def test_redacted_reasoning_without_content_block_stop(fake_client):
     items = [
         {"messageStart": {"role": "assistant"}},
         _redacted_delta(0, REDACTED_BYTES),
         {"messageStop": {"stopReason": "end_turn"}},
     ]
-    response = await _run_gpt(mock_server, items)
+    response = await _run_gpt(fake_client, items)
     assert response.content[0].thinking_signature == REDACTED_B64
 
 
-async def test_redacted_reasoning_split_across_deltas(mock_server):
+async def test_redacted_reasoning_split_across_deltas(fake_client):
     items = [
         {"messageStart": {"role": "assistant"}},
         _redacted_delta(0, REDACTED_BYTES[:7]),
@@ -775,7 +756,7 @@ async def test_redacted_reasoning_split_across_deltas(mock_server):
         {"contentBlockStop": {"contentBlockIndex": 0}},
         {"messageStop": {"stopReason": "end_turn"}},
     ]
-    response = await _run_gpt(mock_server, items)
+    response = await _run_gpt(fake_client, items)
     assert response.content[0].thinking_signature == REDACTED_B64
     assert response.content[0].thinking == "[Reasoning redacted]"
 
@@ -812,9 +793,9 @@ async def test_replays_redacted_reasoning():
     ]
 
 
-async def test_signed_thinking_stream(mock_server, keys):
-    mock_server.add(
-        eventstream_response(
+async def test_signed_thinking_stream(fake_client, keys):
+    fake_client.add(
+        sdk_response(
             [
                 {"messageStart": {"role": "assistant"}},
                 {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"reasoningContent": {"text": "think"}}}},
@@ -824,9 +805,7 @@ async def test_signed_thinking_stream(mock_server, keys):
             ]
         )
     )
-    message = await stream(
-        BASE_MODEL, _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
+    message = await stream(BASE_MODEL, _hello(), {"cache_retention": "none"}).result()
     assert message.content == [ThinkingContent("think", thinking_signature="sig")]
 
 
@@ -1001,14 +980,14 @@ async def test_stream_simple_budget_thinking_adjusts_max_tokens():
 # -- stream events, stop reasons, usage, headers ----------------------------------------------------
 
 
-async def test_forwards_stream_items_in_order(mock_server, keys):
+async def test_forwards_stream_items_in_order(fake_client, keys):
     items = [
         {"messageStart": {"role": "assistant"}},
         {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hello"}}},
         {"messageStop": {"stopReason": "end_turn", "additionalModelResponseFields": {"source": "test"}}},
         {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}},
     ]
-    mock_server.add(eventstream_response([{**item} for item in items]))
+    fake_client.add(sdk_response([{**item} for item in items]))
     received: list[Any] = []
     models: list[Any] = []
     model = _model()
@@ -1020,39 +999,13 @@ async def test_forwards_stream_items_in_order(mock_server, keys):
     result = await stream(
         model,
         _hello(),
-        {"cache_retention": "none", "http_client": mock_server.client(), "on_provider_stream_event": on_event},
+        {"cache_retention": "none", "on_provider_stream_event": on_event},
     ).result()
     assert received == items
     assert models == [model] * 4
     assert result.stop_reason == "stop"
     assert result.content == [TextContent("hello")]
     assert (result.usage.input, result.usage.output, result.usage.total_tokens) == (1, 1, 2)
-
-
-async def test_strips_event_padding_and_forwards_exception_items(mock_server, keys):
-    mock_server.add(
-        eventstream_response(
-            [
-                {"messageStart": {"role": "assistant", "p": "abcdefgh"}},
-                {"internalServerException": {"message": "bedrock stream failed"}},
-            ]
-        )
-    )
-    received: list[Any] = []
-    result = await stream(
-        _model(),
-        _hello(),
-        {
-            "cache_retention": "none",
-            "http_client": mock_server.client(),
-            "on_provider_stream_event": lambda i, _m: received.append(i),
-        },
-    ).result()
-    assert received[0] == {"messageStart": {"role": "assistant"}}
-    assert isinstance(received[1]["internalServerException"], BedrockServiceError)
-    assert result.stop_reason == "error"
-    assert result.error_message == "Internal server error: bedrock stream failed"
-    assert is_retryable_assistant_error(result)
 
 
 @pytest.mark.parametrize(
@@ -1065,21 +1018,19 @@ async def test_strips_event_padding_and_forwards_exception_items(mock_server, ke
         ("guardrail_intervened", "error", "Provider stopped with: guardrail_intervened"),
     ],
 )
-async def test_raw_stop_reasons(mock_server, keys, raw, stop_reason, error_message):
-    mock_server.add(eventstream_response(simple_stop(raw)))
-    message = await stream(
-        _model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
+async def test_raw_stop_reasons(fake_client, keys, raw, stop_reason, error_message):
+    fake_client.add(sdk_response(simple_stop(raw)))
+    message = await stream(_model(), _hello(), {"cache_retention": "none"}).result()
     assert message.stop_reason == stop_reason
     assert message.raw_stop_reason == raw
     assert message.error_message == error_message
 
 
-async def test_prices_1h_cache_writes_at_twice_input(mock_server, keys):
+async def test_prices_1h_cache_writes_at_twice_input(fake_client, keys):
     # Regression test for https://github.com/earendil-works/pi/issues/9457
     model = _model()
-    mock_server.add(
-        eventstream_response(
+    fake_client.add(
+        sdk_response(
             [
                 {"messageStart": {"role": "assistant"}},
                 {
@@ -1101,56 +1052,56 @@ async def test_prices_1h_cache_writes_at_twice_input(mock_server, keys):
             ]
         )
     )
-    result = await stream(model, _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
+    result = await stream(model, _hello(), {"cache_retention": "none"}).result()
     assert result.usage.cache_write == 1_000_000
     assert result.usage.cache_write_1h == 400_000
     expected = (600_000 * model.cost.cache_write + 400_000 * model.cost.input * 2) / 1_000_000
     assert result.usage.cost.cache_write == pytest.approx(expected, abs=1e-10)
 
 
-async def test_forwards_raw_response_headers_to_on_response(mock_server, keys):
-    model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    mock_server.add(
-        httpx.Response(
-            200,
-            content=b"",
-            headers={
-                "content-type": "application/vnd.amazon.eventstream",
-                "x-bifrost-provider": "bedrock",
-                "x-bifrost-resolved-model": model_id,
-                "x-amzn-requestid": "req-123",
-            },
+async def test_forwards_exception_items_before_raising(fake_client, keys):
+    fake_client.add(
+        sdk_response(
+            [
+                {"messageStart": {"role": "assistant"}},
+                {"internalServerException": {"message": "bedrock stream failed"}},
+            ]
         )
     )
+    received: list[Any] = []
+    result = await stream(
+        _model(),
+        _hello(),
+        {"cache_retention": "none", "on_provider_stream_event": lambda i, _m: received.append(i)},
+    ).result()
+    assert received[0] == {"messageStart": {"role": "assistant"}}
+    error = received[1]["internalServerException"]
+    assert isinstance(error, BedrockServiceError)
+    assert error.name == "InternalServerException"
+    assert result.stop_reason == "error"
+    assert result.error_message == "Internal server error: bedrock stream failed"
+    assert is_retryable_assistant_error(result)
+
+
+async def test_forwards_response_metadata_headers_to_on_response(fake_client, keys):
+    model_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    fake_client.add(sdk_response([], headers={"x-bifrost-provider": "bedrock", "x-amzn-requestid": "req-123"}))
     responses: list[Any] = []
     result = await stream(
-        _model(model_id),
-        _hello(),
-        {
-            "cache_retention": "none",
-            "http_client": mock_server.client(),
-            "on_response": lambda r, _m: responses.append(r),
-        },
+        _model(model_id), _hello(), {"cache_retention": "none", "on_response": lambda r, _m: responses.append(r)}
     ).result()
     # The empty event stream fails, but the header callback fired before stream consumption.
     assert result.stop_reason == "error"
     assert result.error_message == "Bedrock stream ended without a stop reason"
-    assert len(responses) == 1
-    assert responses[0].status == 200
-    assert responses[0].headers["x-amzn-requestid"] == "req-123"
-    assert responses[0].headers["x-bifrost-provider"] == "bedrock"
-    assert responses[0].headers["x-bifrost-resolved-model"] == model_id
+    assert [(r.status, r.headers["x-amzn-requestid"], r.headers["x-bifrost-provider"]) for r in responses] == [
+        (200, "req-123", "bedrock")
+    ]
 
 
-async def test_corrupted_event_stream_is_an_error(mock_server, keys):
-    frame = bytearray(event("messageStart", {"role": "assistant"}))
-    frame[-1] ^= 0xFF
-    mock_server.add(
-        httpx.Response(200, content=bytes(frame), headers={"content-type": "application/vnd.amazon.eventstream"})
-    )
-    result = await stream(_model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}).result()
-    assert result.stop_reason == "error"
-    assert result.error_message == "Event stream message checksum mismatch"
+async def test_rejects_user_message_start(fake_client, keys):
+    fake_client.add(sdk_response([{"messageStart": {"role": "user"}}]))
+    result = await stream(_model(), _hello(), {"cache_retention": "none"}).result()
+    assert result.error_message == "Unexpected assistant message start but got user message start instead"
 
 
 # -- error metadata ---------------------------------------------------------------------------------
@@ -1164,41 +1115,28 @@ def _diagnostic(message: AssistantMessage) -> Any:
     return next((d for d in message.diagnostics or [] if d.type == DIAGNOSTIC_TYPE), None)
 
 
-def _error_response(status: int, error_type: str | None, body: Any, request_id: str = REQUEST_ID) -> httpx.Response:
-    headers = {"x-amzn-requestid": request_id}
-    if error_type is not None:
-        headers["x-amzn-errortype"] = error_type
-    content = body if isinstance(body, bytes) else json.dumps(body).encode()
-    return httpx.Response(status, content=content, headers=headers)
+async def _run_bedrock(**options: Any) -> AssistantMessage:
+    return await stream(_model(), _hello(), {"cache_retention": "none", **options}).result()
 
 
-async def _run_bedrock(mock_server, **options: Any) -> AssistantMessage:
-    return await stream(
-        _model(),
-        _hello(),
-        {"cache_retention": "none", "http_client": mock_server.client(), "max_retries": 0, **options},
-    ).result()
-
-
-async def test_records_status_code_and_request_id_for_http_errors(mock_server, keys):
-    mock_server.add(
-        _error_response(
-            400,
-            "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
-            {"message": VALIDATION_MESSAGE},
+async def test_client_error_without_raw_response_uses_the_parsed_error(fake_client, keys):
+    fake_client.add(
+        ClientError(
+            {
+                "Error": {"Code": "ValidationException", "Message": VALIDATION_MESSAGE},
+                "ResponseMetadata": {"HTTPStatusCode": 400, "RequestId": REQUEST_ID},
+            },
+            "ConverseStream",
         )
     )
-    message = await _run_bedrock(mock_server)
-    diagnostic = _diagnostic(message)
-    assert message.stop_reason == "error"
+    message = await _run_bedrock()
     assert message.error_message == f"Validation error: {VALIDATION_MESSAGE}"
-    assert diagnostic.details == {"status": 400, "errorCode": "ValidationException", "requestId": REQUEST_ID}
-    assert diagnostic.error is None
+    assert _diagnostic(message).details == {"status": 400, "errorCode": "ValidationException", "requestId": REQUEST_ID}
 
 
-async def test_mid_stream_modeled_exception(mock_server, keys):
-    mock_server.add(
-        eventstream_response(
+async def test_mid_stream_modeled_exception(fake_client, keys):
+    fake_client.add(
+        sdk_response(
             [
                 {"messageStart": {"role": "assistant"}},
                 {"throttlingException": {"message": "Too many tokens, please wait before trying again."}},
@@ -1206,7 +1144,7 @@ async def test_mid_stream_modeled_exception(mock_server, keys):
             headers={"x-amzn-requestid": REQUEST_ID},
         )
     )
-    message = await _run_bedrock(mock_server)
+    message = await _run_bedrock()
     assert message.stop_reason == "error"
     assert message.error_message == "Throttling error: Too many tokens, please wait before trying again."
     # Throttling must not be mistaken for a context overflow ("too many tokens").
@@ -1214,84 +1152,96 @@ async def test_mid_stream_modeled_exception(mock_server, keys):
     assert _diagnostic(message).details == {"errorCode": "ThrottlingException", "requestId": REQUEST_ID}
 
 
-async def test_unmodeled_mid_stream_error(mock_server, keys):
-    frames = event("messageStart", {"role": "assistant"}) + encode_event_stream_message(
-        {
-            ":message-type": "error",
-            ":error-code": "ModelStreamErrorException",
-            ":error-message": "Model stream terminated unexpectedly.",
-        }
+async def test_unmodeled_mid_stream_error(fake_client, keys):
+    fake_client.add(
+        sdk_response(
+            [
+                {"messageStart": {"role": "assistant"}},
+                stream_exception("ModelStreamErrorException", "Model stream terminated unexpectedly."),
+            ],
+            headers={"x-amzn-requestid": REQUEST_ID},
+        )
     )
-    mock_server.add(httpx.Response(200, content=frames, headers={"x-amzn-requestid": REQUEST_ID}))
-    message = await _run_bedrock(mock_server)
+    message = await _run_bedrock()
     assert message.error_message == "Model stream terminated unexpectedly."
     assert _diagnostic(message).details == {"errorCode": "ModelStreamErrorException", "requestId": REQUEST_ID}
 
 
-async def test_unknown_exception_frame_uses_body(mock_server, keys):
-    frames = event("messageStart", {"role": "assistant"}) + exception("fooException", {"message": "foo"})
-    mock_server.add(httpx.Response(200, content=frames, headers={"x-amzn-requestid": REQUEST_ID}))
-    message = await _run_bedrock(mock_server)
-    assert message.error_message == '{"message": "foo"}'
-    assert _diagnostic(message).details == {"errorCode": "fooException", "requestId": REQUEST_ID}
-
-
-async def test_transport_failure_has_no_provider_code(mock_server, keys):
-    def fail(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("socket hang up", request=request)
-
-    mock_server.add(fail)
-    message = await _run_bedrock(mock_server)
+async def test_transport_failure_has_no_provider_code(fake_client, keys):
+    fake_client.add(EndpointConnectionError(endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com"))
+    message = await _run_bedrock()
     assert message.stop_reason == "error"
-    assert message.error_message == "Connection error: socket hang up"
+    assert message.error_message == (
+        'Could not connect to the endpoint URL: "https://bedrock-runtime.us-east-1.amazonaws.com"'
+    )
     assert _diagnostic(message) is None
 
 
-async def test_no_diagnostic_for_aborted_turn(mock_server, keys):
-    mock_server.add(_error_response(400, "ValidationException", {"message": VALIDATION_MESSAGE}))
-    message = await _run_bedrock(mock_server, signal=AbortSignal.abort())
+async def test_no_diagnostic_for_aborted_turn(fake_client, keys):
+    message = await _run_bedrock(signal=AbortSignal.abort())
     assert message.stop_reason == "aborted"
     assert _diagnostic(message) is None
+    assert not fake_client.calls
 
 
-async def test_drops_over_long_header_values(mock_server, keys):
-    mock_server.add(_error_response(400, f"{'E' * 5000}Exception", {"message": VALIDATION_MESSAGE}, "R" * 5000))
-    message = await _run_bedrock(mock_server)
-    assert _diagnostic(message).details == {"status": 400}
+# -- abort ------------------------------------------------------------------------------------------
 
 
-async def test_unknown_error_code_placeholder_and_raw_bodies(mock_server, keys):
-    mock_server.add(_error_response(403, None, {"message": "blocked by gw"}))
-    message = await _run_bedrock(mock_server)
-    assert message.error_message == "Unknown: blocked by gw"
-    assert _diagnostic(message).details == {"status": 403, "requestId": REQUEST_ID}
-
-    mock_server.add(_error_response(403, None, b"<html>blocked</html>"))
-    message = await _run_bedrock(mock_server)
-    assert message.error_message == "Unknown: 403: <html>blocked</html>"
-
-
-async def test_data_retention_hint(mock_server, keys):
-    mock_server.add(
-        _error_response(
-            400, "ValidationException", {"message": "data retention mode 'default' is not available for this model"}
-        )
+async def test_abort_closes_the_event_stream(fake_client, keys):
+    gate = threading.Event()
+    response = sdk_response(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "partial"}}},
+        ],
+        gate=gate,
     )
-    message = await _run_bedrock(mock_server)
-    assert message.error_message.endswith(
-        "See https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html for supported data retention modes."
-    )
+    fake_client.add(response)
+    controller = AbortController()
+    s = stream(_model(), _hello(), {"cache_retention": "none", "signal": controller.signal})
+    types = []
+    async for item in s:
+        types.append(item.type)
+        if item.type == "text_delta":
+            controller.abort()
+    message = await s.result()
+    assert types == ["start", "text_start", "text_delta", "error"]
+    assert message.stop_reason == "aborted"
+    assert message.content == [TextContent("partial")]
+    assert response["stream"].closed
 
 
-async def test_retries_throttling_by_default(mock_server, keys, monkeypatch):
-    async def no_sleep(*_args: Any, **_kwargs: Any) -> None:
-        return None
+async def test_abort_before_the_response_arrives(fake_client, keys):
+    release = threading.Event()
+    entered = threading.Event()
+    response = sdk_response(simple_stop())
 
-    monkeypatch.setattr("pi_ai.utils.http.sleep", no_sleep)
-    mock_server.add(_error_response(429, "ThrottlingException", {"message": "slow down"}))
-    mock_server.add(eventstream_response(simple_stop()))
-    message = await stream(
-        _model(), _hello(), {"cache_retention": "none", "http_client": mock_server.client()}
-    ).result()
+    def converse_stream(**params: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        return response
+
+    fake_client.converse_stream = converse_stream  # type: ignore[method-assign]
+    controller = AbortController()
+    s = stream(_model(), _hello(), {"cache_retention": "none", "signal": controller.signal})
+    task = asyncio.ensure_future(s.result())
+    while not entered.is_set():
+        await asyncio.sleep(0.005)
+    controller.abort()
+    message = await task
+    assert message.stop_reason == "aborted"
+    release.set()
+    for _ in range(200):
+        if response["stream"].closed:
+            break
+        await asyncio.sleep(0.005)
+    # The worker closes the late response instead of reading it.
+    assert response["stream"].closed
+
+
+async def test_many_events_are_delivered_in_order(fake_client, keys):
+    deltas = [{"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": str(i % 10)}}} for i in range(5000)]
+    fake_client.add(sdk_response([simple_stop()[0], *deltas, simple_stop()[1]]))
+    message = await _run_bedrock()
     assert message.stop_reason == "stop"
-    assert len(mock_server.requests) == 2
+    assert message.content == [TextContent("".join(str(i % 10) for i in range(5000)))]

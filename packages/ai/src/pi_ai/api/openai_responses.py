@@ -2,18 +2,15 @@
 # Converters branch on ``role``/``type`` discriminators held in locals, which pyright does not narrow.
 """OpenAI Responses API (``openai-responses``).
 
-Talks to ``POST {base_url}/responses`` with the request body and headers the OpenAI
-SDK would send. Also used by OpenAI-compatible Responses endpoints (xAI, GitHub
-Copilot, OpenRouter, OpenCode, Cloudflare AI Gateway, ...).
+Streams ``responses.create`` through the official ``openai`` SDK (``AsyncOpenAI``).
+Also used by OpenAI-compatible Responses endpoints (xAI, GitHub Copilot, OpenRouter,
+OpenCode, Cloudflare AI Gateway, ...).
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import Mapping
 from typing import Any, Literal
-
-import httpx
 
 from ..abort import abort_scope
 from ..event_stream import AssistantMessageEventStream
@@ -31,13 +28,20 @@ from ..types import (
 )
 from ..utils.callbacks import maybe_await
 from ..utils.error_body import format_provider_error, normalize_provider_error
-from ..utils.http import ProviderHttpError, build_headers, iter_sse, send_request
 from ..utils.misc import get_pi_user_agent, get_provider_env_value, headers_to_record
 from ..utils.transcript import get_declared_tools, resolve_transcript, resolve_transcript_tools
 from .constrained_sampling import create_grammar_tool_input_properties
 from .github_copilot_headers import build_copilot_dynamic_headers, has_copilot_vision_input
 from .openai_prompt_cache import clamp_openai_prompt_cache_key
 from .openai_responses_shared import convert_responses_messages, convert_responses_tools, process_responses_stream
+from .openai_sdk import (
+    create_openai_client,
+    iter_sdk_stream,
+    merge_sdk_headers,
+    open_sdk_stream,
+    openai_request,
+    sdk_body_arguments,
+)
 from .simple_options import build_base_options, resolve_sampling_params
 
 __all__ = [
@@ -45,8 +49,6 @@ __all__ = [
     "OPENAI_TOOL_CALL_PROVIDERS",
     "stream",
     "stream_simple",
-    "iter_responses_sse_events",
-    "openai_sdk_headers",
 ]
 
 OPENAI_TOOL_CALL_PROVIDERS = frozenset({"openai", "openai-codex", "opencode"})
@@ -165,40 +167,6 @@ def _get_prompt_cache_options(compat: Mapping[str, Any], cache_retention: str) -
     return None
 
 
-def openai_sdk_headers(env: Mapping[str, str] | None = None) -> dict[str, str | None]:
-    """Default headers the OpenAI SDK sends before auth and client default headers."""
-    return {
-        "Accept": "application/json",
-        "OpenAI-Organization": get_provider_env_value("OPENAI_ORG_ID", env),
-        "OpenAI-Project": get_provider_env_value("OPENAI_PROJECT_ID", env),
-    }
-
-
-def _sdk_stream_error(error: Any, headers: httpx.Headers) -> ProviderHttpError:
-    """The OpenAI SDK's ``APIError`` for a stream chunk carrying an ``error`` field."""
-    message: Any = error.get("message") if isinstance(error, dict) else None
-    if message:
-        text = message if isinstance(message, str) else _json_dumps(message)
-    else:
-        text = _json_dumps(error)
-    return ProviderHttpError(text, headers=headers, error=error)
-
-
-def _json_dumps(value: Any) -> str:
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-
-
-async def iter_responses_sse_events(response: httpx.Response) -> AsyncIterator[Any]:
-    """Decode a Responses SSE stream like the OpenAI SDK's ``Stream`` iterator."""
-    async for sse in iter_sse(response):
-        if sse.data.startswith("[DONE]"):
-            break
-        data = sse.json()
-        if isinstance(data, dict) and data.get("error"):
-            raise _sdk_stream_error(data["error"], response.headers)
-        yield data
-
-
 def stream(
     model: Model, context: TranscriptContext, options: Mapping[str, Any] | None = None
 ) -> AssistantMessageEventStream:
@@ -233,7 +201,8 @@ async def _run(
             grammar_tool_input_properties = create_grammar_tool_input_properties(
                 get_declared_tools(context.messages), compat["supportsOpenAIGrammarTools"]
             )
-            headers = _build_request_headers(model, context, api_key, options, compat, cache_session_id)
+            headers = _build_request_headers(model, context, options, compat, cache_session_id)
+            client = create_openai_client(api_key=api_key, base_url=model.base_url, headers=headers, options=options)
             params: Any = _build_params(
                 model, context, options, compat, grammar_tool_input_properties, configuration_update_effort
             )
@@ -242,23 +211,19 @@ async def _run(
                 next_params = await maybe_await(on_payload(params, model))
                 if next_params is not None:
                     params = next_params
-            response = await send_request(
-                "POST",
-                f"{model.base_url}/responses",
-                headers=headers,
-                body=params,
-                options=options,
-                error_style="openai",
-            )
+            create = client.responses.with_raw_response.create
+            body_arguments = sdk_body_arguments(params, headers=headers)
+            raw = await openai_request(lambda: create(stream=True, **body_arguments), options)
+            sdk_stream = open_sdk_stream(raw)
             try:
                 on_response = options.get("on_response")
                 if on_response is not None:
                     await maybe_await(
-                        on_response(ProviderResponse(response.status_code, headers_to_record(response.headers)), model)
+                        on_response(ProviderResponse(raw.status_code, headers_to_record(raw.headers)), model)
                     )
                 out.push(StartEvent(output))
                 await process_responses_stream(
-                    iter_responses_sse_events(response),
+                    iter_sdk_stream(sdk_stream),
                     output,
                     out,
                     model,
@@ -272,7 +237,7 @@ async def _run(
                     },
                 )
             finally:
-                await response.aclose()
+                await sdk_stream.close()
 
         if signal is not None and signal.aborted:
             raise RuntimeError("Request was aborted")
@@ -321,11 +286,11 @@ def stream_simple(
 def _build_request_headers(
     model: Model,
     context: TranscriptContext,
-    api_key: str,
     options: Mapping[str, Any],
     compat: Mapping[str, Any],
     session_id: str | None,
-) -> dict[str, str]:
+) -> dict[str, str | None]:
+    """The client's ``default_headers``: ``None`` removes a header, SDK defaults included."""
     copilot_headers: dict[str, str] | None = None
     if model.provider == "github-copilot":
         copilot_headers = build_copilot_dynamic_headers(
@@ -342,16 +307,13 @@ def _build_request_headers(
                 session_headers["session_id"] = session_id
             session_headers["x-client-request-id"] = session_id
 
-    return build_headers(
-        openai_sdk_headers(options.get("env")),
-        {"Authorization": f"Bearer {api_key}"},
+    return merge_sdk_headers(
         {"User-Agent": get_pi_user_agent()},
         model.headers,
         copilot_headers,
         session_headers,
         # Options headers last so they can override defaults.
         options.get("headers"),
-        {"Content-Type": "application/json"},
     )
 
 

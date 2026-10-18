@@ -1,27 +1,32 @@
 """Google Vertex AI adapter.
 
-Streams ``publishers/google/models/{model}:streamGenerateContent?alt=sse`` over REST, with
-either a Vertex API key (express mode) or Application Default Credentials plus project and
-location, resolving endpoints the way ``@google/genai`` (used by pi upstream) does.
+Streams through the official ``google-genai`` SDK (``Client(vertexai=True, ...)``), as pi
+upstream does with ``@google/genai``: either with a Vertex API key (express mode) or with
+Application Default Credentials (through ``google-auth``) plus project and location.
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 import urllib.parse
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from ..auth.google_adc import get_google_auth_headers
+import google.auth
+from google.auth.credentials import Credentials
+from google.genai import Client
+from google.genai import types as genai_types
+
 from ..event_stream import AssistantMessageEventStream
 from ..models import clamp_thinking_level
 from ..types import Model, StreamOptions, TranscriptContext
+from ..utils.http import get_http_client
 from ..utils.misc import get_provider_env_value
 from .google_shared import (
-    GoogleClient,
     GoogleThinkingOptions,
     ResolvedGoogleThinkingLevel,
-    build_google_client_headers,
+    get_google_client,
     new_google_output,
     resolve_google_thinking_level,
     run_google_stream,
@@ -38,13 +43,12 @@ __all__ = [
     "resolve_api_key",
     "resolve_project",
     "resolve_location",
-    "resolve_vertex_base_url",
 ]
 
 API_VERSION = "v1"
 GCP_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials"
+CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 _GLOBAL_ENDPOINT = "https://aiplatform.googleapis.com/"
-_MULTI_REGIONAL_LOCATIONS = frozenset(("us", "eu"))
 _PLACEHOLDER_API_KEY = re.compile(r"<[^>]+>")
 _API_VERSION_SEGMENT = re.compile(r"v\d+(?:beta\d*)?")
 _API_VERSION_IN_TEXT = re.compile(r"(?:^|/)v\d+(?:beta\d*)?(?:/|$)")
@@ -163,84 +167,58 @@ def _base_url_includes_api_version(base_url: str) -> bool:
     return _API_VERSION_IN_TEXT.search(base_url) is not None
 
 
-def resolve_vertex_base_url(
-    model: Model,
-    *,
-    project: str | None,
-    location: str | None,
-    api_key: str | None,
-    env: Mapping[str, str] | None = None,
-) -> str:
-    """The URL prefix that ``{model path}:streamGenerateContent`` is appended to.
+def _load_credentials_file(path: str) -> Credentials:
+    credentials, _project = google.auth.load_credentials_from_file(path, scopes=[CLOUD_PLATFORM_SCOPE])
+    return credentials
 
-    A custom model baseUrl is used as a collection URL (no ``projects/.../locations/...``
-    prefix; the API version is appended unless the URL already has one). Otherwise the SDK's
-    endpoint rules apply: the global endpoint for API keys and ``location == "global"``,
-    ``aiplatform.{us,eu}.rep.googleapis.com`` for multi-regions, ``{location}-aiplatform`` otherwise.
-    """
-    custom = _resolve_custom_base_url(model.base_url)
-    if custom is not None:
-        base_url = custom
-        api_version = "" if _base_url_includes_api_version(custom) else API_VERSION
-        prepend_resource_path = False
+
+async def _create_client(model: Model, options: Mapping[str, Any]) -> Client:
+    env = options.get("env")
+    http_options: dict[str, Any] = {"api_version": API_VERSION}
+    custom_base_url = _resolve_custom_base_url(model.base_url)
+    if custom_base_url is not None:
+        # A model baseUrl is a collection URL: no projects/.../locations/... prefix. The JS SDK
+        # still appends the API version unless the URL has one; the Python SDK never does for
+        # collection-scoped URLs, so add it here.
+        if not _base_url_includes_api_version(custom_base_url):
+            custom_base_url = f"{custom_base_url.rstrip('/')}/{API_VERSION}"
+        http_options["base_url"] = custom_base_url
+        http_options["base_url_resource_scope"] = genai_types.ResourceScope.COLLECTION
     else:
-        api_version = API_VERSION
+        # The SDK reads GOOGLE_VERTEX_BASE_URL from os.environ itself; this also honors the provider env.
         env_base_url = (get_provider_env_value("GOOGLE_VERTEX_BASE_URL", env) or "").strip()
         if env_base_url:
-            base_url = env_base_url
-        elif (api_key and not project) or location == "global":
-            # Vertex express mode (API key) or the global endpoint.
-            base_url = _GLOBAL_ENDPOINT
-        elif project and location and location in _MULTI_REGIONAL_LOCATIONS:
-            base_url = f"https://aiplatform.{location}.rep.googleapis.com/"
-        else:
-            base_url = f"https://{location}-aiplatform.googleapis.com/"
-        prepend_resource_path = bool(project and location and not api_key)
-    parts = [base_url[:-1] if base_url.endswith("/") else base_url]
-    if api_version:
-        parts.append(api_version)
-    if prepend_resource_path:
-        parts.append(f"projects/{project}/locations/{location}")
-    return "/".join(parts)
+            http_options["base_url"] = env_base_url
+    http_client = get_http_client(http_options.get("base_url") or _GLOBAL_ENDPOINT, options)
+    http_options["httpx_async_client"] = http_client
+    base_key = (http_options.get("base_url"), http_options.get("base_url_resource_scope"))
 
-
-def _create_client(model: Model, options: Mapping[str, Any]) -> GoogleClient:
     # Use a Vertex API key if provided, otherwise ADC with project and location.
     api_key = resolve_api_key(options)
-    headers = build_google_client_headers(model, options)
     if api_key:
-        prefix = resolve_vertex_base_url(model, project=None, location=None, api_key=api_key, env=options.get("env"))
 
-        async def api_key_headers() -> dict[str, str]:
-            if api_key.startswith("auth_tokens/"):
-                raise ValueError("Ephemeral tokens are only supported by the live API.")
-            return {"x-goog-api-key": api_key}
+        async def api_key_client() -> Client:
+            return Client(vertexai=True, api_key=api_key, http_options=genai_types.HttpOptions(**http_options))
 
-        return GoogleClient(
-            vertex=True,
-            url=lambda model_path: f"{prefix}/{model_path}:streamGenerateContent?alt=sse",
-            headers=headers,
-            auth_headers=api_key_headers,
-        )
+        return await get_google_client(http_client, ("vertex-api-key", api_key, *base_key), api_key_client)
 
     project = resolve_project(options)
     location = resolve_location(options)
-    prefix = resolve_vertex_base_url(model, project=project, location=location, api_key=None, env=options.get("env"))
+    # Upstream passes GOOGLE_APPLICATION_CREDENTIALS to google-auth as keyFilename; without it the
+    # SDK uses google.auth.default(). The cached client keeps the credentials and refreshes the token.
+    key_filename = get_provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", env)
 
-    async def adc_headers() -> dict[str, str]:
-        return await get_google_auth_headers(
-            env=options.get("env"),
-            http_client=options.get("http_client"),
-            signal=options.get("signal"),
-            timeout_ms=options.get("timeout_ms"),
+    async def adc_client() -> Client:
+        credentials = await asyncio.to_thread(_load_credentials_file, key_filename) if key_filename else None
+        return Client(
+            vertexai=True,
+            project=project,
+            location=location,
+            credentials=credentials,
+            http_options=genai_types.HttpOptions(**http_options),
         )
 
-    return GoogleClient(
-        vertex=True,
-        url=lambda model_path: f"{prefix}/{model_path}:streamGenerateContent?alt=sse",
-        headers=headers,
-        auth_headers=adc_headers,
-    )
+    return await get_google_client(http_client, ("vertex-adc", project, location, key_filename, *base_key), adc_client)
 
 
 def get_google_budget(

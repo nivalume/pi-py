@@ -1565,3 +1565,55 @@ async def test_exposes_response_id(mock_server: Any) -> None:
     assert message.content and isinstance(message.content[0], TextContent)
     assert message.content[0].text == "answer"
     assert isinstance(message.usage, Usage)
+
+
+async def test_aborted_mid_stream(mock_server: Any) -> None:
+    import asyncio
+
+    from pi_ai import AbortController
+
+    controller = AbortController()
+    release = asyncio.Event()
+
+    async def body():
+        yield b'data: {"type":"response.created","response":{"id":"resp_1"}}\n\n'
+        yield (
+            b'data: {"type":"response.output_item.added","output_index":0,'
+            b'"item":{"type":"message","id":"msg_1","role":"assistant","content":[]}}\n\n'
+        )
+        await release.wait()
+
+    mock_server.add(httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body()))
+    stream = openai_responses.stream(
+        make_model(),
+        simple_context(),
+        {"api_key": "k", "http_client": mock_server.client(), "signal": controller.signal},
+    )
+    types: list[str] = []
+    async for event in stream:
+        types.append(event.type)
+        if event.type == "text_start":
+            controller.abort()
+    message = await stream.result()
+    assert message.stop_reason == "aborted"
+    assert message.error_message == "Request was aborted"
+    assert types[-1] == "error"
+
+
+async def test_in_stream_error_payload_raises_like_the_sdk(mock_server: Any) -> None:
+    mock_server.add_sse([{"error": {"message": "upstream exploded", "code": "server_error"}}])
+    message = await openai_responses.stream(
+        make_model(), simple_context(), {"api_key": "sk-x", "http_client": mock_server.client()}
+    ).result()
+    assert message.stop_reason == "error"
+    assert message.error_message == "upstream exploded"
+
+
+async def test_status_error_retries_through_sdk(mock_server: Any) -> None:
+    mock_server.add_json({"error": {"message": "busy"}}, status=503, headers={"retry-after-ms": "1"})
+    mock_server.add_sse([completed_event()])
+    message = await openai_responses.stream(
+        make_model(), simple_context(), {"api_key": "sk-x", "http_client": mock_server.client(), "max_retries": 1}
+    ).result()
+    assert message.stop_reason == "stop"
+    assert len(mock_server.requests) == 2

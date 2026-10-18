@@ -1071,3 +1071,82 @@ async def test_aborted_mid_stream_keeps_partial_content(mock_server):
     assert message.error_message == "Request was aborted"
     assert message.content == [TextContent("hello")]
     assert types == ["start", "text_start", "text_delta", "text_end", "error"]
+
+
+# ---------------------------------------------------------------------------
+# OpenAI SDK transport
+# ---------------------------------------------------------------------------
+
+
+async def test_status_error_keeps_the_parsed_error_body(mock_server):
+    mock_server.add_json(
+        {"error": {"message": "Invalid value for 'model'", "type": "invalid_request_error"}}, status=400
+    )
+    message, _ = await run(mock_server, openai_model(), ctx(HI), simple=False)
+    assert message.stop_reason == "error"
+    # JS SDK APIError: status 400, error = body.error, formatted by normalizeProviderError.
+    assert message.error_message == '400: {"message":"Invalid value for \'model\'","type":"invalid_request_error"}'
+
+
+async def test_status_error_without_json_body(mock_server):
+    mock_server.add(httpx.Response(502, text="Bad Gateway"))
+    message, _ = await run(mock_server, openai_model(), ctx(HI), simple=False)
+    assert message.error_message == "502 Bad Gateway"
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(httpx.ConnectError("refused"), "Connection error."), (httpx.ReadTimeout("slow"), "Request timed out.")],
+)
+async def test_transport_errors_use_sdk_messages(mock_server, error, expected):
+    def fail(_request: httpx.Request) -> httpx.Response:
+        raise error
+
+    mock_server.add(fail)
+    message, _ = await run(mock_server, openai_model(), ctx(HI), simple=False)
+    assert message.stop_reason == "error"
+    assert message.error_message == expected
+
+
+async def test_retries_are_fresh_sdk_requests(mock_server):
+    mock_server.add_json({"error": {"message": "rate limited"}}, status=429, headers={"retry-after-ms": "1"})
+    mock_server.add_sse(OK_CHUNKS)
+    message, _ = await run(
+        mock_server, RETRY_MODEL, ctx(UserMessage("hi")), {"max_retries": 1, "max_retry_delay_ms": 100}, simple=False
+    )
+    assert message.stop_reason == "stop"
+    # pi retries around the SDK (max_retries=0), so every attempt is a first SDK attempt.
+    assert [request.headers["x-stainless-retry-count"] for request in mock_server.requests] == ["0", "0"]
+
+
+async def test_on_payload_body_is_sent_unchanged(mock_server):
+    replacement = {
+        "model": "custom-model",
+        "messages": [{"role": "user", "content": "hi", "custom_part": True}],
+        "stream": True,
+        "provider_specific": {"nested": [1, None]},
+    }
+    message, _ = await run(
+        mock_server, openai_model(), ctx(HI), {"on_payload": lambda _params, _model: replacement}, simple=False
+    )
+    assert message.stop_reason == "stop"
+    assert mock_server.last.json() == replacement
+
+
+async def test_uses_pooled_http_client_without_http_client_option(mock_server, monkeypatch):
+    from pi_ai.api import openai_sdk
+
+    seen: list[str] = []
+    client = mock_server.client()
+
+    def pooled(url: str = "", options: Any = None) -> httpx.AsyncClient:
+        seen.append(url)
+        return client
+
+    monkeypatch.setattr(openai_sdk, "get_http_client", pooled)
+    mock_server.add_sse([STOP_CHUNK, "[DONE]"])
+    s = stream(openai_model(), ctx(HI), {"api_key": "k"})
+    message = await s.result()
+    assert message.stop_reason == "stop"
+    assert seen == ["https://api.openai.com/v1"]
+    assert not client.is_closed

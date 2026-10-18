@@ -1,11 +1,11 @@
 """Shared HTTP transport for provider adapters.
 
-Adapters talk to provider APIs directly over ``httpx`` instead of wrapping
-vendor SDKs. This keeps the dependency footprint to one package, makes import
-time small, and gives every adapter the same controls: header suppression with
-``None`` values, ``on_payload``/``on_response`` hooks, provider-scoped proxy
-settings, SDK-compatible retries, and prompt cancellation through
-:class:`pi_ai.AbortSignal`.
+Adapters built on vendor SDKs (anthropic, openai, google-genai) hand the pooled
+client from :func:`get_http_client` to the SDK. Adapters for APIs that pi calls
+without an SDK (Mistral, OpenAI Codex, pi-messages, classifiers, OAuth) send
+requests with :func:`send_request`, which provides header suppression with
+``None`` values, provider-scoped proxy settings, SDK-compatible retries and
+error messages, and prompt cancellation through :class:`pi_ai.AbortSignal`.
 
 Connection pools are shared per event loop (and per proxy configuration), so
 consecutive requests reuse TLS connections.

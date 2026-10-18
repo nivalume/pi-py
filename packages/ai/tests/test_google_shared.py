@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import httpx
 import pytest
+from google.genai import Client
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 import pi_ai.utils.http as http_module
 from pi_ai import (
@@ -23,13 +27,12 @@ from pi_ai import (
     normalize_context,
 )
 from pi_ai.api.google_shared import (
+    build_google_http_headers,
     build_google_params,
-    build_google_request_body,
     convert_messages,
     convert_tools,
     get_disabled_google_thinking_config,
     google_api_error,
-    google_model_path,
     is_thinking_part,
     map_stop_reason,
     map_stop_reason_string,
@@ -681,6 +684,27 @@ class TestRetryGoogleRequest:
         assert info.value is error
         assert request.calls == 1
 
+    async def test_converts_and_retries_sdk_http_errors(self, no_backoff: list[float]) -> None:
+        body = {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}}
+        error = genai_errors.ServerError(503, body, httpx.Response(503, json=body))
+        request = _Request([error, error])
+        with pytest.raises(ProviderHttpError) as info:
+            await retry_google_request(request, {"max_retries": 1})
+        assert request.calls == 2
+        assert info.value.status == 503
+        assert str(info.value) == json.dumps(body, separators=(",", ":"))
+        assert info.value.__cause__ is error
+
+    async def test_does_not_retry_stream_error_events(self, no_backoff: list[float]) -> None:
+        # The SDK raises for an error event inside a 200 event stream; upstream never retries those.
+        event = {"error": {"code": 429, "message": "slow down", "status": "RESOURCE_EXHAUSTED"}}
+        error = genai_errors.ClientError(429, event, httpx.Response(200))
+        request = _Request([error, "ok"])
+        with pytest.raises(ProviderHttpError) as info:
+            await retry_google_request(request, {"max_retries": 2})
+        assert request.calls == 1
+        assert str(info.value) == f"got status: RESOURCE_EXHAUSTED. {json.dumps(event, separators=(',', ':'))}"
+
     async def test_does_not_retry_transport_errors(self, no_backoff: list[float]) -> None:
         error = ProviderHttpError("Connection error: refused")
         request = _Request([error, "ok"])
@@ -691,22 +715,12 @@ class TestRetryGoogleRequest:
 
 
 # ---------------------------------------------------------------------------
-# SDK wire format
+# SDK parameters and errors
 # ---------------------------------------------------------------------------
 
 
-class TestRequestBody:
-    def test_model_paths(self) -> None:
-        assert google_model_path("gemini-2.5-flash", False) == "models/gemini-2.5-flash"
-        assert google_model_path("models/x", False) == "models/x"
-        assert google_model_path("tunedModels/x", False) == "tunedModels/x"
-        assert google_model_path("gemini-2.5-flash", True) == "publishers/google/models/gemini-2.5-flash"
-        assert google_model_path("meta/llama-3", True) == "publishers/meta/models/llama-3"
-        assert google_model_path("projects/p/locations/l/endpoints/e", True) == "projects/p/locations/l/endpoints/e"
-        with pytest.raises(ValueError, match="invalid model parameter"):
-            google_model_path("a?b", False)
-
-    def test_params_and_body_split_like_the_sdk(self) -> None:
+class TestRequestParams:
+    async def test_params_are_sent_through_the_sdk(self, mock_server: Any) -> None:
         model = make_model("gemini-3-pro-preview")
         tool = Tool("bash", "Run bash", {"type": "object", "properties": {"command": {"type": "string"}}})
         context = normalize_context(Context(system_prompt="Be terse.", messages=[UserMessage("hi")], tools=[tool]))
@@ -721,6 +735,7 @@ class TestRequestBody:
             },
         )
         assert params["model"] == "gemini-3-pro-preview"
+        assert params["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
         assert params["config"] == {
             "temperature": 0.2,
             "maxOutputTokens": 100,
@@ -739,41 +754,46 @@ class TestRequestBody:
             "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
             "thinkingConfig": {"includeThoughts": True, "thinkingLevel": "HIGH"},
         }
-        model_path, body = build_google_request_body(params, vertex=False)
-        assert model_path == "models/gemini-3-pro-preview"
-        assert body == {
-            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-            "systemInstruction": {"role": "user", "parts": [{"text": "Be terse."}]},
-            "tools": params["config"]["tools"],
-            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 100,
-                "thinkingConfig": {"includeThoughts": True, "thinkingLevel": "HIGH"},
-            },
+
+        # The SDK accepts the camelCase dicts and splits them into the REST body.
+        mock_server.add_sse([{"candidates": [{"finishReason": "STOP"}]}])
+        client = Client(api_key="k", http_options=genai_types.HttpOptions(httpx_async_client=mock_server.client()))
+        stream = await client.aio.models.generate_content_stream(**params)
+        assert [chunk.candidates[0].finish_reason async for chunk in stream] == ["STOP"]
+        request = mock_server.last
+        assert request.url.endswith("/v1beta/models/gemini-3-pro-preview:streamGenerateContent?alt=sse")
+        body = request.json()
+        assert set(body) == {"contents", "systemInstruction", "tools", "toolConfig", "generationConfig"}
+        assert body["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+        assert body["systemInstruction"] == {"role": "user", "parts": [{"text": "Be terse."}]}
+        assert body["toolConfig"] == {"functionCallingConfig": {"mode": "ANY"}}
+        assert body["tools"][0]["functionDeclarations"][0]["name"] == "bash"
+        generation_config = body["generationConfig"]
+        assert (generation_config["temperature"], generation_config["maxOutputTokens"]) == (0.2, 100)
+        assert "thinkingConfig" in generation_config
+
+    def test_http_headers(self) -> None:
+        model = make_model()
+        model.headers = {"X-Model": "m", "user-agent": "model-agent"}
+        assert build_google_http_headers(model, {"headers": {"X-Goog-Api-Key": "mine", "X-Model": None}}) == {
+            "user-agent": "model-agent",
+            "x-goog-api-key": "mine",
         }
 
-    def test_empty_config_and_errors(self) -> None:
-        _, body = build_google_request_body({"model": "m", "contents": "hello", "config": {}}, vertex=True)
-        assert body == {"contents": [{"role": "user", "parts": [{"text": "hello"}]}], "generationConfig": {}}
-        with pytest.raises(ValueError, match="contents are required"):
-            build_google_request_body({"model": "m", "contents": [], "config": {}}, vertex=False)
-        with pytest.raises(ValueError, match="labels parameter is only supported in Gemini Enterprise Agent Platform"):
-            build_google_request_body({"model": "m", "contents": "x", "config": {"labels": {"a": "b"}}}, vertex=False)
-        _, body = build_google_request_body(
-            {"model": "m", "contents": "x", "config": {"labels": {"a": "b"}, "modelSelectionConfig": {"x": 1}}},
-            vertex=True,
-        )
-        assert body["labels"] == {"a": "b"}
-        assert body["generationConfig"] == {"modelConfig": {"x": 1}}
 
-    def test_api_error_wording(self) -> None:
+class TestApiError:
+    def test_json_body_is_the_message(self) -> None:
         body = {"error": {"code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED"}}
-        error = google_api_error(403, json.dumps(body), "application/json; charset=UTF-8")
+        response = httpx.Response(403, json=body)
+        error = google_api_error(genai_errors.ClientError(403, body, response))
         assert str(error) == json.dumps(body, separators=(",", ":"))
         assert error.status == 403
         assert error.headers is None
-        text_error = google_api_error(502, "bad gateway", "text/html")
-        assert json.loads(str(text_error)) == {
-            "error": {"message": "bad gateway", "code": 502, "status": "Bad Gateway"}
-        }
+
+    def test_non_json_body(self) -> None:
+        response = httpx.Response(502, text="bad gateway", headers={"content-type": "text/html"})
+        error = google_api_error(
+            genai_errors.ServerError(502, {"message": "bad gateway", "status": "Bad Gateway"}, response)
+        )
+        assert json.loads(str(error)) == {"error": {"message": "bad gateway", "code": 502, "status": "Bad Gateway"}}
+        assert error.status == 502

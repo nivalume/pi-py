@@ -17,7 +17,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
-dependencies = ["httpx>=0.27"]
+dependencies = [
+    "httpx>=0.27",
+    # Official vendor SDKs, as used by the TypeScript package.
+    "anthropic>=1.15",
+    "openai>=3.35",
+    "google-genai>=2.31",
+]
 
 [project.optional-dependencies]
 # orjson speeds up SSE/JSON decoding on the streaming hot path.
@@ -26,7 +32,9 @@ fast = ["orjson>=3.10"]
 websocket = ["websockets>=13"]
 # Pydantic models as tool parameter schemas.
 pydantic = ["pydantic>=2.6"]
-all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6"]
+# Amazon Bedrock (bedrock-converse-stream) through the AWS SDK.
+bedrock = ["boto3>=1.43"]
+all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43"]
 
 [project.scripts]
 pi-ai = "pi_ai.cli:main"

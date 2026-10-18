@@ -17,7 +17,7 @@ pi-agent-core = { workspace = true }
 
 [dependency-groups]
 dev = [
-    "pi-ai[fast,websocket]",
+    "pi-ai[fast,websocket,bedrock]",
     "pi-agent-core",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",

@@ -2,9 +2,9 @@
 # Converters branch on ``role``/``type`` discriminators held in locals, which pyright does not narrow.
 """Azure OpenAI Responses API (``azure-openai-responses``).
 
-Sends ``POST {base_url}/responses?api-version=<version>`` with an ``api-key`` header,
-like the ``AzureOpenAI`` client of the OpenAI SDK. The deployment name goes in the
-body's ``model`` field.
+Streams ``responses.create`` through the official ``openai`` SDK's ``AsyncAzureOpenAI``
+client (``POST {base_url}/responses?api-version=<version>`` with an ``api-key`` header).
+The deployment name goes in the body's ``model`` field.
 """
 
 from __future__ import annotations
@@ -27,14 +27,20 @@ from ..types import (
 )
 from ..utils.callbacks import maybe_await
 from ..utils.error_body import format_provider_error, normalize_provider_error
-from ..utils.http import build_headers, send_request
 from ..utils.misc import get_pi_user_agent, headers_to_record
 from ..utils.transcript import get_declared_tools, resolve_transcript, resolve_transcript_tools
 from .azure_openai_config import AzureEndpointOptions, resolve_azure_config, resolve_deployment_name
 from .constrained_sampling import create_grammar_tool_input_properties
 from .openai_prompt_cache import clamp_openai_prompt_cache_key
-from .openai_responses import iter_responses_sse_events, openai_sdk_headers
 from .openai_responses_shared import convert_responses_messages, convert_responses_tools, process_responses_stream
+from .openai_sdk import (
+    create_openai_client,
+    iter_sdk_stream,
+    merge_sdk_headers,
+    open_sdk_stream,
+    openai_request,
+    sdk_body_arguments,
+)
 from .simple_options import build_base_options, resolve_sampling_params
 
 __all__ = ["AzureOpenAIResponsesOptions", "AZURE_TOOL_CALL_PROVIDERS", "stream", "stream_simple"]
@@ -83,15 +89,16 @@ async def _run(
             api_key = options.get("api_key")
             if not api_key:
                 raise RuntimeError(f"No API key for provider: {model.provider}")
-            headers = build_headers(
-                openai_sdk_headers(options.get("env")),
-                {"api-key": api_key},
-                {"User-Agent": get_pi_user_agent()},
-                model.headers,
-                options.get("headers"),
-                {"Content-Type": "application/json"},
-            )
+            headers = merge_sdk_headers({"User-Agent": get_pi_user_agent()}, model.headers, options.get("headers"))
             base_url, api_version = resolve_azure_config(model, options)
+            client = create_openai_client(
+                api_key=api_key,
+                # The SDK appends the path to the base URL and sends ``api-version`` as the query string.
+                base_url=base_url.partition("?")[0],
+                headers=headers,
+                options=options,
+                azure_api_version=api_version,
+            )
             grammar_tool_input_properties = create_grammar_tool_input_properties(
                 get_declared_tools(context.messages), bool((model.compat or {}).get("supportsOpenAIGrammarTools"))
             )
@@ -101,24 +108,19 @@ async def _run(
                 next_params = await maybe_await(on_payload(params, model))
                 if next_params is not None:
                     params = next_params
-            response = await send_request(
-                "POST",
-                _build_url(base_url),
-                headers=headers,
-                body=params,
-                options=options,
-                error_style="openai",
-                params={"api-version": api_version},
-            )
+            create = client.responses.with_raw_response.create
+            body_arguments = sdk_body_arguments(params, headers=headers)
+            raw = await openai_request(lambda: create(stream=True, **body_arguments), options)
+            sdk_stream = open_sdk_stream(raw)
             try:
                 on_response = options.get("on_response")
                 if on_response is not None:
                     await maybe_await(
-                        on_response(ProviderResponse(response.status_code, headers_to_record(response.headers)), model)
+                        on_response(ProviderResponse(raw.status_code, headers_to_record(raw.headers)), model)
                     )
                 out.push(StartEvent(output))
                 await process_responses_stream(
-                    iter_responses_sse_events(response),
+                    iter_sdk_stream(sdk_stream),
                     output,
                     out,
                     model,
@@ -128,7 +130,7 @@ async def _run(
                     },
                 )
             finally:
-                await response.aclose()
+                await sdk_stream.close()
 
         if signal is not None and signal.aborted:
             raise RuntimeError("Request was aborted")
@@ -168,12 +170,6 @@ def stream_simple(
         if options.get(key) is not None:
             base[key] = options[key]
     return stream(model, context, base)
-
-
-def _build_url(base_url: str) -> str:
-    # Like the SDK: the path is appended to the base URL and the query string is replaced by the
-    # ``api-version`` parameter.
-    return f"{base_url.partition('?')[0]}/responses"
 
 
 def _build_params(

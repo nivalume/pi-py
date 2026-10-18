@@ -2,10 +2,10 @@
 # Converters branch on ``role``/``type`` discriminators held in locals, which pyright does not narrow.
 """OpenAI Chat Completions API (``openai-completions``).
 
-Port of pi's ``api/openai-completions.ts``. Talks to ``{base_url}/chat/completions``
-directly over HTTP with the JSON body and headers the OpenAI SDK would send, and
-covers the many OpenAI-compatible servers through ``model.compat`` (auto-detected
-from the provider id and base URL when unset).
+Port of pi's ``api/openai-completions.ts``. Streams ``chat.completions.create`` through
+the official ``openai`` SDK (``AsyncOpenAI``) and covers the many OpenAI-compatible
+servers through ``model.compat`` (auto-detected from the provider id and base URL
+when unset).
 """
 
 from __future__ import annotations
@@ -49,7 +49,6 @@ from ..types import (
 from ..utils import fastjson
 from ..utils.callbacks import maybe_await
 from ..utils.error_body import format_provider_error, normalize_provider_error
-from ..utils.http import ProviderHttpError, build_headers, iter_sse, send_request
 from ..utils.json_parse import StreamingJsonParser, parse_tool_call_arguments
 from ..utils.misc import get_pi_user_agent, get_provider_env_value, headers_to_record, sanitize_surrogates, short_hash
 from ..utils.text import append_text, append_thinking, get_system_message_text, render_system_message_update
@@ -65,6 +64,14 @@ from .constrained_sampling import (
 )
 from .github_copilot_headers import build_copilot_dynamic_headers, has_copilot_vision_input
 from .openai_prompt_cache import clamp_openai_prompt_cache_key
+from .openai_sdk import (
+    create_openai_client,
+    iter_sdk_stream,
+    merge_sdk_headers,
+    open_sdk_stream,
+    openai_request,
+    sdk_body_arguments,
+)
 from .simple_options import (
     build_base_options,
     clamp_thinking_budget_to_answer_room,
@@ -106,7 +113,6 @@ class ConvertCompletionsMessagesOptions(TypedDict, total=False):
 #: Fully resolved ``OpenAICompletionsCompat`` (camelCase keys, as in pi).
 ResolvedOpenAICompletionsCompat: TypeAlias = dict[str, Any]
 
-_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _REASONING_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
 _REPLAY_REASONING_FIELDS = frozenset(("reasoning", "reasoning_content", "reasoning_text"))
 # Characters removed by JavaScript's String.prototype.trim().
@@ -374,55 +380,33 @@ def stream_simple(
 # ---------------------------------------------------------------------------
 
 
-def _chat_completions_url(base_url: str) -> str:
-    base = base_url or _DEFAULT_BASE_URL
-    return (base[:-1] if base.endswith("/") else base) + "/chat/completions"
-
-
 def _build_request_headers(
     model: Model,
     context: TranscriptContext,
-    api_key: str,
     options_headers: Mapping[str, str | None] | None,
     session_id: str | None,
     compat: ResolvedOpenAICompletionsCompat,
-) -> dict[str, str]:
-    headers: dict[str, str | None] = {"User-Agent": get_pi_user_agent()}
-    if model.headers:
-        headers.update(model.headers)
+) -> dict[str, str | None]:
+    """The client's ``default_headers``: ``None`` removes a header, SDK defaults included."""
+    copilot_headers: dict[str, str] | None = None
     if model.provider == "github-copilot":
         messages = context.messages
-        headers.update(build_copilot_dynamic_headers(messages=messages, has_images=has_copilot_vision_input(messages)))
+        copilot_headers = build_copilot_dynamic_headers(
+            messages=messages, has_images=has_copilot_vision_input(messages)
+        )
+    session_headers: dict[str, str] = {}
     if session_id and compat.get("sendSessionAffinityHeaders"):
         if compat.get("sessionAffinityFormat") == "openrouter":
-            headers["x-session-id"] = session_id
+            session_headers["x-session-id"] = session_id
         else:
             if compat.get("sessionAffinityFormat") == "openai":
-                headers["session_id"] = session_id
-            headers["x-client-request-id"] = session_id
-            headers["x-session-affinity"] = session_id
+                session_headers["session_id"] = session_id
+            session_headers["x-client-request-id"] = session_id
+            session_headers["x-session-affinity"] = session_id
     # Options headers last so they can override defaults.
-    if options_headers:
-        headers.update(options_headers)
-    # Same precedence as the OpenAI SDK: SDK defaults < auth < client default headers < body headers.
-    return build_headers(
-        {"Accept": "application/json"},
-        {"Authorization": f"Bearer {api_key}"},
-        headers,
-        {"Content-Type": "application/json"},
+    return merge_sdk_headers(
+        {"User-Agent": get_pi_user_agent()}, model.headers, copilot_headers, session_headers, options_headers
     )
-
-
-def _sdk_error_message(error: Any) -> str:
-    """The OpenAI SDK's ``APIError`` message for an error without HTTP status."""
-    message = _prop(error, "message")
-    if _truthy(message):
-        text = message if isinstance(message, str) else _json_compact(message)
-    elif _truthy(error):
-        text = _json_compact(error)
-    else:
-        text = ""
-    return text or "(no status code or body)"
 
 
 class _CustomInput:
@@ -749,7 +733,8 @@ async def _run(
         )
         cache_retention = _resolve_cache_retention(options.get("cache_retention"), options.get("env"))
         cache_session_id = None if cache_retention == "none" else options.get("session_id")
-        headers = _build_request_headers(model, context, api_key, options.get("headers"), cache_session_id, compat)
+        headers = _build_request_headers(model, context, options.get("headers"), cache_session_id, compat)
+        client = create_openai_client(api_key=api_key, base_url=model.base_url, headers=headers, options=options)
         params: Any = build_params(model, context, options, compat, cache_retention, grammar_properties)
         on_payload = options.get("on_payload")
         if on_payload is not None:
@@ -757,41 +742,27 @@ async def _run(
             if next_params is not None:
                 params = next_params
 
-        url = _chat_completions_url(model.base_url)
+        create = client.chat.completions.with_raw_response.create
+        body_arguments = sdk_body_arguments(params, "model", "messages", headers=headers)
         try:
             async with abort_scope(signal):
-                response = await send_request(
-                    "POST", url, headers=headers, body=params, options=options, error_style="openai"
-                )
+                raw = await openai_request(lambda: create(stream=True, **body_arguments), options)
         except AbortError as error:
             if signal is not None and signal.aborted:
                 raise AbortError("Request aborted") from error
             raise
 
         processor = _StreamProcessor(model, out, output, grammar_properties)
+        sdk_stream = open_sdk_stream(raw)
         try:
             on_response = options.get("on_response")
             if on_response is not None:
-                await maybe_await(
-                    on_response(ProviderResponse(response.status_code, headers_to_record(response.headers)), model)
-                )
+                await maybe_await(on_response(ProviderResponse(raw.status_code, headers_to_record(raw.headers)), model))
             out.push(StartEvent(output))
             on_event = options.get("on_provider_stream_event")
             try:
                 async with abort_scope(signal):
-                    async for sse in iter_sse(response):
-                        data = sse.data
-                        if data.startswith("[DONE]"):
-                            break
-                        chunk = sse.json()
-                        event_name = sse.event
-                        if event_name is not None and event_name.startswith("thread."):
-                            chunk = {"event": event_name, "data": chunk}
-                        elif isinstance(chunk, dict) and _truthy(chunk.get("error")):
-                            error_body = chunk["error"]
-                            raise ProviderHttpError(
-                                _sdk_error_message(error_body), headers=response.headers, error=error_body
-                            )
+                    async for chunk in iter_sdk_stream(sdk_stream):
                         if on_event is not None:
                             await maybe_await(on_event(chunk, model))
                         processor.handle_chunk(chunk)
@@ -800,7 +771,7 @@ async def _run(
                 if signal is None or not signal.aborted:
                     raise
         finally:
-            await response.aclose()
+            await sdk_stream.close()
 
         processor.finish()
         if signal is not None and signal.aborted:

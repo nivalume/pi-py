@@ -1,23 +1,29 @@
 """Amazon Bedrock Converse streaming (``bedrock-converse-stream`` API).
 
-Port of pi's ``api/bedrock-converse-stream.ts``. pi drives the AWS SDK's
-``ConverseStreamCommand``; this module sends the same REST call directly:
-``POST /model/{modelId}/converse-stream`` with the SDK's JSON body, signed with
-SigV4 (or a Bedrock API key as bearer token), and decodes the
-``application/vnd.amazon.eventstream`` response with :mod:`pi_ai.utils.aws`.
+Port of pi's ``api/bedrock-converse-stream.ts``, which drives the AWS SDK's
+``ConverseStreamCommand``. This module uses the AWS SDK for Python: a boto3
+``bedrock-runtime`` client and ``converse_stream``. boto3 is an optional extra
+(``pip install "pi-ai[bedrock]"``).
 
-The payload passed to ``on_payload`` is the SDK command input: ``modelId`` plus the
-body members, with binary members (image bytes, redacted reasoning) as ``bytes``.
+boto3 is synchronous, so each request runs the call and iterates its
+``EventStream`` in a worker thread; events reach the event loop in batches.
+
+The payload passed to ``on_payload`` is the ``converse_stream`` input: ``modelId``
+plus the request members, with binary members (image bytes, redacted reasoning)
+as ``bytes``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import os
 import re
-from collections.abc import AsyncIterator, Mapping
+import threading
+from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
-from urllib.parse import quote
 
 import httpx
 
@@ -53,27 +59,12 @@ from ..types import (
     now_ms,
 )
 from ..utils import fastjson
-from ..utils.aws import (
-    AwsCredentials,
-    aws_dns_suffix,
-    b64decode_forgiving,
-    iter_event_stream,
-    resolve_aws_credentials,
-    resolve_profile_region,
-    sign_request,
-)
 from ..utils.callbacks import maybe_await
 from ..utils.diagnostics import AssistantMessageDiagnostic, append_assistant_message_diagnostic
 from ..utils.error_body import normalize_provider_error
-from ..utils.http import ProviderHttpError, send_request
+from ..utils.http import DEFAULT_TIMEOUT_MS, _proxy_for
 from ..utils.json_parse import StreamingJsonParser, parse_tool_call_arguments
-from ..utils.misc import (
-    get_pi_user_agent,
-    get_provider_env_value,
-    headers_to_record,
-    provider_headers_to_record,
-    sanitize_surrogates,
-)
+from ..utils.misc import get_provider_env_value, provider_headers_to_record, sanitize_surrogates
 from ..utils.text import append_text, append_thinking, get_system_message_text
 from ..utils.transcript import (
     collapse_system_messages,
@@ -94,8 +85,10 @@ __all__ = [
     "BedrockThinkingDisplay",
     "BedrockOptions",
     "BedrockClientConfig",
+    "BedrockCredentials",
     "BedrockServiceError",
     "BedrockStreamError",
+    "BOTO3_INSTALL_HINT",
     "resolve_bedrock_client_config",
     "stream",
     "stream_simple",
@@ -128,9 +121,10 @@ class BedrockOptions(StreamOptions, total=False):
     #: Bedrock API key. When set, SigV4 signing is skipped and ``Authorization: Bearer`` is sent.
     #: Also read from ``AWS_BEARER_TOKEN_BEDROCK``.
     bearer_token: str
-    #: Python extension: explicit SigV4 credentials (an :class:`AwsCredentials`, a mapping with
-    #: ``access_key_id``/``secret_access_key``/``session_token`` or the SDK's camelCase keys, or a
-    #: sync/async callable returning one). Takes precedence over the credential chain.
+    #: Python extension: explicit SigV4 credentials (a :class:`BedrockCredentials`, a mapping with
+    #: ``access_key_id``/``secret_access_key``/``session_token`` or the SDK's camelCase keys, a botocore
+    #: ``Credentials`` object, or a sync/async callable returning one). Takes precedence over the
+    #: credential chain.
     credentials: Any
 
 
@@ -139,8 +133,9 @@ THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
 #: Matches the placeholder the Anthropic API path uses for redacted thinking.
 REDACTED_THINKING_PLACEHOLDER = "[Reasoning redacted]"
 _AMBIENT_AUTH_MARKER = "<authenticated>"
-#: The AWS SDK makes 3 attempts by default.
-_SDK_DEFAULT_MAX_RETRIES = 2
+BOTO3_INSTALL_HINT = (
+    'Amazon Bedrock requires the AWS SDK for Python (boto3). Install it with: pip install "pi-ai[bedrock]"'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +192,17 @@ BEDROCK_ERROR_PREFIXES: dict[str, str] = {
 #: Some models reject the account's configured data retention mode; point users at the AWS docs.
 BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html"
 _DATA_RETENTION = re.compile(r"data retention mode", re.IGNORECASE)
+
+#: Modeled exception members of the ConverseStream output union.
+_STREAM_EXCEPTIONS = frozenset(
+    {
+        "internalServerException",
+        "modelStreamErrorException",
+        "validationException",
+        "throttlingException",
+        "serviceUnavailableException",
+    }
+)
 
 
 def _format_bedrock_error(error: BaseException) -> str:
@@ -271,7 +277,7 @@ def _sanitize_error_code(raw: Any) -> str | None:
     return value or None
 
 
-def _request_id(headers: Any) -> str | None:
+def _request_id(headers: Mapping[str, Any] | None) -> str | None:
     if headers is None:
         return None
     for name in ("x-amzn-requestid", "x-amzn-request-id", "x-amz-request-id"):
@@ -281,11 +287,12 @@ def _request_id(headers: Any) -> str | None:
     return None
 
 
-def _http_error(error: ProviderHttpError) -> BedrockServiceError:
-    """Deserialize a non-2xx response like the SDK's REST-JSON error parser."""
-    status = error.status
-    headers = error.headers
-    text = error.raw_body or ""
+def _http_error(status: int, headers: Mapping[str, str], text: str) -> BedrockServiceError:
+    """Deserialize a non-2xx response like the JS SDK's REST-JSON error parser.
+
+    botocore's own parser turns unrecognized bodies into ``"403"``/``"Forbidden"``; pi's
+    error messages (and retry/overflow detection) follow the JS SDK, so the raw body is used.
+    """
     parsed: Any = None
     if text.strip():
         try:
@@ -293,7 +300,7 @@ def _http_error(error: ProviderHttpError) -> BedrockServiceError:
         except ValueError:
             parsed = None
     body = parsed if isinstance(parsed, dict) else {}
-    code = _sanitize_error_code(headers.get("x-amzn-errortype") if headers is not None else None)
+    code = _sanitize_error_code(headers.get("x-amzn-errortype"))
     if code is None:
         code = _sanitize_error_code(body.get("code")) or _sanitize_error_code(body.get("__type"))
     message = body.get("message") or body.get("Message")
@@ -309,9 +316,67 @@ def _http_error(error: ProviderHttpError) -> BedrockServiceError:
     )
 
 
+#: Key under which the ``after-call`` hook stores the raw error response on botocore's parsed dict.
+_RAW_ERROR_KEY = "PiRawErrorResponse"
+
+
+def _client_error(error: Any) -> BedrockServiceError:
+    """Map a botocore ``ClientError`` raised by ``converse_stream``."""
+    response: Mapping[str, Any] = getattr(error, "response", None) or {}
+    raw = response.get(_RAW_ERROR_KEY)
+    if raw is not None:
+        status, headers, content = raw
+        return _http_error(status, headers, content.decode("utf-8", "replace"))
+    metadata = response.get("ResponseMetadata") or {}
+    info = response.get("Error") or {}
+    status = metadata.get("HTTPStatusCode")
+    return BedrockServiceError(
+        str(info.get("Code") or "Unknown"),
+        str(info.get("Message") or "UnknownError"),
+        status=status if isinstance(status, int) else None,
+        request_id=metadata.get("RequestId") or None,
+    )
+
+
+def _convert_sdk_error(error: Exception) -> tuple[Exception, str | None]:
+    """Turn a botocore exception into pi's error types.
+
+    Returns the error and, for modeled stream exceptions, the stream member name
+    (``throttlingException``) under which it is reported to ``on_provider_stream_event``.
+    """
+    try:
+        from botocore.exceptions import ClientError, EventStreamError, NoCredentialsError, NoRegionError
+    except ImportError:
+        return error, None
+    if isinstance(error, EventStreamError):
+        info = error.response.get("Error") or {}
+        code = info.get("Code") or None
+        message = info.get("Message") or "UnknownError"
+        if code in _STREAM_EXCEPTIONS:
+            return BedrockServiceError(code[0].upper() + code[1:], message), code
+        return BedrockStreamError(code, message), None
+    if isinstance(error, ClientError):
+        return _client_error(error), None
+    # Same wording as the JS SDK.
+    if isinstance(error, NoRegionError):
+        return RuntimeError("Region is missing"), None
+    if isinstance(error, NoCredentialsError):
+        return RuntimeError("Could not load credentials from any providers"), None
+    return error, None
+
+
 # ---------------------------------------------------------------------------
 # Client configuration (region, endpoint, auth)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BedrockCredentials:
+    """Static SigV4 credentials."""
+
+    access_key_id: str
+    secret_access_key: str
+    session_token: str | None = None
 
 
 @dataclass(slots=True)
@@ -319,15 +384,15 @@ class BedrockClientConfig:
     """What pi would pass to ``new BedrockRuntimeClient(config)``."""
 
     region: str | None = None
-    #: Explicit endpoint; ``None`` derives the standard endpoint from the region.
+    #: Explicit endpoint; ``None`` lets the SDK derive it from the region.
     endpoint: str | None = None
     profile: str | None = None
-    #: Static SigV4 credentials (scoped/ambient access keys, explicit option, or skip-auth dummies).
+    #: Static SigV4 credentials (ambient access keys, explicit option, or skip-auth dummies).
     credentials: Any = None
     #: Bearer token (Bedrock API key); takes precedence over SigV4.
     token: str | None = None
-    #: The profile was configured explicitly (``profile`` option or scoped ``AWS_PROFILE``).
-    explicit_profile: bool = False
+    #: ``AWS_BEDROCK_SKIP_AUTH=1``: sign with dummy credentials, never with a bearer token.
+    skip_auth: bool = False
 
 
 _ARN_REGION = re.compile(r"^arn:aws(?:-[a-z0-9-]+)?:bedrock:([a-z0-9-]+):")
@@ -344,12 +409,12 @@ def _configured_region(options: Mapping[str, Any]) -> str | None:
     )
 
 
-def _configured_credentials(env: Mapping[str, str] | None) -> AwsCredentials | None:
+def _configured_credentials(env: Mapping[str, str] | None) -> BedrockCredentials | None:
     access_key_id = get_provider_env_value("AWS_ACCESS_KEY_ID", env)
     secret_access_key = get_provider_env_value("AWS_SECRET_ACCESS_KEY", env)
     if not access_key_id or not secret_access_key:
         return None
-    return AwsCredentials(access_key_id, secret_access_key, get_provider_env_value("AWS_SESSION_TOKEN", env))
+    return BedrockCredentials(access_key_id, secret_access_key, get_provider_env_value("AWS_SESSION_TOKEN", env))
 
 
 def _standard_endpoint_region(base_url: str | None) -> str | None:
@@ -376,10 +441,7 @@ def resolve_bedrock_client_config(model: Model, options: Mapping[str, Any] | Non
     # A profile explicitly configured through pi's auth flow (the `profile` option or scoped
     # `AWS_PROFILE` on the stored credential's env) must win over ambient access keys (#6957).
     options_profile = options.get("profile") or (env or {}).get("AWS_PROFILE") or None
-    config = BedrockClientConfig(
-        profile=options_profile or get_provider_env_value("AWS_PROFILE", env),
-        explicit_profile=bool(options_profile),
-    )
+    config = BedrockClientConfig(profile=options_profile or get_provider_env_value("AWS_PROFILE", env))
     configured_region = _configured_region(options)
     has_ambient_profile = bool(get_provider_env_value("AWS_PROFILE"))
     endpoint_region = _standard_endpoint_region(model.base_url)
@@ -392,6 +454,7 @@ def resolve_bedrock_client_config(model: Model, options: Mapping[str, Any] | Non
         config.endpoint = model.base_url
 
     skip_auth = get_provider_env_value("AWS_BEDROCK_SKIP_AUTH", env) == "1"
+    config.skip_auth = skip_auth
     api_key = options.get("api_key")
     if api_key == _AMBIENT_AUTH_MARKER:
         api_key = None
@@ -413,7 +476,7 @@ def resolve_bedrock_client_config(model: Model, options: Mapping[str, Any] | Non
 
     if skip_auth:
         # Support proxies that don't need authentication.
-        config.credentials = AwsCredentials("dummy-access-key", "dummy-secret-key")
+        config.credentials = BedrockCredentials("dummy-access-key", "dummy-secret-key")
     else:
         explicit = options.get("credentials")
         if explicit is not None:
@@ -427,43 +490,93 @@ def resolve_bedrock_client_config(model: Model, options: Mapping[str, Any] | Non
     return config
 
 
-def _coerce_credentials(value: Any) -> AwsCredentials:
-    if isinstance(value, AwsCredentials):
-        return value
+def _coerce_credentials(value: Any) -> tuple[str, str, str | None]:
+    if isinstance(value, BedrockCredentials):
+        return value.access_key_id, value.secret_access_key, value.session_token
     if isinstance(value, Mapping):
         access_key_id = value.get("access_key_id") or value.get("accessKeyId")
         secret_access_key = value.get("secret_access_key") or value.get("secretAccessKey")
         if access_key_id and secret_access_key:
-            return AwsCredentials(
-                access_key_id, secret_access_key, value.get("session_token") or value.get("sessionToken")
-            )
+            return access_key_id, secret_access_key, value.get("session_token") or value.get("sessionToken")
+    else:
+        # botocore `Credentials` (refreshable ones are frozen per request).
+        frozen = getattr(value, "get_frozen_credentials", None)
+        if callable(frozen):
+            value = frozen()
+        access_key = getattr(value, "access_key", None) or getattr(value, "access_key_id", None)
+        secret_key = getattr(value, "secret_key", None) or getattr(value, "secret_access_key", None)
+        if access_key and secret_key:
+            token = getattr(value, "token", None) or getattr(value, "session_token", None)
+            return access_key, secret_key, token
     raise TypeError("Bedrock credentials must provide access_key_id and secret_access_key")
 
 
-async def _resolve_signing_credentials(
-    config: BedrockClientConfig, region: str, options: Mapping[str, Any]
-) -> AwsCredentials:
-    value = config.credentials
-    if value is not None:
-        if callable(value):
-            value = await maybe_await(value())
-        return _coerce_credentials(value)
-    return await resolve_aws_credentials(
-        profile=config.profile if config.explicit_profile else None,
-        env=options.get("env"),
-        region=region,
-        http_client=options.get("http_client"),
+@dataclass(frozen=True, slots=True)
+class _ClientKey:
+    """Everything a cached boto3 client is configured with."""
+
+    region: str | None
+    endpoint: str | None
+    profile: str | None
+    credentials: tuple[str, str, str | None] | None
+    token: str | None
+    #: Prefer SigV4 even when ``AWS_BEARER_TOKEN_BEDROCK`` is set (skip-auth proxies).
+    force_sigv4: bool
+    #: Total attempts; ``None`` keeps the SDK default (standard mode: 3) or ``AWS_MAX_ATTEMPTS``.
+    max_attempts: int | None
+    timeout: float
+    proxy: str | None
+
+
+async def _client_key(model: Model, config: BedrockClientConfig, options: Mapping[str, Any]) -> _ClientKey:
+    credentials = config.credentials
+    if callable(credentials):
+        credentials = await maybe_await(credentials())
+    max_retries = options.get("max_retries")
+    timeout_ms = options.get("timeout_ms")
+    return _ClientKey(
+        region=config.region,
+        endpoint=config.endpoint,
+        profile=config.profile,
+        credentials=_coerce_credentials(credentials) if credentials is not None else None,
+        token=config.token,
+        force_sigv4=config.skip_auth,
+        max_attempts=None if max_retries is None else max(0, int(max_retries)) + 1,
+        timeout=(timeout_ms if timeout_ms is not None else DEFAULT_TIMEOUT_MS) / 1000,
+        proxy=_proxy_for(config.endpoint or model.base_url or "https://", options.get("env")),
     )
 
 
-def _default_endpoint(region: str, env: Mapping[str, str] | None) -> str:
-    fips = (get_provider_env_value("AWS_USE_FIPS_ENDPOINT", env) or "").lower() == "true"
-    return f"https://bedrock-runtime{'-fips' if fips else ''}.{region}.{aws_dns_suffix(region)}"
+# ---------------------------------------------------------------------------
+# boto3 clients
+# ---------------------------------------------------------------------------
+
+#: Client creation loads the service model and resolves credentials, which is slow; clients are
+#: thread-safe, so they are shared per configuration.
+_MAX_CACHED_CLIENTS = 16
+_client_cache: OrderedDict[_ClientKey, Any] = OrderedDict()
+_client_cache_lock = threading.Lock()
+#: Per-call state for the botocore event hooks, which run in the calling (worker) thread.
+_call_state = threading.local()
 
 
-# ---------------------------------------------------------------------------
-# Header handling
-# ---------------------------------------------------------------------------
+def _load_boto3() -> Any:
+    try:
+        import boto3
+    except ImportError as error:
+        raise RuntimeError(BOTO3_INSTALL_HINT) from error
+    return boto3
+
+
+class _StaticTokenProvider:
+    """botocore token provider for an explicit Bedrock API key."""
+
+    def __init__(self, token: Any) -> None:
+        self._token = token
+
+    def load_token(self, **_kwargs: Any) -> Any:
+        return self._token
+
 
 #: `host` and `x-amz-*` participate in the SigV4 canonical request; `authorization` is owned by
 #: SigV4 or the bearer-token path. Compared case-insensitively.
@@ -475,18 +588,221 @@ def _is_reserved_header(name: str) -> bool:
     return lower.startswith("x-amz-") or lower in _RESERVED_HEADER_EXACT
 
 
-def _apply_custom_headers(headers: dict[str, str], custom: Mapping[str, str] | None) -> None:
-    """Caller headers override same-named request headers before signing, so the signature covers them.
+def _apply_custom_headers(request: Any, **_kwargs: Any) -> None:
+    """``before-sign`` hook: caller headers override same-named request headers, covered by the signature."""
+    headers: Mapping[str, str] | None = getattr(_call_state, "headers", None)
+    if not headers:
+        return
+    for name, value in headers.items():
+        if name in request.headers:
+            del request.headers[name]
+        request.headers[name] = value
 
-    Reserved SigV4/auth headers are skipped.
+
+def _apply_custom_user_agent(request: Any, **_kwargs: Any) -> None:
+    """``request-created`` hook (last): botocore rebuilds ``User-Agent`` after signing, so reapply it."""
+    headers: Mapping[str, str] | None = getattr(_call_state, "headers", None)
+    if not headers:
+        return
+    for name, value in headers.items():
+        if name.lower() == "user-agent":
+            if name in request.headers:
+                del request.headers[name]
+            request.headers[name] = value
+
+
+def _capture_error_response(http_response: Any, parsed: Any, **_kwargs: Any) -> None:
+    """``after-call`` hook: keep the raw error response, which botocore's parser discards."""
+    if http_response.status_code >= 300 and isinstance(parsed, dict):
+        headers = {str(name).lower(): str(value) for name, value in http_response.headers.items()}
+        parsed[_RAW_ERROR_KEY] = (http_response.status_code, headers, http_response.content or b"")
+
+
+def _new_client(key: _ClientKey) -> Any:
+    boto3 = _load_boto3()
+    import botocore.session
+    from botocore.config import Config
+    from botocore.tokens import FrozenAuthToken
+
+    core = botocore.session.Session()
+    if key.token is not None:
+        core.register_component("token_provider", _StaticTokenProvider(FrozenAuthToken(key.token)))
+    session = boto3.session.Session(botocore_session=core, profile_name=key.profile)
+    # The JS SDK defaults to the standard retry mode (3 attempts); botocore defaults to legacy.
+    retries: dict[str, Any] = {}
+    if key.max_attempts is not None:
+        retries["total_max_attempts"] = key.max_attempts
+    if not os.environ.get("AWS_RETRY_MODE") and not core.get_scoped_config().get("retry_mode"):
+        retries["mode"] = "standard"
+    config: dict[str, Any] = {"retries": retries, "connect_timeout": key.timeout, "read_timeout": key.timeout}
+    if key.token is not None:
+        config["auth_scheme_preference"] = "httpBearerAuth"
+    elif key.force_sigv4:
+        config["auth_scheme_preference"] = "sigv4"
+    if key.proxy is not None:
+        config["proxies"] = {"http": key.proxy, "https": key.proxy}
+    access_key, secret_key, session_token = key.credentials or (None, None, None)
+    client = session.client(
+        "bedrock-runtime",
+        region_name=key.region,
+        endpoint_url=key.endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        aws_session_token=session_token,
+        config=Config(**config),
+    )
+    client.meta.events.register("before-sign.bedrock-runtime.ConverseStream", _apply_custom_headers)
+    client.meta.events.register("after-call.bedrock-runtime.ConverseStream", _capture_error_response)
+    client.meta.events.register_last("request-created.bedrock-runtime", _apply_custom_user_agent)
+    return client
+
+
+def _get_client(key: _ClientKey) -> Any:
+    with _client_cache_lock:
+        client = _client_cache.get(key)
+        if client is not None:
+            _client_cache.move_to_end(key)
+            return client
+        client = _new_client(key)
+        _client_cache[key] = client
+        if len(_client_cache) > _MAX_CACHED_CLIENTS:
+            _client_cache.popitem(last=False)
+        return client
+
+
+# ---------------------------------------------------------------------------
+# Worker thread <-> event loop
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _Response:
+    metadata: Mapping[str, Any]
+
+
+@dataclass(slots=True)
+class _Failure:
+    error: Exception
+    #: Stream member name of a modeled stream exception (``throttlingException``).
+    stream_item: str | None
+
+
+_END = object()
+
+
+def _interrupt_stream(event_stream: Any) -> None:
+    """Unblock a worker reading ``event_stream`` from another thread."""
+    raw = getattr(event_stream, "_raw_stream", None)
+    shutdown = getattr(raw, "shutdown", None)  # urllib3 >= 2.3
+    try:
+        if callable(shutdown):
+            shutdown()
+        else:
+            event_stream.close()
+    except Exception:
+        pass
+
+
+class _StreamBridge:
+    """Hands items from the worker thread to the event loop.
+
+    Items accumulate in a list; the worker schedules at most one wake-up per batch, so a
+    fast stream costs one ``call_soon_threadsafe`` per batch rather than per event.
     """
-    for name, value in (custom or {}).items():
-        if _is_reserved_header(name):
-            continue
-        lower = name.lower()
-        for existing in [key for key in headers if key.lower() == lower]:
-            del headers[existing]
-        headers[name] = value
+
+    __slots__ = ("_items", "_lock", "_loop", "_scheduled", "_stream", "_waiter", "closed")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+        self._lock = threading.Lock()
+        self._items: list[Any] = []
+        self._scheduled = False
+        self._waiter: asyncio.Future[None] | None = None
+        self._stream: Any = None
+        self.closed = False
+
+    # -- worker side -----------------------------------------------------------------------
+
+    def attach(self, event_stream: Any) -> bool:
+        """Register the response stream; ``False`` once the consumer has gone away."""
+        with self._lock:
+            if self.closed:
+                return False
+            self._stream = event_stream
+            return True
+
+    def put(self, item: Any) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self._items.append(item)
+            if self._scheduled:
+                return
+            self._scheduled = True
+        try:
+            self._loop.call_soon_threadsafe(self._wake)
+        except RuntimeError:  # the event loop is closed
+            self.closed = True
+
+    # -- event loop side -------------------------------------------------------------------
+
+    def _wake(self) -> None:
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(None)
+
+    async def get(self) -> list[Any]:
+        while True:
+            with self._lock:
+                if self._items:
+                    items, self._items = self._items, []
+                    self._scheduled = False
+                    return items
+            waiter = self._loop.create_future()
+            self._waiter = waiter
+            try:
+                await waiter
+            finally:
+                self._waiter = None
+
+    def close(self) -> None:
+        with self._lock:
+            if self.closed:
+                return
+            self.closed = True
+            self._items = []
+            event_stream = self._stream
+        if event_stream is not None:
+            _interrupt_stream(event_stream)
+
+
+def _stream_worker(bridge: _StreamBridge, key: _ClientKey, params: dict[str, Any], headers: Any) -> None:
+    event_stream: Any = None
+    try:
+        client = _get_client(key)
+        _call_state.headers = headers
+        try:
+            response = client.converse_stream(**params)
+        finally:
+            _call_state.headers = None
+        event_stream = response["stream"]
+        if not bridge.attach(event_stream):
+            return
+        bridge.put(_Response(response.get("ResponseMetadata") or {}))
+        for event in event_stream:
+            if bridge.closed:
+                return
+            bridge.put(event)
+        bridge.put(_END)
+    except Exception as error:
+        if not bridge.closed:
+            bridge.put(_Failure(*_convert_sdk_error(error)))
+    finally:
+        if event_stream is not None:
+            try:
+                event_stream.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -646,21 +962,45 @@ async def _run(
                 payload = replaced
 
         async with abort_scope(signal):
-            response = await _send(model, config, payload, options)
-            response_request_id = _normalize_diagnostic_value(_request_id(response.headers))
+            key = await _client_key(model, config, options)
+            params = {name: value for name, value in payload.items() if value is not None}
+            custom_headers = provider_headers_to_record(options.get("headers"))
+            headers = (
+                {name: value for name, value in custom_headers.items() if not _is_reserved_header(name)}
+                if custom_headers
+                else None
+            )
+            on_response = options.get("on_response")
+            on_event = options.get("on_provider_stream_event")
+            bridge = _StreamBridge(asyncio.get_running_loop())
+            worker = threading.Thread(
+                target=_stream_worker, args=(bridge, key, params, headers), name="pi-ai-bedrock", daemon=True
+            )
+            worker.start()
             try:
-                on_response = options.get("on_response")
-                if on_response is not None:
-                    await maybe_await(
-                        on_response(ProviderResponse(response.status_code, headers_to_record(response.headers)), model)
-                    )
-                on_event = options.get("on_provider_stream_event")
-                async for item in _iter_converse_stream(response):
-                    if on_event is not None:
-                        await maybe_await(on_event(item, model))
-                    _handle_item(item, model, output, blocks, out)
+                finished = False
+                while not finished:
+                    for item in await bridge.get():
+                        if type(item) is dict:
+                            if on_event is not None:
+                                await maybe_await(on_event(item, model))
+                            _handle_item(item, model, output, blocks, out)
+                        elif item is _END:
+                            finished = True
+                        elif isinstance(item, _Response):
+                            metadata = item.metadata
+                            response_request_id = _normalize_diagnostic_value(metadata.get("RequestId"))
+                            status = metadata.get("HTTPStatusCode")
+                            if on_response is not None and isinstance(status, int):
+                                headers_record = dict(metadata.get("HTTPHeaders") or {})
+                                await maybe_await(on_response(ProviderResponse(status, headers_record), model))
+                        else:
+                            # Modeled stream exceptions are stream items in the SDK: observe, then raise.
+                            if item.stream_item is not None and on_event is not None:
+                                await maybe_await(on_event({item.stream_item: item.error}, model))
+                            raise item.error
             finally:
-                await response.aclose()
+                bridge.close()
 
         if signal is not None and signal.aborted:
             raise RuntimeError("Request was aborted")
@@ -682,121 +1022,9 @@ async def _run(
         out.end()
 
 
-async def _send(
-    model: Model, config: BedrockClientConfig, payload: Mapping[str, Any], options: Mapping[str, Any]
-) -> httpx.Response:
-    env = options.get("env")
-    region = config.region or resolve_profile_region(config.profile, env)
-    if not region:
-        raise RuntimeError("Region is missing")
-    endpoint = (
-        config.endpoint
-        or get_provider_env_value("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", env)
-        or get_provider_env_value("AWS_ENDPOINT_URL", env)
-        or _default_endpoint(region, env)
-    )
-    model_id = str(payload.get("modelId") or model.id)
-    url = f"{endpoint.rstrip('/')}/model/{quote(model_id, safe='')}/converse-stream"
-    body = fastjson.dumps_bytes(
-        {key: _to_wire(value) for key, value in payload.items() if key != "modelId" and value is not None}
-    )
-    headers: dict[str, str] = {"content-type": "application/json", "user-agent": get_pi_user_agent()}
-    _apply_custom_headers(headers, provider_headers_to_record(options.get("headers")))
-    if config.token is not None:
-        headers["authorization"] = f"Bearer {config.token}"
-    else:
-        credentials = await _resolve_signing_credentials(config, region, options)
-        headers = sign_request("POST", url, headers, body, credentials, region=region, service="bedrock")
-
-    max_retries = options.get("max_retries")
-    request_options = {
-        **options,
-        "max_retries": _SDK_DEFAULT_MAX_RETRIES if max_retries is None else max_retries,
-    }
-    try:
-        return await send_request(
-            "POST", url, headers=headers, content=body, options=request_options, error_style="raw"
-        )
-    except ProviderHttpError as error:
-        if error.status is None:
-            raise
-        raise _http_error(error) from error
-
-
-def _to_wire(value: Any) -> Any:
-    """Serialize binary members as base64, like the SDK's JSON protocol."""
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return base64.b64encode(bytes(value)).decode("ascii")
-    if isinstance(value, Mapping):
-        return {key: _to_wire(entry) for key, entry in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_wire(item) for item in value]
-    return value
-
-
 # ---------------------------------------------------------------------------
 # Response stream
 # ---------------------------------------------------------------------------
-
-_STREAM_EVENTS = frozenset(
-    {"messageStart", "contentBlockStart", "contentBlockDelta", "contentBlockStop", "messageStop", "metadata"}
-)
-_STREAM_EXCEPTIONS = frozenset(
-    {
-        "internalServerException",
-        "modelStreamErrorException",
-        "validationException",
-        "throttlingException",
-        "serviceUnavailableException",
-    }
-)
-
-
-def _parse_json_object(payload: bytes) -> dict[str, Any]:
-    if not payload:
-        return {}
-    parsed = fastjson.loads(payload)
-    return parsed if isinstance(parsed, dict) else {}
-
-
-async def _iter_converse_stream(response: httpx.Response) -> AsyncIterator[dict[str, Any]]:
-    """Yield SDK-shaped stream items (``{"contentBlockDelta": {...}}``).
-
-    Modeled exception frames are yielded as ``{"throttlingException": BedrockServiceError}``
-    so they reach ``on_provider_stream_event`` before being raised; unmodeled error frames raise.
-    """
-    async for message in iter_event_stream(response):
-        headers = message.headers
-        message_type = headers.get(":message-type")
-        if message_type == "event":
-            event_type = headers.get(":event-type")
-            if event_type not in _STREAM_EVENTS:
-                continue  # unknown union members are skipped, like the SDK
-            data = _parse_json_object(message.payload)
-            data.pop("p", None)  # length-obfuscation padding; not a modeled member
-            if event_type == "contentBlockDelta":
-                reasoning = (data.get("delta") or {}).get("reasoningContent")
-                if isinstance(reasoning, dict) and isinstance(reasoning.get("redactedContent"), str):
-                    reasoning["redactedContent"] = base64.b64decode(reasoning["redactedContent"])
-            yield {event_type: data}
-        elif message_type == "exception":
-            code = headers.get(":exception-type")
-            text = message.payload.decode("utf-8", "replace")
-            if code in _STREAM_EXCEPTIONS:
-                try:
-                    data = _parse_json_object(message.payload)
-                except ValueError:
-                    data = {}
-                error_message = data.get("message") or data.get("Message") or "UnknownError"
-                name = code[0].upper() + code[1:]
-                fields = {key: value for key, value in data.items() if key not in ("message", "Message")}
-                yield {code: BedrockServiceError(name, str(error_message), fields=fields)}
-            else:
-                raise BedrockStreamError(code, text)
-        elif message_type == "error":
-            raise BedrockStreamError(headers.get(":error-code"), headers.get(":error-message") or "UnknownError")
-        else:
-            raise RuntimeError(f"Unrecognizable event type: {headers.get(':event-type')}")
 
 
 def _handle_item(
@@ -825,11 +1053,6 @@ def _handle_item(
             output.error_message = error_message
     elif (metadata := item.get("metadata")) is not None:
         _handle_metadata(metadata, model, output)
-    else:
-        for name in _STREAM_EXCEPTIONS:
-            exception = item.get(name)
-            if exception is not None:
-                raise exception
 
 
 def _handle_content_block_start(event: Mapping[str, Any], blocks: _Blocks, out: AssistantMessageEventStream) -> None:
@@ -1189,11 +1412,28 @@ _IMAGE_FORMATS = {
 }
 
 
+_BASE64_WHITESPACE = re.compile(r"[\t\n\f\r ]+")
+_BASE64_INVALID = re.compile(r"[^A-Za-z0-9+/]")
+
+
+def _b64decode_forgiving(data: str) -> bytes:
+    """Base64 decode like the browser ``atob``: whitespace and missing padding are tolerated.
+
+    Raises ``ValueError`` for characters outside the base64 alphabet.
+    """
+    text = _BASE64_WHITESPACE.sub("", data)
+    if len(text) % 4 == 0 and text.endswith("="):
+        text = text[:-2] if text.endswith("==") else text[:-1]
+    if len(text) % 4 == 1 or _BASE64_INVALID.search(text):
+        raise ValueError("Invalid base64 data")
+    return base64.b64decode(text + "=" * (-len(text) % 4))
+
+
 def _image_block(mime_type: str, data: str) -> dict[str, Any]:
     image_format = _IMAGE_FORMATS.get(mime_type)
     if image_format is None:
         raise ValueError(f"Unknown image type: {mime_type}")
-    return {"source": {"bytes": b64decode_forgiving(data)}, "format": image_format}
+    return {"source": {"bytes": _b64decode_forgiving(data)}, "format": image_format}
 
 
 def _decode_redacted_content(signature: str | None) -> bytes | None:
@@ -1201,7 +1441,7 @@ def _decode_redacted_content(signature: str | None) -> bytes | None:
     if not signature:
         return None
     try:
-        return b64decode_forgiving(signature)
+        return _b64decode_forgiving(signature)
     except ValueError:
         return None
 

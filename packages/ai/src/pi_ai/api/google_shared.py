@@ -2,25 +2,27 @@
 # Converters branch on ``role``/``type`` discriminators held in locals, which pyright does not narrow.
 """Shared utilities for the Google Generative AI and Google Vertex APIs.
 
-pi's TypeScript adapters use the ``@google/genai`` SDK. This port talks to the
-REST API directly, so besides the message/tool conversion shared by both
-adapters it also reproduces the parts of the SDK that shape the wire format:
-the request body conversion (``generateContentParametersToMldev``/``...ToVertex``),
-model resource paths, default headers and ``ApiError`` message wording.
+Like pi's TypeScript adapters (which use ``@google/genai``), both adapters send requests
+through the official ``google-genai`` SDK (``client.aio.models.generate_content_stream``).
+This module holds what they share: message/tool conversion, thinking configuration,
+stop reasons, usage, the retry policy, SDK client construction and the stream producer.
 """
 
 from __future__ import annotations
 
-import http
+import base64
 import itertools
 import json
 import re
-import sys
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
+from enum import Enum
 from typing import Any, Literal, Required, TypeAlias, TypedDict, TypeVar
 
 import httpx
+from google.genai import Client
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 from ..abort import AbortError, abort_scope
 from ..event_stream import AssistantMessageEventStream
@@ -50,17 +52,10 @@ from ..types import (
     Usage,
     now_ms,
 )
-from ..utils import fastjson
 from ..utils.callbacks import maybe_await
 from ..utils.error_body import format_provider_error, normalize_provider_error
-from ..utils.http import ProviderHttpError, build_headers, iter_sse, retry_provider_request, send_request
-from ..utils.misc import (
-    get_pi_user_agent,
-    has_header,
-    headers_to_record,
-    provider_headers_to_record,
-    sanitize_surrogates,
-)
+from ..utils.http import ProviderHttpError, retry_provider_request
+from ..utils.misc import get_pi_user_agent, provider_headers_to_record, sanitize_surrogates
 from ..utils.text import append_text, append_thinking, get_system_message_text
 from ..utils.transcript import (
     collapse_system_messages,
@@ -75,7 +70,6 @@ __all__ = [
     "GoogleApiThinkingLevel",
     "ResolvedGoogleThinkingLevel",
     "GoogleThinkingOptions",
-    "GOOGLE_GENAI_SDK_VERSION",
     "resolve_google_thinking_level",
     "uses_google_thinking_level",
     "to_google_thinking_level",
@@ -94,12 +88,9 @@ __all__ = [
     "retry_google_request",
     "parse_google_usage",
     "build_google_params",
-    "google_model_path",
-    "build_google_request_body",
-    "google_sdk_default_headers",
-    "build_google_client_headers",
+    "build_google_http_headers",
     "google_api_error",
-    "GoogleClient",
+    "get_google_client",
     "new_google_output",
     "run_google_stream",
 ]
@@ -187,8 +178,8 @@ def get_disabled_google_thinking_config(model: Model) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def is_thinking_part(part: Mapping[str, Any]) -> bool:
-    """Whether a streamed Gemini ``Part`` is thinking content.
+def is_thinking_part(part: genai_types.Part | Mapping[str, Any]) -> bool:
+    """Whether a streamed Gemini ``Part`` (an SDK ``Part`` or its dict form) is thinking content.
 
     Protocol note (Gemini / Vertex AI thought signatures):
 
@@ -202,7 +193,8 @@ def is_thinking_part(part: Mapping[str, Any]) -> bool:
 
     See https://ai.google.dev/gemini-api/docs/thought-signatures
     """
-    return part.get("thought") is True
+    thought = part.get("thought") if isinstance(part, Mapping) else part.thought
+    return thought is True
 
 
 def retain_thought_signature(existing: str | None, incoming: str | None) -> str | None:
@@ -514,18 +506,56 @@ class _UnretriedError(Exception):
         self.error = error
 
 
+def google_api_error(error: genai_errors.APIError) -> ProviderHttpError:
+    """The SDK's ``APIError`` as a :class:`ProviderHttpError` worded like ``@google/genai``'s ``ApiError``.
+
+    * Error status: the message is the JSON error body. A non-JSON body becomes
+      ``{"error": {"message": <text>, "code": <status>, "status": <reason>}}``.
+    * Error event inside a 200 event stream: ``got status: <status>. <JSON event>``.
+
+    Like the JS SDK error it carries the status code but no headers, so retries use plain backoff.
+    """
+    response = error.response
+    details = error.details
+    if _is_stream_error(error):
+        status = error.status
+        message = f"got status: {status if status is not None else 'undefined'}. {_compact_json(details)}"
+    else:
+        body = details
+        if isinstance(response, httpx.Response) and "application/json" not in (
+            response.headers.get("content-type") or ""
+        ):
+            body = {"error": {"message": response.text, "code": error.code, "status": response.reason_phrase}}
+        message = _compact_json(body)
+    converted = ProviderHttpError(message, status=error.code)
+    converted.__cause__ = error
+    return converted
+
+
+def _is_stream_error(error: genai_errors.APIError) -> bool:
+    """Whether the SDK raised for an error event received in a successful (200) event stream."""
+    status_code = getattr(error.response, "status_code", None)
+    return isinstance(status_code, int) and status_code < 400
+
+
 async def retry_google_request(request: Callable[[], Awaitable[T]], options: Mapping[str, Any] | None = None) -> T:
     """Run a Google request with the shared provider retry policy.
 
     408/409/429/5xx are retried with backoff, honoring ``max_retries``/``max_retry_delay_ms``/``signal``,
-    like the Anthropic and OpenAI adapters. Upstream only retries the SDK's ``ApiError`` (which
-    always carries an HTTP status), so transport failures without a status are not retried.
+    like the Anthropic and OpenAI adapters. The SDK's ``APIError`` is converted with
+    :func:`google_api_error`. Upstream only retries the SDK's HTTP errors, so transport failures and
+    error events inside an accepted stream are not retried.
     """
     options = options or {}
 
     async def attempt() -> T:
         try:
             return await request()
+        except genai_errors.APIError as error:
+            converted = google_api_error(error)
+            if _is_stream_error(error):
+                raise _UnretriedError(converted) from error
+            raise converted from error
         except ProviderHttpError as error:
             if error.status is None:
                 raise _UnretriedError(error) from error
@@ -542,18 +572,18 @@ async def retry_google_request(request: Callable[[], Awaitable[T]], options: Map
         raise wrapped.error from None
 
 
-def parse_google_usage(model: Model, metadata: Mapping[str, Any]) -> Usage:
-    """Usage from a Gemini ``usageMetadata`` object, with cost filled in."""
-    prompt = metadata.get("promptTokenCount") or 0
-    cached = metadata.get("cachedContentTokenCount") or 0
-    candidates = metadata.get("candidatesTokenCount") or 0
-    thoughts = metadata.get("thoughtsTokenCount") or 0
+def parse_google_usage(model: Model, metadata: genai_types.GenerateContentResponseUsageMetadata) -> Usage:
+    """Usage from the SDK's ``usage_metadata``, with cost filled in."""
+    prompt = metadata.prompt_token_count or 0
+    cached = metadata.cached_content_token_count or 0
+    candidates = metadata.candidates_token_count or 0
+    thoughts = metadata.thoughts_token_count or 0
     usage = Usage(
         input=prompt - cached,
         output=candidates + thoughts,
         cache_read=cached,
         cache_write=0,
-        total_tokens=metadata.get("totalTokenCount") or 0,
+        total_tokens=metadata.total_token_count or 0,
         reasoning=thoughts,
     )
     calculate_cost(model, usage)
@@ -561,15 +591,15 @@ def parse_google_usage(model: Model, metadata: Mapping[str, Any]) -> Usage:
 
 
 # ---------------------------------------------------------------------------
-# Request parameters (the SDK's GenerateContentParameters) and wire body
+# Request parameters (the SDK's GenerateContentParameters)
 # ---------------------------------------------------------------------------
 
 
 def build_google_params(model: Model, context: TranscriptContext, options: Mapping[str, Any]) -> dict[str, Any]:
-    """Build ``{"model", "contents", "config"}`` exactly as pi passes them to ``generateContentStream``.
+    """Build ``{"model", "contents", "config"}`` exactly as pi passes them to ``generate_content_stream``.
 
-    This is the payload handed to ``on_payload``; :func:`build_google_request_body` turns it into the
-    REST body the SDK would send.
+    This is the payload handed to ``on_payload``. Keys use the API's camelCase names, which the
+    SDK's parameter models accept as aliases.
     """
     contents = convert_messages(model, context)
     initial = get_initial_system_message(context.messages)
@@ -613,304 +643,72 @@ def build_google_params(model: Model, context: TranscriptContext, options: Mappi
     return {"model": model.id, "contents": contents, "config": config}
 
 
-def google_model_path(model: Any, vertex: bool) -> str:
-    """The model resource path the SDK builds (``tModel``)."""
-    if not model or not isinstance(model, str):
-        raise ValueError("model is required and must be a string")
-    if ".." in model or "?" in model or "&" in model:
-        raise ValueError("invalid model parameter")
-    if vertex:
-        if model.startswith(("publishers/", "projects/", "models/")):
-            return model
-        if "/" in model:
-            publisher, name = model.split("/", 2)[:2]
-            return f"publishers/{publisher}/models/{name}"
-        return f"publishers/google/models/{model}"
-    if model.startswith(("models/", "tunedModels/")):
-        return model
-    return f"models/{model}"
+# ---------------------------------------------------------------------------
+# SDK client
+# ---------------------------------------------------------------------------
 
 
-def _t_part(origin: Any) -> Any:
-    if origin is None:
-        raise ValueError("PartUnion is required")
-    if isinstance(origin, str):
-        return {"text": origin}
-    if isinstance(origin, Mapping):
-        return origin
-    raise ValueError(f"Unsupported part type: {type(origin).__name__}")
+def build_google_http_headers(model: Model, options: Mapping[str, Any]) -> dict[str, str] | None:
+    """``httpOptions.headers``: pi's User-Agent, then model headers, then request headers.
 
-
-def _t_parts(origin: Any) -> list[Any]:
-    if origin is None or (isinstance(origin, list) and not origin):
-        raise ValueError("PartListUnion is required")
-    if isinstance(origin, list):
-        return [_t_part(item) for item in origin]
-    return [_t_part(origin)]
-
-
-def _is_content(origin: Any) -> bool:
-    return isinstance(origin, Mapping) and isinstance(origin.get("parts"), list)
-
-
-def _t_content(origin: Any) -> Any:
-    if origin is None:
-        raise ValueError("ContentUnion is required")
-    if _is_content(origin):
-        return origin
-    return {"role": "user", "parts": _t_parts(origin)}
-
-
-def _is_function_part(origin: Any) -> bool:
-    return isinstance(origin, Mapping) and ("functionCall" in origin or "functionResponse" in origin)
-
-
-def _t_contents(origin: Any) -> list[Any]:
-    if origin is None or (isinstance(origin, list) and not origin):
-        raise ValueError("contents are required")
-    if not isinstance(origin, list):
-        if _is_function_part(origin):
-            raise ValueError(
-                "To specify functionCall or functionResponse parts, please wrap them in a Content object, "
-                "specifying the role for them"
-            )
-        return [_t_content(origin)]
-    result: list[Any] = []
-    accumulated: list[Any] = []
-    is_content_array = _is_content(origin[0])
-    for item in origin:
-        is_content = _is_content(item)
-        if is_content != is_content_array:
-            raise ValueError(
-                "Mixing Content and Parts is not supported, please group the parts into a the appropriate "
-                "Content objects and specify the roles for them"
-            )
-        if is_content:
-            result.append(item)
-        elif _is_function_part(item):
-            raise ValueError(
-                "To specify functionCall or functionResponse parts, please wrap them, and any other parts, "
-                "in Content objects as appropriate, specifying the role for them"
-            )
-        else:
-            accumulated.append(item)
-    if not is_content_array:
-        result.append({"role": "user", "parts": _t_parts(accumulated)})
-    return result
-
-
-def _convert_content(content: Mapping[str, Any]) -> dict[str, Any]:
-    converted: dict[str, Any] = {}
-    parts = content.get("parts")
-    if parts is not None:
-        converted["parts"] = [
-            {key: value for key, value in part.items() if value is not None} if isinstance(part, Mapping) else part
-            for part in parts
-        ]
-    role = content.get("role")
-    if role is not None:
-        converted["role"] = role
-    return converted
-
-
-def _t_tool(tool: Any) -> Any:
-    # The SDK moves JSON Schema `parameters` (marked by `$schema`) to `parametersJsonSchema`.
-    # (Its conversion of plain `parameters` to the OpenAPI Schema dialect is not reproduced.)
-    if not isinstance(tool, Mapping) or not tool.get("functionDeclarations"):
-        return tool
-    declarations = []
-    for declaration in tool["functionDeclarations"]:
-        declaration = dict(declaration)
-        for source, target in (("parameters", "parametersJsonSchema"), ("response", "responseJsonSchema")):
-            schema = declaration.get(source)
-            if isinstance(schema, Mapping) and "$schema" in schema and not declaration.get(target):
-                declaration[target] = declaration.pop(source)
-        declarations.append(declaration)
-    return {**tool, "functionDeclarations": declarations}
-
-
-_GENERATION_CONFIG_KEYS = (
-    "temperature",
-    "topP",
-    "topK",
-    "candidateCount",
-    "maxOutputTokens",
-    "stopSequences",
-    "responseLogprobs",
-    "logprobs",
-    "presencePenalty",
-    "frequencyPenalty",
-    "seed",
-    "responseMimeType",
-    "responseSchema",
-    "responseJsonSchema",
-    "routingConfig",
-    "modelSelectionConfig",
-    "responseModalities",
-    "mediaResolution",
-    "speechConfig",
-    "audioTimestamp",
-    "thinkingConfig",
-    "audioTranscriptionConfig",
-    "imageConfig",
-    "enableEnhancedCivicAnswers",
-)
-_VERTEX_ONLY_CONFIG_KEYS = ("routingConfig", "modelSelectionConfig", "labels", "audioTimestamp", "modelArmorConfig")
-_GEMINI_ONLY_CONFIG_KEYS = ("enableEnhancedCivicAnswers",)
-
-
-def build_google_request_body(params: Mapping[str, Any], *, vertex: bool) -> tuple[str, dict[str, Any]]:
-    """Convert ``generateContentStream`` parameters into ``(model path, REST body)`` like the SDK.
-
-    ``systemInstruction``, ``tools``, ``toolConfig``, ``safetySettings``, ``cachedContent`` (and
-    Vertex ``labels``/``modelArmorConfig``) move to the top level; sampling and thinking settings
-    go into ``generationConfig``.
+    Names are lower-cased so they replace the SDK's own entries (``x-goog-api-key``,
+    ``user-agent``) instead of duplicating them. The SDK prefixes ``user-agent`` with its
+    ``google-genai-sdk/<version> gl-python/<version>`` label and sets ``x-goog-api-client``.
     """
-    model_path = google_model_path(params.get("model"), vertex)
-    body: dict[str, Any] = {}
-    contents = params.get("contents")
-    if contents is not None:
-        body["contents"] = [_convert_content(content) for content in _t_contents(contents)]
+    record = provider_headers_to_record({"User-Agent": get_pi_user_agent()}, model.headers, options.get("headers"))
+    return {name.lower(): value for name, value in record.items()} if record else None
+
+
+_CLIENT_CACHE_ATTR = "_pi_google_genai_clients"
+_CLIENT_CACHE_SIZE = 16
+
+
+async def get_google_client(
+    http_client: httpx.AsyncClient, key: Hashable, factory: Callable[[], Awaitable[Client]]
+) -> Client:
+    """The SDK client for ``key`` on ``http_client``, built with ``factory`` on first use.
+
+    Building a ``google.genai.Client`` takes tens of milliseconds (it creates SSL contexts and
+    a sync httpx client it never uses here), and a Vertex client holds the ADC credentials and
+    their access token, so clients are reused. The cache lives on the httpx client (the SDK
+    client refers back to it), so both are collected together; a client that does not take
+    attributes gets a fresh SDK client per request.
+    """
+    clients: OrderedDict[Hashable, Client] | None = getattr(http_client, _CLIENT_CACHE_ATTR, None)
+    if clients is None:
+        clients = OrderedDict()
+        try:
+            setattr(http_client, _CLIENT_CACHE_ATTR, clients)
+        except (AttributeError, TypeError):
+            return await factory()
+    client = clients.get(key)
+    if client is not None:
+        clients.move_to_end(key)
+        return client
+    client = await factory()
+    clients[key] = client
+    if len(clients) > _CLIENT_CACHE_SIZE:
+        clients.popitem(last=False)
+    return client
+
+
+def _stream_request(params: Mapping[str, Any], headers: dict[str, str] | None, options: Mapping[str, Any]) -> Any:
+    """``generate_content_stream`` keyword arguments, with per-request ``http_options`` in the config."""
+    http_options: dict[str, Any] = {}
+    if headers:
+        http_options["headers"] = headers
+    timeout_ms = options.get("timeout_ms")
+    if timeout_ms is not None:
+        http_options["timeout"] = int(timeout_ms)
     config = params.get("config")
-    if config is not None:
-        config = dict(config)
-        # maybeMoveToResponseJsonSchema
-        response_schema = config.get("responseSchema")
-        if (
-            isinstance(response_schema, Mapping)
-            and not config.get("responseJsonSchema")
-            and "$schema" in response_schema
-        ):
-            config["responseJsonSchema"] = config.pop("responseSchema")
-        backend = "Gemini Developer API" if not vertex else "Gemini Enterprise Agent Platform"
-        other = "Gemini Enterprise Agent Platform" if not vertex else "Gemini Developer API"
-        unsupported = _VERTEX_ONLY_CONFIG_KEYS if not vertex else _GEMINI_ONLY_CONFIG_KEYS
-        for key in unsupported:
-            if key in config:
-                raise ValueError(f"{key} parameter is only supported in {other} mode, not in {backend} mode.")
-        generation_config: dict[str, Any] = {}
-        service_tier = config.get("serviceTier")
-        if service_tier is not None:
-            body["serviceTier"] = service_tier
-        system_instruction = config.get("systemInstruction")
-        if system_instruction is not None:
-            body["systemInstruction"] = _convert_content(_t_content(system_instruction))
-        for key in _GENERATION_CONFIG_KEYS:
-            value = config.get(key)
-            if value is not None:
-                generation_config["modelConfig" if key == "modelSelectionConfig" else key] = value
-        safety_settings = config.get("safetySettings")
-        if safety_settings is not None:
-            body["safetySettings"] = safety_settings
-        tools = config.get("tools")
-        if tools is not None:
-            if not isinstance(tools, list):
-                raise ValueError("tools is required and must be an array of Tools")
-            body["tools"] = [_t_tool(tool) for tool in tools]
-        tool_config = config.get("toolConfig")
-        if tool_config is not None:
-            body["toolConfig"] = tool_config
-        if vertex:
-            for key in ("labels", "modelArmorConfig"):
-                if config.get(key) is not None:
-                    body[key] = config[key]
-        cached_content = config.get("cachedContent")
-        if cached_content is not None:
-            body["cachedContent"] = cached_content
-        body["generationConfig"] = generation_config
-    return model_path, body
-
-
-# ---------------------------------------------------------------------------
-# HTTP: headers and errors like the SDK
-# ---------------------------------------------------------------------------
-
-#: ``@google/genai`` version pinned by pi; its wire format is what this port reproduces.
-GOOGLE_GENAI_SDK_VERSION = "2.21.0"
-_SDK_LABEL = f"google-genai-sdk/{GOOGLE_GENAI_SDK_VERSION} gl-python/{sys.version.split()[0]}"
-
-
-def google_sdk_default_headers() -> dict[str, str]:
-    """The SDK's default request headers (pi's User-Agent overrides the SDK label)."""
-    return {"User-Agent": _SDK_LABEL, "x-goog-api-client": _SDK_LABEL, "Content-Type": "application/json"}
-
-
-def google_api_error(status: int, body_text: str, content_type: str | None) -> ProviderHttpError:
-    """Build an error worded like the SDK's ``ApiError``: the JSON error body is the message.
-
-    Like the SDK error, it carries the status but no headers, so retries use plain backoff.
-    """
-    error_body: Any = None
-    if content_type and "application/json" in content_type:
-        try:
-            error_body = json.loads(body_text)
-        except ValueError:
-            error_body = None
-    if error_body is None:
-        try:
-            reason = http.HTTPStatus(status).phrase
-        except ValueError:
-            reason = ""
-        error_body = {"error": {"message": body_text, "code": status, "status": reason}}
-    return ProviderHttpError(_compact_json(error_body), status=status)
-
-
-@dataclass(slots=True)
-class GoogleClient:
-    """Resolved endpoint and auth for one request (the analog of a configured ``GoogleGenAI``)."""
-
-    vertex: bool
-    #: Builds the ``streamGenerateContent`` URL for a model resource path.
-    url: Callable[[str], str]
-    #: Headers from ``httpOptions`` merged over the SDK defaults.
-    headers: dict[str, str]
-    #: Auth headers, added only where the request does not already carry them.
-    auth_headers: Callable[[], Awaitable[Mapping[str, str]]]
-
-
-def build_google_client_headers(model: Model, options: Mapping[str, Any]) -> dict[str, str]:
-    """SDK default headers patched with pi's User-Agent, model headers and request headers."""
-    http_headers = provider_headers_to_record(
-        {"User-Agent": get_pi_user_agent()}, model.headers, options.get("headers")
-    )
-    return build_headers(google_sdk_default_headers(), http_headers)
-
-
-async def _open_stream(client: GoogleClient, params: Mapping[str, Any], options: Mapping[str, Any]) -> httpx.Response:
-    model_path, body = build_google_request_body(params, vertex=client.vertex)
-    url = client.url(model_path)
-    # Retries are handled by retry_google_request around this call.
-    request_options = {**options, "max_retries": 0}
-
-    async def attempt() -> httpx.Response:
-        headers = dict(client.headers)
-        for name, value in (await client.auth_headers()).items():
-            if not has_header(headers, name):
-                headers[name] = value
-        try:
-            response = await send_request(
-                "POST", url, headers=headers, body=body, options=request_options, error_style="raw"
-            )
-        except ProviderHttpError as error:
-            if error.status is None:
-                raise
-            content_type = error.headers.get("content-type") if error.headers is not None else None
-            raise google_api_error(error.status, error.raw_body or "", content_type) from error
-        return response
-
-    return await retry_google_request(attempt, options)
-
-
-def _raise_stream_error(chunk: Any) -> None:
-    """Raise the SDK's ``ApiError`` for an error object received in place of a response chunk."""
-    if not isinstance(chunk, dict):
-        return
-    error = chunk.get("error")
-    if not isinstance(error, dict):
-        return
-    code = error.get("code")
-    if isinstance(code, int) and 400 <= code < 600:
-        raise ProviderHttpError(f"got status: {error.get('status')}. {_compact_json(chunk)}", status=code)
+    if http_options:
+        if isinstance(config, genai_types.GenerateContentConfig):
+            config = config.model_copy(update={"http_options": genai_types.HttpOptions(**http_options)})
+        else:
+            config = dict(config or {})
+            existing = config.pop("httpOptions", None) or config.pop("http_options", None)
+            config["httpOptions"] = {**existing, **http_options} if isinstance(existing, Mapping) else http_options
+    return {"model": params.get("model"), "contents": params.get("contents"), "config": config}
 
 
 # ---------------------------------------------------------------------------
@@ -920,11 +718,34 @@ def _raise_stream_error(chunk: Any) -> None:
 # Counter for generating unique tool call IDs
 _tool_call_counter = itertools.count(1)
 
+_ChunkStream: TypeAlias = AsyncIterator[genai_types.GenerateContentResponse]
+
 
 def new_google_output(model: Model) -> AssistantMessage:
     return AssistantMessage(
         [], api=model.api, provider=model.provider, model=model.id, usage=Usage(), stop_reason="pending"
     )
+
+
+async def _aclose(stream: _ChunkStream) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+async def _open_stream(client: Client, request: Any) -> tuple[_ChunkStream, genai_types.GenerateContentResponse | None]:
+    """Send the request and wait for the first chunk.
+
+    The SDK's stream sends its request lazily, on the first iteration; waiting for the first
+    chunk makes HTTP errors surface here, inside the retry policy, as they do upstream.
+    """
+    stream = await client.aio.models.generate_content_stream(**request)
+    try:
+        first = await anext(stream, None)
+    except BaseException:
+        await _aclose(stream)
+        raise
+    return stream, first
 
 
 async def run_google_stream(
@@ -934,13 +755,13 @@ async def run_google_stream(
     out: AssistantMessageEventStream,
     output: AssistantMessage,
     *,
-    create_client: Callable[[], GoogleClient],
+    create_client: Callable[[], Awaitable[Client]],
     missing_finish_reason_message: str,
 ) -> None:
     """Producer shared by the Gemini and Vertex adapters (identical upstream apart from the client)."""
     signal = options.get("signal")
     try:
-        client = create_client()
+        client = await create_client()
         normalized = collapse_system_messages(context)
         params: Any = build_google_params(model, normalized, options)
         on_payload = options.get("on_payload")
@@ -948,18 +769,23 @@ async def run_google_stream(
             replaced = await maybe_await(on_payload(params, model))
             if replaced is not None:
                 params = replaced
+        request = _stream_request(params, build_google_http_headers(model, options), options)
         async with abort_scope(signal):
-            response = await _open_stream(client, params, options)
+            stream, first = await retry_google_request(lambda: _open_stream(client, request), options)
             try:
                 on_response = options.get("on_response")
                 if on_response is not None:
-                    await maybe_await(
-                        on_response(ProviderResponse(response.status_code, headers_to_record(response.headers)), model)
-                    )
+                    # The SDK exposes the response headers on each chunk; a stream that started is a 200.
+                    http_response = first.sdk_http_response if first is not None else None
+                    headers = dict(http_response.headers or {}) if http_response is not None else {}
+                    await maybe_await(on_response(ProviderResponse(200, headers), model))
                 out.push(StartEvent(output))
-                await _consume_stream(model, options, out, output, response)
+                if first is not None:
+                    await _consume_stream(model, options, out, output, first, stream)
+            except genai_errors.APIError as error:
+                raise google_api_error(error) from error
             finally:
-                await response.aclose()
+                await _aclose(stream)
 
         if signal is not None and signal.aborted:
             raise AbortError("Request was aborted")
@@ -990,114 +816,107 @@ def _end_block(
         out.push(ThinkingEndEvent(index, block.thinking, output))
 
 
+def _signature_text(signature: bytes | str | None) -> str | None:
+    """A thought signature as the base64 text pi stores (the SDK decodes it to bytes)."""
+    if not signature:
+        return None
+    if isinstance(signature, bytes):
+        return base64.b64encode(signature).decode("ascii")
+    return signature
+
+
 async def _consume_stream(
     model: Model,
     options: Mapping[str, Any],
     out: AssistantMessageEventStream,
     output: AssistantMessage,
-    response: httpx.Response,
+    first: genai_types.GenerateContentResponse,
+    stream: _ChunkStream,
 ) -> None:
-    if "application/json" in (response.headers.get("content-type") or ""):
-        # A JSON body instead of an event stream: the SDK raises the error it carries,
-        # otherwise it finds no `data:` event and fails on the leftover buffer.
-        raw = await response.aread()
-        if raw.strip():
-            try:
-                _raise_stream_error(fastjson.loads(raw))
-            except ValueError:
-                pass
-            raise ValueError("Incomplete JSON segment at the end")
-        return
-
     on_event = options.get("on_provider_stream_event")
     blocks = output.content
     current: TextContent | ThinkingContent | None = None
 
-    async for sse in iter_sse(response):
-        if not sse.data:
-            continue
-        chunk = sse.json()
-        _raise_stream_error(chunk)
+    chunk: genai_types.GenerateContentResponse | None = first
+    while chunk is not None:
         if on_event is not None:
             await maybe_await(on_event(chunk, model))
-        if not isinstance(chunk, dict):
-            continue
-        # GenerateContentResponse.responseId is an output-only field identifying each response.
+        # GenerateContentResponse.response_id is an output-only field identifying each response.
         # Keep the first non-empty one from the stream.
         if not output.response_id:
-            output.response_id = chunk.get("responseId") or None
-        candidates = chunk.get("candidates")
-        candidate = candidates[0] if isinstance(candidates, list) and candidates else None
-        if not isinstance(candidate, dict):
-            candidate = {}
-        parts = (candidate.get("content") or {}).get("parts")
-        for part in parts or ():
-            text = part.get("text")
-            if text is not None:
-                is_thinking = is_thinking_part(part)
-                if current is None or is_thinking != isinstance(current, ThinkingContent):
+            output.response_id = chunk.response_id or None
+        candidates = chunk.candidates
+        candidate = candidates[0] if candidates else None
+        if candidate is not None:
+            content = candidate.content
+            parts = content.parts if content is not None else None
+            for part in parts or ():
+                text = part.text
+                if text is not None:
+                    is_thinking = part.thought is True
+                    if current is None or is_thinking != isinstance(current, ThinkingContent):
+                        if current is not None:
+                            _end_block(out, output, current)
+                        if is_thinking:
+                            current = ThinkingContent("")
+                            blocks.append(current)
+                            out.push(ThinkingStartEvent(len(blocks) - 1, output))
+                        else:
+                            current = TextContent("")
+                            blocks.append(current)
+                            out.push(TextStartEvent(len(blocks) - 1, output))
+                    signature = _signature_text(part.thought_signature)
+                    if isinstance(current, ThinkingContent):
+                        append_thinking(current, text)
+                        current.thinking_signature = retain_thought_signature(current.thinking_signature, signature)
+                        out.push(ThinkingDeltaEvent(len(blocks) - 1, text, output))
+                    else:
+                        append_text(current, text)
+                        current.text_signature = retain_thought_signature(current.text_signature, signature)
+                        out.push(TextDeltaEvent(len(blocks) - 1, text, output))
+
+                function_call = part.function_call
+                if function_call is not None:
                     if current is not None:
                         _end_block(out, output, current)
-                    if is_thinking:
-                        current = ThinkingContent("")
-                        blocks.append(current)
-                        out.push(ThinkingStartEvent(len(blocks) - 1, output))
-                    else:
-                        current = TextContent("")
-                        blocks.append(current)
-                        out.push(TextStartEvent(len(blocks) - 1, output))
-                if isinstance(current, ThinkingContent):
-                    append_thinking(current, text)
-                    current.thinking_signature = retain_thought_signature(
-                        current.thinking_signature, part.get("thoughtSignature")
+                        current = None
+                    # Generate unique ID if not provided or if it's a duplicate
+                    provided_id = function_call.id
+                    needs_new_id = not provided_id or any(
+                        isinstance(block, ToolCall) and block.id == provided_id for block in blocks
                     )
-                    out.push(ThinkingDeltaEvent(len(blocks) - 1, text, output))
-                else:
-                    append_text(current, text)
-                    current.text_signature = retain_thought_signature(
-                        current.text_signature, part.get("thoughtSignature")
+                    name = function_call.name
+                    tool_call_id = (
+                        f"{name if name is not None else 'undefined'}_{now_ms()}_{next(_tool_call_counter)}"
+                        if needs_new_id
+                        else provided_id
                     )
-                    out.push(TextDeltaEvent(len(blocks) - 1, text, output))
+                    args = function_call.args
+                    tool_call = ToolCall(
+                        tool_call_id,  # type: ignore[arg-type]
+                        name or "",
+                        args if args is not None else {},
+                        thought_signature=_signature_text(part.thought_signature),
+                    )
+                    blocks.append(tool_call)
+                    index = len(blocks) - 1
+                    out.push(ToolCallStartEvent(index, output))
+                    out.push(ToolCallDeltaEvent(index, _compact_json(tool_call.arguments), output))
+                    out.push(ToolCallEndEvent(index, tool_call, output))
 
-            function_call = part.get("functionCall")
-            if function_call:
-                if current is not None:
-                    _end_block(out, output, current)
-                    current = None
-                # Generate unique ID if not provided or if it's a duplicate
-                provided_id = function_call.get("id")
-                needs_new_id = not provided_id or any(
-                    isinstance(block, ToolCall) and block.id == provided_id for block in blocks
-                )
-                name = function_call.get("name")
-                tool_call_id = (
-                    f"{name if name is not None else 'undefined'}_{now_ms()}_{next(_tool_call_counter)}"
-                    if needs_new_id
-                    else provided_id
-                )
-                args = function_call.get("args")
-                tool_call = ToolCall(
-                    tool_call_id,
-                    name or "",
-                    args if args is not None else {},
-                    thought_signature=part.get("thoughtSignature") or None,
-                )
-                blocks.append(tool_call)
-                index = len(blocks) - 1
-                out.push(ToolCallStartEvent(index, output))
-                out.push(ToolCallDeltaEvent(index, _compact_json(tool_call.arguments), output))
-                out.push(ToolCallEndEvent(index, tool_call, output))
+            finish_reason = candidate.finish_reason
+            if finish_reason:
+                raw = finish_reason.value if isinstance(finish_reason, Enum) else str(finish_reason)
+                output.raw_stop_reason = raw
+                output.stop_reason = map_stop_reason(raw)
+                if output.stop_reason == "stop" and any(isinstance(block, ToolCall) for block in blocks):
+                    output.stop_reason = "toolUse"
 
-        finish_reason = candidate.get("finishReason")
-        if finish_reason:
-            output.raw_stop_reason = finish_reason
-            output.stop_reason = map_stop_reason(finish_reason)
-            if output.stop_reason == "stop" and any(isinstance(block, ToolCall) for block in blocks):
-                output.stop_reason = "toolUse"
-
-        usage_metadata = chunk.get("usageMetadata")
-        if usage_metadata:
+        usage_metadata = chunk.usage_metadata
+        if usage_metadata is not None:
             output.usage = parse_google_usage(model, usage_metadata)
+
+        chunk = await anext(stream, None)
 
     if current is not None:
         _end_block(out, output, current)

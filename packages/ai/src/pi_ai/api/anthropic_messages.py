@@ -2,32 +2,36 @@
 # Converters branch on ``role``/``type`` discriminators held in locals, which pyright does not narrow.
 """Anthropic Messages API (``anthropic-messages``).
 
-Port of pi's ``api/anthropic-messages.ts``. pi drives the Anthropic TypeScript SDK
-(``client.beta.messages.create(...).asResponse()``) and parses the SSE body itself;
-this module talks HTTP directly and reproduces the SDK's wire format: ``POST
-{base_url}/v1/messages?beta=true`` with ``x-api-key`` (or ``Authorization: Bearer``),
-``anthropic-version: 2023-06-01``, ``anthropic-beta`` built from the request ``betas``,
-and SDK-style error messages (``400 {"type":"error",...}``).
+Port of pi's ``api/anthropic-messages.ts``. Like pi, requests go through the official SDK
+(``AsyncAnthropic``): ``client.beta.messages.with_raw_response.create(...)`` returns the raw
+response (pi's ``.asResponse()``), whose SSE body is parsed here. Workload identity federation
+(``ANTHROPIC_FEDERATION_RULE_ID`` & co.) is the SDK's: the token exchange and access-token
+cache run in the SDK.
 
-Workload identity federation (``ANTHROPIC_FEDERATION_RULE_ID`` & co.) is handled the
-way the SDK does it: the identity token is exchanged at ``/v1/oauth/token`` (RFC 7523
-jwt-bearer grant) and the access token is cached across requests.
+The SDK speaks ``httpx2``; pi's ``http_client`` option and connection pool are ``httpx``, so
+SDK requests are routed through the httpx client by a small transport bridge.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import dataclasses
+import inspect
 import json
-import math
 import os
 import re
-import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+import weakref
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
+import anthropic
 import httpx
+import httpx2
+from anthropic import AsyncAnthropic, omit
+from anthropic.lib.credentials import InMemoryConfig, TokenCache, WorkloadIdentityError
+from anthropic.resources.beta.messages.messages import AsyncMessages
 
 from ..abort import AbortError, abort_scope
 from ..env_api_keys import (
@@ -71,7 +75,7 @@ from ..types import (
 )
 from ..utils.callbacks import maybe_await
 from ..utils.diagnostics import AssistantMessageDiagnostic, DiagnosticErrorInfo, append_assistant_message_diagnostic
-from ..utils.http import DEFAULT_TIMEOUT_MS, ProviderHttpError, build_headers, get_http_client, send_request
+from ..utils.http import ProviderHttpError, get_http_client, make_status_error, retry_provider_request
 from ..utils.json_parse import StreamingJsonParser, parse_json_with_repair, parse_tool_call_arguments
 from ..utils.misc import get_pi_user_agent, get_provider_env_value, headers_to_record, sanitize_surrogates
 from ..utils.text import append_text, append_thinking, get_system_message_text, render_system_message_update
@@ -135,6 +139,10 @@ class AnthropicOptions(StreamOptions, total=False):
     interleaved_thinking: bool
     #: Anthropic tool choice. Strings map to built-in choices; ``{"type": "tool", "name": ...}`` forces a tool.
     tool_choice: AnthropicToolChoice
+    #: Pre-built SDK client. When provided, skips internal client construction entirely (auth,
+    #: headers, ``http_client``). Use this to inject alternative SDK clients such as
+    #: ``AsyncAnthropicVertex`` that share the same messaging API.
+    client: AsyncAnthropic
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +150,6 @@ class AnthropicOptions(StreamOptions, total=False):
 # ---------------------------------------------------------------------------
 
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
-_ANTHROPIC_VERSION = "2023-06-01"
 
 FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14"
@@ -152,7 +159,6 @@ THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01"
 INLINE_TOOLS_BETA = "inline-tools-2026-09-15"
 _CLAUDE_CODE_BETA = "claude-code-20250219"
 _OAUTH_BETA = "oauth-2025-04-20"
-_FEDERATION_BETA = "oidc-federation-2026-04-01"
 
 # Stealth mode: Mimic Claude Code's tool naming exactly
 CLAUDE_CODE_VERSION = "2.1.280"
@@ -221,6 +227,15 @@ _STRICT_UNSUPPORTED_KEYWORDS = frozenset(
 _STRICT_STRING_FORMATS = frozenset(
     {"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
 )
+
+#: Keyword parameters of ``beta.messages.create``; other request fields go through ``extra_body``.
+_SDK_CREATE_PARAMS = frozenset(inspect.signature(AsyncMessages.create).parameters) - {
+    "self",
+    "extra_headers",
+    "extra_query",
+    "extra_body",
+    "timeout",
+}
 
 _ANTHROPIC_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _TOOL_CALL_ID_RE = re.compile(r"[^a-zA-Z0-9_-]")
@@ -353,36 +368,168 @@ def _base_url(model: Model) -> str:
     return model.base_url or os.environ.get("ANTHROPIC_BASE_URL") or _DEFAULT_BASE_URL
 
 
-def _messages_url(base_url: str) -> str:
-    # Same joining rule as the SDK's buildURL; beta.messages.create posts to /v1/messages?beta=true.
-    path = "v1/messages?beta=true" if base_url.endswith("/") else "/v1/messages?beta=true"
-    return base_url + path
+# ---------------------------------------------------------------------------
+# SDK transport: pi's httpx clients under the SDK's httpx2 client
+# ---------------------------------------------------------------------------
+
+
+def _httpx2_error(error: httpx.TransportError, request: httpx2.Request) -> httpx2.TransportError:
+    """The httpx2 counterpart of an httpx transport error, so the SDK classifies it (timeout vs connection)."""
+    cls = getattr(httpx2, type(error).__name__, None)
+    if not (isinstance(cls, type) and issubclass(cls, httpx2.TransportError)):
+        cls = httpx2.TimeoutException if isinstance(error, httpx.TimeoutException) else httpx2.TransportError
+    return cls(str(error), request=request)
+
+
+def _response_headers(response: httpx.Response) -> list[tuple[bytes, bytes]]:
+    headers = response.headers.raw
+    if response.is_stream_consumed and "content-encoding" in response.headers:
+        # The body was already read (and decoded) by httpx, e.g. a canned MockTransport response.
+        return [
+            (name, value) for name, value in headers if name.lower() not in (b"content-encoding", b"content-length")
+        ]
+    return headers
+
+
+class _BridgeByteStream(httpx2.AsyncByteStream):
+    __slots__ = ("_request", "_response")
+
+    def __init__(self, response: httpx.Response, request: httpx2.Request) -> None:
+        self._response = response
+        self._request = request
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        response = self._response
+        # Raw bytes keep content decoding on the httpx2 side, like a native transport.
+        chunks = response.aiter_bytes() if response.is_stream_consumed else response.aiter_raw()
+        try:
+            async for chunk in chunks:
+                yield chunk
+        except httpx.TransportError as error:
+            raise _httpx2_error(error, self._request) from error
+
+    async def aclose(self) -> None:
+        await self._response.aclose()
+
+
+class _HttpxTransport(httpx2.AsyncBaseTransport):
+    """Sends the SDK's httpx2 requests through a pi ``httpx.AsyncClient``.
+
+    The Anthropic SDK is built on ``httpx2``, while pi's ``http_client`` option and connection
+    pool are ``httpx``. Routing through the httpx client keeps its transport (mocks, proxies,
+    provider-scoped proxy env) and its connection reuse. The client is held weakly so the
+    per-client cache below does not keep caller-owned clients alive.
+    """
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = weakref.ref(client)
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        client = self._client()
+        if client is None:
+            raise httpx2.TransportError("The HTTP client was garbage collected", request=request)
+        body = await request.aread()
+        timeout = request.extensions.get("timeout")
+        outgoing = httpx.Request(
+            request.method,
+            str(request.url),
+            headers=request.headers.raw,
+            content=body,
+            extensions={"timeout": timeout} if timeout is not None else None,
+        )
+        try:
+            response = await client.send(outgoing, stream=True)
+        except httpx.TransportError as error:
+            raise _httpx2_error(error, request) from error
+        return httpx2.Response(
+            response.status_code,
+            headers=_response_headers(response),
+            stream=_BridgeByteStream(response, request),
+            request=request,
+        )
+
+    async def aclose(self) -> None:
+        # The httpx client belongs to the caller or to pi's pool; never close it here.
+        return None
+
+
+#: The event loop of the current Messages request. The SDK's worker thread for the token
+#: exchange runs in a copy of the request's context, so it sees this value.
+_request_loop: contextvars.ContextVar[asyncio.AbstractEventLoop | None] = contextvars.ContextVar(
+    "pi_anthropic_request_loop", default=None
+)
+
+
+class _HttpxSyncTransport(httpx2.BaseTransport):
+    """Transport for the SDK's federation token exchange.
+
+    The SDK exchanges the identity token with a sync ``httpx2.Client`` in a worker thread
+    (``TokenCache.async_get_token``); this hands the request back to the request's event loop
+    and sends it with the same httpx client as the Messages request (``http_client`` or the pool).
+    """
+
+    __slots__ = ("_options",)
+
+    def __init__(self, options: Mapping[str, Any]) -> None:
+        self._options = options
+
+    def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        loop = _request_loop.get()
+        if loop is None or loop.is_closed():
+            raise httpx2.TransportError("The token exchange needs a running pi request", request=request)
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            raise httpx2.TransportError("The token exchange cannot block the event loop", request=request)
+        return asyncio.run_coroutine_threadsafe(self._send(request), loop).result()
+
+    async def _send(self, request: httpx2.Request) -> httpx2.Response:
+        url = str(request.url)
+        client = get_http_client(url, self._options)
+        timeout = request.extensions.get("timeout")
+        outgoing = httpx.Request(
+            request.method,
+            url,
+            headers=request.headers.raw,
+            content=request.read(),
+            extensions={"timeout": timeout} if timeout is not None else None,
+        )
+        try:
+            response = await client.send(outgoing)
+        except httpx.TransportError as error:
+            raise _httpx2_error(error, request) from error
+        headers = [
+            (name, value)
+            for name, value in response.headers.raw
+            if name.lower() not in (b"content-encoding", b"content-length")
+        ]
+        return httpx2.Response(response.status_code, headers=headers, content=response.content, request=request)
+
+
+_sdk_http_clients: weakref.WeakKeyDictionary[httpx.AsyncClient, httpx2.AsyncClient] = weakref.WeakKeyDictionary()
+
+
+def _sdk_http_client(url: str, options: Mapping[str, Any]) -> httpx2.AsyncClient:
+    """The SDK ``http_client``: a caller's ``httpx2.AsyncClient`` as is, else one bridged to pi's httpx client."""
+    custom = options.get("http_client")
+    if isinstance(custom, httpx2.AsyncClient):
+        return custom
+    client = get_http_client(url, options)
+    sdk_client = _sdk_http_clients.get(client)
+    if sdk_client is None:
+        # trust_env=False: proxies are the httpx client's business (and skip httpx2's env proxy mounts).
+        sdk_client = httpx2.AsyncClient(transport=_HttpxTransport(client), trust_env=False)
+        _sdk_http_clients[client] = sdk_client
+    return sdk_client
 
 
 # ---------------------------------------------------------------------------
-# Workload identity federation
+# SDK client (headers and auth)
 # ---------------------------------------------------------------------------
-
-_TOKEN_ENDPOINT = "/v1/oauth/token"
-_GRANT_TYPE_JWT_BEARER = "urn:ietf:params:oauth:grant-type:jwt-bearer"
-_ADVISORY_REFRESH_THRESHOLD_S = 120
-_MANDATORY_REFRESH_THRESHOLD_S = 30
-_ADVISORY_REFRESH_BACKOFF_S = 5
-_MAX_TOKEN_RESPONSE_BYTES = 1 << 20
-_MAX_ERROR_BODY_CHARS = 2000
-_SAFE_ERROR_KEYS = ("error", "error_description", "error_uri")
-
-
-class WorkloadIdentityError(Exception):
-    """A failed workload identity federation token exchange (the SDK's ``WorkloadIdentityError``)."""
-
-    def __init__(
-        self, message: str, status_code: int | None = None, body: Any = None, request_id: str | None = None
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.body = body
-        self.request_id = request_id
 
 
 def _get_anthropic_federation(
@@ -393,8 +540,8 @@ def _get_anthropic_federation(
 ) -> dict[str, Any] | None:
     """Workload identity federation config from the ``ANTHROPIC_*`` variables the SDK documents.
 
-    Only for the anthropic provider, since the exchange is an Anthropic API endpoint, and
-    only when no key or auth header was resolved.
+    The SDK performs the token exchange and refresh. Only for the anthropic provider, since
+    the exchange is an Anthropic API endpoint, and only when no key or auth header was resolved.
     """
     if model.provider != "anthropic" or _has_request_auth(api_key, headers):
         return None
@@ -415,304 +562,63 @@ def _get_anthropic_federation(
     }
 
 
-@dataclass(slots=True)
-class _AccessToken:
-    token: str
-    #: Unix epoch seconds; ``None`` caches forever.
-    expires_at: float | None
+class _PiAnthropic(AsyncAnthropic):
+    """``AsyncAnthropic`` that never runs the SDK's own credential chain.
 
+    The SDK only resolves default credentials (``ANTHROPIC_PROFILE`` config files, federation
+    env vars) for the base class, so a subclass skips that chain. Explicit ``None`` credentials
+    also stay ``None`` instead of falling back to ``ANTHROPIC_API_KEY``/``ANTHROPIC_AUTH_TOKEN``
+    (the JS SDK's ``apiKey: null``), so a client built for header-owned auth never adds SDK
+    credentials behind pi's auth resolver.
 
-def _redact_sensitive(body: Any) -> Any:
-    """Redacted copy of a token-endpoint error body (only RFC 6749 §5.2 error fields survive)."""
-    if body is None:
-        return body
-    if isinstance(body, str):
-        try:
-            parsed = json.loads(body)
-        except ValueError:
-            if len(body) <= _MAX_ERROR_BODY_CHARS:
-                return body
-            return f"{body[:_MAX_ERROR_BODY_CHARS]}... <{len(body) - _MAX_ERROR_BODY_CHARS} more chars>"
-        return json.dumps(_redact_sensitive(parsed), separators=(",", ":"), ensure_ascii=False)
-    if isinstance(body, dict):
-        return {key: body[key] for key in body if key in _SAFE_ERROR_KEYS}
-    return None
-
-
-def _require_secure_token_endpoint(base_url: str) -> None:
-    """Reject base URLs that would send a JWT assertion over cleartext HTTP (loopback allowed)."""
-    if not base_url:
-        return
-    try:
-        url = httpx.URL(base_url)
-    except Exception as error:
-        raise WorkloadIdentityError(f'Invalid token endpoint base URL "{base_url}": {error}') from error
-    if url.scheme == "https":
-        return
-    host = url.host.lower().strip("[]")
-    if url.scheme == "http" and host in ("localhost", "127.0.0.1", "::1"):
-        return
-    raise WorkloadIdentityError(f'Refusing to send credential over non-https token endpoint "{base_url}"')
-
-
-def _read_identity_token(path: str) -> str:
-    """Read the JWT from ``path`` on every exchange (supports rotation, e.g. projected k8s tokens)."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            content = handle.read()
-    except OSError as error:
-        raise WorkloadIdentityError(f"Failed to read identity token file at {path}: {error}") from error
-    token = content.strip()
-    if not token:
-        raise WorkloadIdentityError(f"Identity token file at {path} is empty")
-    return token
-
-
-def _js_number(data: Mapping[str, Any], key: str) -> float:
-    """``Number(data[key])`` semantics for the token response's ``expires_in``."""
-    if key not in data:
-        return math.nan
-    value = data[key]
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return 0.0
-        try:
-            return float(text)
-        except ValueError:
-            return math.nan
-    return math.nan
-
-
-async def _exchange_federation_token(
-    config: Mapping[str, Any], base_url: str, request_options: Mapping[str, Any]
-) -> _AccessToken:
-    """Exchange the external OIDC JWT for an Anthropic access token (RFC 7523 jwt-bearer grant)."""
-    _require_secure_token_endpoint(base_url)
-    authentication = config["authentication"]
-    jwt = _read_identity_token(authentication["identity_token"]["path"])
-    # The token endpoint enforces a 16 KiB assertion limit; fail clearly before the round-trip.
-    if len(jwt) > 16 * 1024:
-        raise WorkloadIdentityError(
-            f"Identity token is {math.ceil(len(jwt) / 1024)} KiB, exceeds the 16 KiB assertion limit"
-        )
-    body: dict[str, str] = {
-        "grant_type": _GRANT_TYPE_JWT_BEARER,
-        "assertion": jwt,
-        "federation_rule_id": authentication["federation_rule_id"],
-        "organization_id": config["organization_id"],
-    }
-    if authentication.get("service_account_id"):
-        body["service_account_id"] = authentication["service_account_id"]
-    if config.get("workspace_id"):
-        body["workspace_id"] = config["workspace_id"]
-
-    url = f"{base_url}{_TOKEN_ENDPOINT}"
-    client = get_http_client(url, request_options)
-    timeout_ms = request_options.get("timeout_ms")
-    try:
-        response = await client.post(
-            url,
-            content=json.dumps(body).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "anthropic-beta": f"{_OAUTH_BETA},{_FEDERATION_BETA}",
-                "User-Agent": get_pi_user_agent(),
-            },
-            timeout=(timeout_ms if timeout_ms is not None else DEFAULT_TIMEOUT_MS) / 1000,
-        )
-    except httpx.HTTPError as error:
-        raise WorkloadIdentityError(f"Failed to reach token endpoint {url}: {error}") from error
-
-    request_id = response.headers.get("request-id")
-    text = response.content[:_MAX_TOKEN_RESPONSE_BYTES].decode("utf-8", "replace")
-    if not response.is_success:
-        redacted = _redact_sensitive(text)
-        hint = ""
-        if response.status_code == 401:
-            middle = (
-                ""
-                if config.get("workspace_id")
-                else "If your federation rule is scoped to multiple workspaces, set the ANTHROPIC_WORKSPACE_ID "
-                "environment variable, the 'workspace_id' config key, or the `workspaceId` option. "
-            )
-            hint = (
-                f" Ensure your federation rule matches your identity token. {middle}View your authentication "
-                "events in the Workload identity page of Claude Console for more details."
-            )
-        request_info = f" (request-id {request_id})" if request_id else ""
-        raise WorkloadIdentityError(
-            f"Token exchange failed with status {response.status_code}{request_info}: {redacted}{hint}",
-            response.status_code,
-            redacted,
-            request_id,
-        )
-
-    try:
-        data = json.loads(text)
-    except ValueError as error:
-        raise WorkloadIdentityError(
-            f"Token endpoint returned non-JSON response (status {response.status_code})",
-            response.status_code,
-            _redact_sensitive(text),
-            request_id,
-        ) from error
-    if not isinstance(data, dict) or not data.get("access_token"):
-        redacted_data = _redact_sensitive(data)
-        raise WorkloadIdentityError(
-            f"Token endpoint response missing access_token: {json.dumps(redacted_data, separators=(',', ':'))}",
-            response.status_code,
-            redacted_data,
-            request_id,
-        )
-    token_type = data.get("token_type")
-    if token_type and str(token_type).lower() != "bearer":
-        raise WorkloadIdentityError(
-            f'Token endpoint response: unsupported token_type "{token_type}" (want Bearer)',
-            response.status_code,
-            _redact_sensitive(data),
-            request_id,
-        )
-    expires_in = _js_number(data, "expires_in")
-    if not math.isfinite(expires_in):
-        redacted_data = _redact_sensitive(data)
-        raise WorkloadIdentityError(
-            f"Token endpoint response missing required fields: {json.dumps(redacted_data, separators=(',', ':'))}",
-            response.status_code,
-            redacted_data,
-            request_id,
-        )
-    return _AccessToken(str(data["access_token"]), time.time() + expires_in)
-
-
-class _FederationTokenCache:
-    """Access token cache with the SDK's two-tier proactive refresh and request deduplication.
-
-    * No cached token: exchange (blocking).
-    * More than 120s left: cached token.
-    * 30-120s left: cached token, refresh in the background (failures keep the stale token).
-    * Under 30s left: block and refresh.
+    The SDK resolves the platform for its ``X-Stainless-*`` headers in a worker thread on a
+    client's first request; pi builds a client per request, so the result is shared.
     """
 
-    __slots__ = ("_cached", "_last_advisory_error", "_next_force", "_pending", "_provider")
+    _shared_platform: Any = None
 
-    def __init__(self, provider: Callable[[], Awaitable[_AccessToken]]) -> None:
-        self._provider = provider
-        self._cached: _AccessToken | None = None
-        self._pending: asyncio.Task[_AccessToken] | None = None
-        self._next_force = False
-        self._last_advisory_error = 0.0
-
-    async def get_token(self) -> str:
-        force = self._next_force
-        self._next_force = False
-        cached = self._cached
-        if force or cached is None:
-            return (await self._refresh(force)).token
-        if cached.expires_at is None:
-            return cached.token
-        remaining = cached.expires_at - time.time()
-        if remaining > _ADVISORY_REFRESH_THRESHOLD_S:
-            return cached.token
-        if remaining > _MANDATORY_REFRESH_THRESHOLD_S:
-            self._background_refresh()
-            return cached.token
-        return (await self._refresh()).token
-
-    def invalidate(self) -> None:
-        """Drop the cached token after a 401 so the next request exchanges again."""
-        self._cached = None
-        self._next_force = True
-
-    def _current_pending(self) -> asyncio.Task[_AccessToken] | None:
-        pending = self._pending
-        if pending is None or pending.done() or pending.get_loop() is not asyncio.get_running_loop():
-            return None
-        return pending
-
-    async def _refresh(self, force: bool = False) -> _AccessToken:
-        pending = None if force else self._current_pending()
-        if pending is None:
-            pending = self._start_refresh()
-        # Shield the shared exchange so one aborted request does not cancel it for the others.
-        return await asyncio.shield(pending)
-
-    def _background_refresh(self) -> None:
-        if self._current_pending() is not None:
-            return
-        if time.time() - self._last_advisory_error < _ADVISORY_REFRESH_BACKOFF_S:
-            return
-        self._start_refresh().add_done_callback(self._on_background_done)
-
-    def _on_background_done(self, task: asyncio.Task[_AccessToken]) -> None:
-        if not task.cancelled() and task.exception() is not None:
-            self._last_advisory_error = time.time()
-
-    def _start_refresh(self) -> asyncio.Task[_AccessToken]:
-        async def run() -> _AccessToken:
-            try:
-                token = await self._provider()
-                self._cached = token
-                return token
-            finally:
-                if self._pending is task:
-                    self._pending = None
-
-        task = asyncio.ensure_future(run())
-        task.add_done_callback(_consume_task_exception)
-        self._pending = task
-        return task
+    def __init__(self, *, api_key: str | None, auth_token: str | None, **kwargs: Any) -> None:
+        super().__init__(api_key=api_key, auth_token=auth_token, **kwargs)
+        self.api_key = api_key
+        self.auth_token = auth_token
+        self._platform = _PiAnthropic._shared_platform
 
 
-def _consume_task_exception(task: asyncio.Future[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
+def _client_headers(*sources: Mapping[str, str | None] | None) -> dict[str, Any]:
+    """pi's ``mergeClientHeaders``: pi's User-Agent, then each source; ``None`` removes the SDK's header too."""
+    merged: dict[str, tuple[str, Any]] = {}
+    for source in ({"User-Agent": get_pi_user_agent()}, *sources):
+        if not source:
+            continue
+        for name, value in source.items():
+            merged[name.lower()] = (name, omit if value is None else value)
+    return {name: value for name, value in merged.values()}
 
 
-#: The SDK caches the federated access token per client. pi keeps one client for the current
-#: federation config and fetch implementation; this keeps one token cache for the current
-#: config and ``http_client``.
-_federation_cache: tuple[str, Any, _FederationTokenCache] | None = None
+#: The SDK caches the federated access token per client, but pi creates a client per request.
+#: Keep one token cache for the current federation config and ``http_client`` and share it with
+#: every per-request client, like upstream's ``withOptions()`` clones.
+_federation_cache: tuple[str, Any, Any, TokenCache] | None = None
 
 
-def _federation_token_cache(
-    model: Model, base_url: str, federation: Mapping[str, Any], options: Mapping[str, Any]
-) -> _FederationTokenCache:
+def _federation_credentials(
+    model: Model, federation: Mapping[str, Any], options: Mapping[str, Any]
+) -> tuple[Any, TokenCache]:
     global _federation_cache
     key = json.dumps([model.base_url, federation], sort_keys=True)
     http_client = options.get("http_client")
     cached = _federation_cache
     if cached is not None and cached[0] == key and cached[1] is http_client:
-        return cached[2]
-    token_base_url = re.sub(r"/+$", "", base_url)
-    exchange_options = {
-        name: options[name] for name in ("http_client", "env", "timeout_ms") if options.get(name) is not None
-    }
-    cache = _FederationTokenCache(lambda: _exchange_federation_token(federation, token_base_url, exchange_options))
-    _federation_cache = (key, http_client, cache)
-    return cache
-
-
-# ---------------------------------------------------------------------------
-# Client setup (headers and auth)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class _Client:
-    base_url: str
-    #: Headers the SDK derives from apiKey/authToken (sent before the client default headers).
-    auth_headers: dict[str, str]
-    #: Client default headers in merge order (pi's ``defaultHeaders``); ``None`` values delete.
-    default_headers: list[Mapping[str, str | None] | None]
-    is_oauth_token: bool
-    federation: _FederationTokenCache | None = None
+        return cached[2], cached[3]
+    exchange_options = {name: options[name] for name in ("http_client", "env") if options.get(name) is not None}
+    if isinstance(http_client, httpx2.AsyncClient):
+        exchange_options.pop("http_client")
+    provider = InMemoryConfig(
+        dict(federation), http_client=httpx2.Client(transport=_HttpxSyncTransport(exchange_options), trust_env=False)
+    )
+    token_cache = TokenCache(provider)
+    _federation_cache = (key, http_client, provider, token_cache)
+    return provider, token_cache
 
 
 def _create_client(
@@ -723,32 +629,37 @@ def _create_client(
     session_id: str | None,
     federation: Mapping[str, Any] | None,
     options: Mapping[str, Any],
-) -> _Client:
+) -> tuple[AsyncAnthropic, bool, TokenCache | None]:
+    """Create the SDK client: ``(client, is_oauth_token, federation token cache)``."""
     base_url = _base_url(model)
-    user_agent = {"User-Agent": get_pi_user_agent()}
+    # pi retries itself (retry_provider_request) so the backoff sleep stays abortable.
+    common: dict[str, Any] = {
+        "base_url": base_url,
+        "http_client": _sdk_http_client(base_url, options),
+        "max_retries": 0,
+    }
 
     # Copilot: Bearer auth.
     if model.provider == "github-copilot":
-        return _Client(
-            base_url,
-            {"Authorization": f"Bearer {api_key}"} if api_key is not None else {},
-            [
-                user_agent,
+        client = _PiAnthropic(
+            api_key=None,
+            auth_token=api_key,
+            default_headers=_client_headers(
                 {"accept": "application/json", "anthropic-dangerous-direct-browser-access": "true"},
                 model.headers,
                 dynamic_headers,
                 options_headers,
-            ],
-            False,
+            ),
+            **common,
         )
+        return client, False, None
 
     # OAuth: Bearer auth, Claude Code identity headers
     if api_key and is_oauth_token(api_key):
-        return _Client(
-            base_url,
-            {"Authorization": f"Bearer {api_key}"},
-            [
-                user_agent,
+        client = _PiAnthropic(
+            api_key=None,
+            auth_token=api_key,
+            default_headers=_client_headers(
                 {
                     "accept": "application/json",
                     "anthropic-dangerous-direct-browser-access": "true",
@@ -757,9 +668,10 @@ def _create_client(
                 },
                 model.headers,
                 options_headers,
-            ],
-            True,
+            ),
+            **common,
         )
+        return client, True, None
 
     # API key, header-owned auth, or workload identity federation.
     compat = _get_compat(model)
@@ -767,77 +679,96 @@ def _create_client(
     if session_id and compat.send_session_affinity_headers:
         header = "x-session-id" if compat.session_affinity_format == "openrouter" else "x-session-affinity"
         session_affinity[header] = session_id
-    default_headers: list[Mapping[str, str | None] | None] = [
-        user_agent,
+    default_headers = _client_headers(
         {"accept": "application/json", "anthropic-dangerous-direct-browser-access": "true"},
         session_affinity,
         model.headers,
         options_headers,
-    ]
+    )
     if federation is not None:
-        return _Client(
-            base_url, {}, default_headers, False, _federation_token_cache(model, base_url, federation, options)
+        provider, token_cache = _federation_credentials(model, federation, options)
+        client = _PiAnthropic(
+            api_key=None,
+            auth_token=None,
+            credentials=provider,
+            _token_cache=token_cache,
+            default_headers=default_headers,
+            **common,
         )
-    return _Client(base_url, {"X-Api-Key": api_key} if api_key is not None else {}, default_headers, False)
+        return client, False, token_cache
+    return _PiAnthropic(api_key=api_key, auth_token=None, default_headers=default_headers, **common), False, None
 
 
-def _split_request(params: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
-    """Split request params into the JSON body and per-request headers, like ``beta.messages.create``."""
-    body = dict(params)
-    betas = body.pop("betas", None)
-    user_profile_id = body.pop("user_profile_id", None)
-    workspace_id = body.pop("workspace_id", None)
-    # The SDK maps the deprecated output_format to output_config.format.
-    output_format = body.pop("output_format", None)
+def _create_kwargs(params: Mapping[str, Any]) -> dict[str, Any]:
+    """Keyword arguments for ``beta.messages.create``: SDK params by name, the rest via ``extra_body``.
+
+    The Python SDK rejects unknown keyword arguments, while upstream passes the params object as
+    is; ``extra_body`` keeps every field on the wire. ``betas``, ``user_profile_id`` and
+    ``workspace_id`` become headers in the SDK.
+    """
+    kwargs: dict[str, Any] = {}
+    extra: dict[str, Any] = {}
+    for name, value in params.items():
+        if name in _SDK_CREATE_PARAMS:
+            kwargs[name] = value
+        else:
+            extra[name] = value
+    # The JS SDK maps the deprecated output_format to output_config.format.
+    output_format = extra.pop("output_format", None)
     if output_format:
-        output_config = body.get("output_config")
+        output_config = kwargs.get("output_config")
         if isinstance(output_config, Mapping) and output_config.get("format"):
             raise ValueError(
                 "Both output_format and output_config.format were provided. "
                 "Please use only output_config.format (output_format is deprecated)."
             )
-        body["output_config"] = {
+        kwargs["output_config"] = {
             **(output_config if isinstance(output_config, Mapping) else {}),
             "format": output_format,
         }
     elif output_format is not None:
-        body["output_format"] = output_format
-    headers: dict[str, str] = {}
-    if betas is not None:
-        headers["anthropic-beta"] = (
-            ",".join(str(beta) for beta in betas) if isinstance(betas, (list, tuple)) else str(betas)
-        )
-    if user_profile_id is not None:
-        headers["anthropic-user-profile-id"] = str(user_profile_id)
-    if workspace_id is not None:
-        headers["anthropic-workspace-id"] = str(workspace_id)
-    return body, headers
+        extra["output_format"] = output_format
+    for name in ("max_tokens", "messages", "model"):
+        # Required by the Python signature; an on_payload hook may still have removed them.
+        kwargs.setdefault(name, omit)
+    if extra:
+        kwargs["extra_body"] = extra
+    return kwargs
 
 
-async def _request_headers(client: _Client, request_headers: Mapping[str, str]) -> dict[str, str]:
-    auth_headers: Mapping[str, str] = client.auth_headers
-    if client.federation is not None:
-        auth_headers = {"Authorization": f"Bearer {await client.federation.get_token()}"}
-    headers = build_headers(
-        {
-            "Accept": "application/json",
-            "anthropic-dangerous-direct-browser-access": "true",
-            "anthropic-version": _ANTHROPIC_VERSION,
-        },
-        auth_headers,
-        *client.default_headers,
-        {"content-type": "application/json"},
-        request_headers,
-    )
-    if client.federation is not None:
-        # Token auth appends the OAuth beta after all header merging (the SDK's prepareRequest).
-        existing_key = next((name for name in headers if name.lower() == "anthropic-beta"), None)
-        existing = headers.pop(existing_key) if existing_key is not None else None
-        parts = [part.strip() for part in existing.split(",")] if existing is not None else []
-        if existing is None or _OAUTH_BETA not in parts:
-            parts.append(_OAUTH_BETA)
-        headers["anthropic-beta"] = ",".join(parts)
-    return headers
+def _provider_error(error: anthropic.APIError) -> ProviderHttpError:
+    """Convert an SDK error to a :class:`ProviderHttpError` with the JS SDK's message wording.
+
+    The JS SDK's ``APIError.message`` is ``"<status> <JSON body>"`` (``"Connection error."`` and
+    ``"Request timed out."`` without a response); pi's retry and overflow detection rely on it.
+    """
+    if isinstance(error, anthropic.APIStatusError):
+        response = error.response
+        try:
+            text = response.text
+        except httpx2.ResponseNotRead:
+            text = ""
+        headers = httpx.Headers(response.headers.multi_items())
+        return make_status_error(response.status_code, text, headers, "anthropic")
+    if isinstance(error, anthropic.APITimeoutError):
+        return ProviderHttpError("Request timed out.")
+    return ProviderHttpError(error.message)
+
+
+async def _create_response(client: AsyncAnthropic, params: Mapping[str, Any], options: Mapping[str, Any]) -> Any:
+    """``client.beta.messages.create(params).asResponse()``: the raw response, before its body is read."""
+    kwargs = _create_kwargs(params)
+    _request_loop.set(asyncio.get_running_loop())
+    timeout_ms = options.get("timeout_ms")
+    if timeout_ms is not None:
+        kwargs["timeout"] = timeout_ms / 1000
+    try:
+        return await client.beta.messages.with_raw_response.create(**kwargs)
+    except (anthropic.APIStatusError, anthropic.APIConnectionError) as error:
+        raise _provider_error(error) from error
+    finally:
+        if _PiAnthropic._shared_platform is None and isinstance(client, _PiAnthropic):
+            _PiAnthropic._shared_platform = client._platform
 
 
 # ---------------------------------------------------------------------------
@@ -1360,7 +1291,7 @@ def map_stop_reason(reason: str, stop_details: Mapping[str, Any] | None = None) 
             raise ValueError(f"Unhandled stop reason: {reason}")
 
 
-async def _iter_sse_messages(response: httpx.Response) -> AsyncIterator[tuple[str | None, str, list[str]]]:
+async def _iter_sse_messages(response: httpx2.Response) -> AsyncIterator[tuple[str | None, str, list[str]]]:
     """Decode SSE messages as ``(event, data, raw lines)``, keeping raw lines for parse errors."""
     event: str | None = None
     data: list[str] = []
@@ -1387,7 +1318,7 @@ async def _iter_sse_messages(response: httpx.Response) -> AsyncIterator[tuple[st
         yield event, "\n".join(data), raw
 
 
-async def _iter_anthropic_events(response: httpx.Response) -> AsyncIterator[Any]:
+async def _iter_anthropic_events(response: httpx2.Response) -> AsyncIterator[Any]:
     saw_message_start = False
     saw_message_end = False
     async for event_name, data, raw in _iter_sse_messages(response):
@@ -1519,22 +1450,40 @@ async def _stream_response(
     out: AssistantMessageEventStream,
 ) -> None:
     signal = options.get("signal")
-    api_key: str | None = options.get("api_key")
-    options_headers: Mapping[str, str | None] | None = options.get("headers")
-    federation = _get_anthropic_federation(model, api_key, options_headers, options.get("env"))
-    if federation is None:
-        _assert_request_auth(model.provider, api_key, options_headers)
-
-    dynamic_headers: dict[str, str] | None = None
-    if model.provider == "github-copilot":
-        dynamic_headers = build_copilot_dynamic_headers(
-            messages=context.messages, has_images=has_copilot_vision_input(context.messages)
+    token_cache: TokenCache | None = None
+    custom_client = options.get("client")
+    if custom_client is not None:
+        # Upstream sends every request with maxRetries: 0 and retries itself.
+        client: AsyncAnthropic = (
+            custom_client if custom_client.max_retries == 0 else custom_client.with_options(max_retries=0)
         )
-    cache_retention = _resolve_cache_retention(options.get("cache_retention"), options.get("env"))
-    cache_session_id = None if cache_retention == "none" else options.get("session_id")
-    client = _create_client(model, api_key, options_headers, dynamic_headers, cache_session_id, federation, options)
-    is_oauth = client.is_oauth_token
-    url = _messages_url(client.base_url)
+        is_oauth = False
+    else:
+        api_key: str | None = options.get("api_key")
+        options_headers: Mapping[str, str | None] | None = options.get("headers")
+        federation = _get_anthropic_federation(model, api_key, options_headers, options.get("env"))
+        if federation is None:
+            _assert_request_auth(model.provider, api_key, options_headers)
+
+        dynamic_headers: dict[str, str] | None = None
+        if model.provider == "github-copilot":
+            dynamic_headers = build_copilot_dynamic_headers(
+                messages=context.messages, has_images=has_copilot_vision_input(context.messages)
+            )
+        cache_retention = _resolve_cache_retention(options.get("cache_retention"), options.get("env"))
+        cache_session_id = None if cache_retention == "none" else options.get("session_id")
+        client, is_oauth, token_cache = _create_client(
+            model, api_key, options_headers, dynamic_headers, cache_session_id, federation, options
+        )
+
+    async def attempt(params: Mapping[str, Any]) -> Any:
+        try:
+            return await _create_response(client, params, options)
+        except ProviderHttpError as error:
+            if token_cache is not None and error.status == 401:
+                # The server rejected the token even if it still looks fresh.
+                token_cache.invalidate()
+            raise
 
     disable_preferred_strict_tools = False
     while True:
@@ -1550,18 +1499,13 @@ async def _stream_response(
             if replaced is not None:
                 params = dict(replaced)
                 params["stream"] = True
-        body, request_headers = _split_request(params)
         try:
-            headers = await _request_headers(client, request_headers)
-            try:
-                response = await send_request(
-                    "POST", url, headers=headers, body=body, options=options, error_style="anthropic"
-                )
-            except ProviderHttpError as error:
-                if client.federation is not None and error.status == 401:
-                    # The server rejected the token even if it still looks fresh.
-                    client.federation.invalidate()
-                raise
+            raw = await retry_provider_request(
+                lambda params=params: attempt(params),
+                max_retries=options.get("max_retries") or 0,
+                max_retry_delay_ms=options.get("max_retry_delay_ms"),
+                signal=signal,
+            )
             break
         except Exception as error:
             # Only downgrade a rejected request, never an already-started stream.
@@ -1583,6 +1527,7 @@ async def _stream_response(
                 ),
             )
 
+    response: httpx2.Response = raw.http_response
     try:
         on_response = options.get("on_response")
         if on_response is not None:
@@ -1602,7 +1547,7 @@ async def _consume_events(
     options: Mapping[str, Any],
     output: AssistantMessage,
     out: AssistantMessageEventStream,
-    response: httpx.Response,
+    response: httpx2.Response,
 ) -> None:
     content = output.content
     usage = output.usage
