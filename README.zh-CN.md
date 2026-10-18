@@ -1,0 +1,108 @@
+# pi-py
+
+[pi](https://github.com/earendil-works/pi) 核心库的 Python 实现，包含两个包：
+
+| 包 | 导入名 | 对应上游 | 功能 |
+| --- | --- | --- | --- |
+| [`pi-ai`](packages/ai/README.md) | `pi_ai` | `@earendil-works/pi-ai` | 统一的 LLM API：provider 集合、鉴权解析（API key / OAuth）、流式事件、token 与费用统计、工具调用、跨 provider 上下文切换、图像生成、分类 |
+| [`pi-agent-core`](packages/agent/README.md) | `pi_agent` | `@earendil-works/pi-agent-core` | 有状态 Agent：工具执行（并行/串行）、steering 与 follow-up 队列、生命周期事件、钩子 |
+
+## 安装
+
+```bash
+pip install pi-ai pi-agent-core          # 运行时只依赖 httpx
+pip install "pi-ai[fast]"                # 可选：orjson 加速 JSON 解码
+pip install "pi-ai[all]"                 # 可选：orjson + websockets + pydantic
+```
+
+开发环境：
+
+```bash
+uv sync
+uv run pytest
+```
+
+## 快速开始
+
+```python
+import asyncio
+
+from pi_ai import Context, UserMessage
+from pi_ai.providers.all import builtin_models
+
+
+async def main() -> None:
+    models = builtin_models()                     # 注册全部内置 provider，鉴权读取 ANTHROPIC_API_KEY 等环境变量
+    model = models.get_model("anthropic", "claude-sonnet-4-5")
+    stream = models.stream(model, Context(system_prompt="回答要简洁。", messages=[UserMessage("你好！")]))
+    async for event in stream:
+        if event.type == "text_delta":
+            print(event.delta, end="", flush=True)
+    message = await stream.result()
+    print(f"\n输入 {message.usage.input} / 输出 {message.usage.output} tokens，费用 ${message.usage.cost.total:.4f}")
+
+
+asyncio.run(main())
+```
+
+Agent：
+
+```python
+from pi_agent import Agent, AgentInitialState, agent_tool
+
+
+@agent_tool
+async def get_weather(city: str) -> str:
+    """查询天气。
+
+    Args:
+        city: 城市名。
+    """
+    return f"{city}：晴，25°C"
+
+
+agent = Agent(
+    initial_state=AgentInitialState(system_prompt="你是一个助手。", model=model, tools=[get_weather]),
+    stream_fn=models.stream_simple,
+)
+async for event in agent.events("北京天气怎么样？"):
+    if event.type == "message_update" and event.assistant_message_event.type == "text_delta":
+        print(event.assistant_message_event.delta, end="")
+```
+
+## 与 pi 保持一致的 API
+
+架构与语义与 TypeScript 版一致：同样的 `Models`/`Provider` 运行时、同样的事件协议
+（`start` → `text_delta`… → `done`/`error`）、同样的 transcript 模型（系统提示词和工具由
+system message 承载）、同样的鉴权优先级、同样的模型目录和 Agent 循环。命名遵循 Python 习惯：
+
+| TypeScript | Python |
+| --- | --- |
+| `createModels()`、`models.streamSimple(...)` | `create_models()`、`models.stream_simple(...)` |
+| `{ apiKey, sessionId, maxTokens }` | 关键字参数 `api_key=..., session_id=..., max_tokens=...`（也可传 dict） |
+| `message.stopReason`、`usage.cacheRead` | `message.stop_reason`、`usage.cache_read` |
+| `{ role: "user", content: "hi", timestamp }` | `UserMessage("hi")`（timestamp 默认为当前时间） |
+| TypeBox `Type.Object({...})` | 内置 `Type.Object({...})` 或 Pydantic 模型 |
+| `AbortController` / `signal` | `pi_ai.AbortController` / `signal=` |
+| `agent.continue()` | `agent.continue_()`（别名 `agent.resume()`） |
+
+线上协议和持久化中出现的字符串值保持不变（`"toolUse"`、`"toolResult"`、`"text_delta"`、API id、
+provider id）。`pi_ai.serialization` 读写 pi 的 camelCase JSON，会话记录、模型定义和
+`auth.json` 凭据文件都可以与 TypeScript 版互通。
+
+## 设计改进
+
+* **不依赖厂商 SDK**：各 provider 适配器直接实现 HTTP/SSE 协议，复用连接池；运行时唯一依赖是 `httpx`。
+* **性能**：slots 数据类、低分配的事件队列、包装流之间零拷贝转发、增量式部分 JSON 解析
+  （大参数工具调用比逐 delta 全量重解析快约 60 倍）、流式文本线性时间累加、可选 orjson、编译并缓存的参数校验器。
+  单核每秒约处理 10 万个流事件（见 `benchmarks/`）。
+* **全面懒加载**：模型目录按 provider 首次访问时加载；API 实现和 OAuth 流程在首次请求时导入。
+* **原生异步取消**：`AbortSignal` 可立即中断挂起的网络读取，被中止的请求以 `stop_reason == "aborted"` 结束而不是抛异常。
+* **Python 友好的扩展**：Pydantic 模型作为工具参数、`@agent_tool` 从类型注解生成工具、`Agent.events()` 异步迭代器、
+  `FileCredentialStore`（pi 的 `auth.json` 格式，带跨进程锁）、事件循环外创建的流、`async with` 关闭流。
+
+详细文档：[pi-ai](packages/ai/README.md)、[pi-agent-core](packages/agent/README.md)。
+
+## 许可证
+
+MIT，基于 Mario Zechner 等人的 pi。
