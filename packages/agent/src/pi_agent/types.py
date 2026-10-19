@@ -23,7 +23,7 @@ from pi_ai import (
 )
 
 if TYPE_CHECKING:
-    pass
+    from pi_telemetry import TelemetryContext
 
 __all__ = [
     "StreamFn",
@@ -225,6 +225,9 @@ class AgentLoopConfig:
     after_tool_call: (
         Callable[[AfterToolCallContext, AbortSignal | None], Awaitable[AfterToolCallResult | None]] | None
     ) = None
+    #: Explicit parent context of the run's ``pi.agent.run`` span (see :mod:`pi_agent.telemetry`). The run span is
+    #: passed to the stream function as ``telemetry_context``. Never persisted.
+    telemetry_context: TelemetryContext | None = None
 
 
 @dataclass(slots=True)

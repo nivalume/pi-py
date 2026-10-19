@@ -25,6 +25,7 @@ from pi_ai.abort import AbortSignal
 from pi_ai.utils.schema import parameters_schema
 from pi_ai.utils.validation import validate_tool_arguments
 from pi_chord.json import JsonValue
+from pi_telemetry import TelemetryContext
 
 from .declarations import render_declarations
 from .runtime.execution import CodemodeSandboxBase
@@ -80,6 +81,7 @@ def create_codemode_tool(
     sandbox: SandboxFactory | None = None,
     name: str = "codemode",
     label: str = "Codemode",
+    telemetry_context: TelemetryContext | None = None,
 ) -> AgentTool:
     """A ``codemode`` agent tool whose scripts call ``tools``.
 
@@ -87,6 +89,7 @@ def create_codemode_tool(
     :class:`~pi_codemode.CodemodeSandbox`), closed when the script ends; pass a factory that
     shares an ``AsyncMonty`` pool (``CodemodeSandbox(tools=tools, pool=pool)``) to avoid starting
     one per call. The script may start with ``# @options: {"timeout_ms": ...}``.
+    ``telemetry_context`` is the parent of each script's ``pi.codemode.run`` span.
     """
     sandbox_tools = [codemode_tool_of(tool) for tool in tools]
     factory = sandbox or _default_sandbox
@@ -104,7 +107,12 @@ def create_codemode_tool(
             return AgentToolResult([TextContent(str(error))], is_error=True)
         runner = factory(sandbox_tools)
         try:
-            result = await runner.execute(source.code, signal=signal, timeout_ms=source.options.timeout_ms)
+            result = await runner.execute(
+                source.code,
+                signal=signal,
+                timeout_ms=source.options.timeout_ms,
+                telemetry_context=telemetry_context,
+            )
         finally:
             await runner.close()
         content: list[TextContent | ImageContent] = [item.to_content() for item in result.output]

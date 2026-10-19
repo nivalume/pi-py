@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from typing_extensions import ReadOnly
 
     from pi_ai.models import Models
+    from pi_telemetry import TelemetryContext
 
     from ..env import ExecutionEnv, ShellOutputSkip, ShellOutputWindow
     from .task_graph import TaskGraph, TaskGraphWatch
@@ -349,6 +350,12 @@ class ToolExecutionApi(DocumentObserver, DocumentReader, Protocol):
     @property
     def env(self) -> ExecutionEnv | None:
         """Built by ``HarnessOptions.env`` for this call; ``None`` without an environment."""
+        ...
+
+    @property
+    def telemetry_context(self) -> TelemetryContext:
+        """The call's ``pi.harness.tool`` span, parent of telemetry the tool produces (``NOOP_TELEMETRY_CONTEXT``
+        when telemetry is off). Never persist it."""
         ...
 
     def now(self) -> float:
@@ -817,6 +824,9 @@ class HarnessOptions(TypedDict):
     setTimer: ReadOnly[NotRequired[SetTimer]]
     onWake: ReadOnly[NotRequired[Callable[[Wake], None]]]
     onReport: ReadOnly[NotRequired[Callable[[BaseException, ReportInfo], None]]]
+    #: Parent of the Harness's spans (``pi.harness.*``, ``pi.session.commit``, and the model requests and code mode
+    #: runs below them); see :mod:`pi_durable.telemetry`. Held in memory only, never persisted.
+    telemetryContext: ReadOnly[NotRequired[TelemetryContext]]
 
 
 class TaskInspectionRunning(TypedDict):

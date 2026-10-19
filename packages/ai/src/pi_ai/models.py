@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pi_telemetry import NOOP_TELEMETRY_CONTEXT
+
 from .abort import (
     AbortController,
     AbortError,
@@ -44,6 +46,7 @@ from .auth.types import (
 )
 from .event_stream import AssistantMessageEventStream
 from .models_store import InMemoryModelsStore, ModelsStore, ModelsStoreEntry
+from .telemetry import AiRequestOperation, trace_request
 from .types import (
     AnyModel,
     AssistantImages,
@@ -197,6 +200,18 @@ def _merge_options(options: Mapping[str, Any] | None, kwargs: Mapping[str, Any])
     if not kwargs:
         return dict(options)
     return {**options, **kwargs}
+
+
+def _traced(options: Mapping[str, Any] | None, kwargs: Mapping[str, Any]) -> bool:
+    """Whether a request's options carry an enabled telemetry context (keyword arguments win)."""
+    telemetry = (
+        kwargs.get("telemetry_context") if "telemetry_context" in kwargs else (options or {}).get("telemetry_context")
+    )
+    return telemetry is not None and telemetry is not NOOP_TELEMETRY_CONTEXT
+
+
+#: The (empty) transcript a deferred fetch reports: it sends no messages.
+_NO_MESSAGES = TranscriptContext([])
 
 
 def _safe_models(provider: Provider, all_types: bool) -> Sequence[AnyModel]:
@@ -741,6 +756,9 @@ class Models:
         """
         transcript = normalize_context(context)
         opts = _merge_options(options, kwargs)
+        telemetry = opts.get("telemetry_context")
+        if telemetry is not None and telemetry is not NOOP_TELEMETRY_CONTEXT:
+            return self._traced_chat(model, transcript, opts, "stream", True)
 
         async def setup() -> AssistantMessageEventStream:
             provider = self._require_chat_provider(model)
@@ -748,6 +766,27 @@ class Models:
             return provider.stream(request_model, transcript, request_options)
 
         return lazy_stream(model, setup)
+
+    def _traced_chat(
+        self,
+        model: Model,
+        transcript: TranscriptContext,
+        opts: dict[str, Any],
+        operation: AiRequestOperation,
+        streaming: bool,
+    ) -> AssistantMessageEventStream:
+        """A chat request inside a ``pi.ai.request`` span; the provider receives the span as its
+        ``telemetry_context`` (see :mod:`pi_ai.telemetry`)."""
+
+        async def setup(instrument: Callable[[dict[str, Any]], dict[str, Any]]) -> AssistantMessageEventStream:
+            provider = self._require_chat_provider(model)
+            request_model, request_options = await self._apply_auth(model, opts)
+            request_options = instrument(request_options)
+            if operation == "stream":
+                return provider.stream(request_model, transcript, request_options)
+            return provider.stream_simple(request_model, transcript, request_options)
+
+        return trace_request(model, transcript, opts, operation, streaming, setup)
 
     async def complete(
         self,
@@ -758,6 +797,9 @@ class Models:
         **kwargs: Any,
     ) -> AssistantMessage:
         """Like :meth:`stream` but returns only the final assistant message."""
+        if _traced(options, kwargs):
+            opts = _merge_options(options, kwargs)
+            return await self._traced_chat(model, normalize_context(context), opts, "stream", False).result()
         return await self.stream(model, context, options, **kwargs).result()
 
     def stream_simple(
@@ -771,6 +813,9 @@ class Models:
         """Stream with provider-neutral options (``reasoning="medium"``, ``tool_choice``...)."""
         transcript = normalize_context(context)
         opts = _merge_options(options, kwargs)
+        telemetry = opts.get("telemetry_context")
+        if telemetry is not None and telemetry is not NOOP_TELEMETRY_CONTEXT:
+            return self._traced_chat(model, transcript, opts, "stream_simple", True)
 
         async def setup() -> AssistantMessageEventStream:
             provider = self._require_chat_provider(model)
@@ -787,26 +832,39 @@ class Models:
         /,
         **kwargs: Any,
     ) -> AssistantMessage:
+        if _traced(options, kwargs):
+            opts = _merge_options(options, kwargs)
+            return await self._traced_chat(model, normalize_context(context), opts, "stream_simple", False).result()
         return await self.stream_simple(model, context, options, **kwargs).result()
 
     def stream_deferred(
         self, model: Model, handle: DeferredHandle, options: Mapping[str, Any] | None = None, /, **kwargs: Any
     ) -> AssistantMessageEventStream:
-        opts = _merge_options(options, kwargs)
+        return self._deferred(model, handle, _merge_options(options, kwargs), True)
 
-        async def setup() -> AssistantMessageEventStream:
+    def _deferred(
+        self, model: Model, handle: DeferredHandle, opts: dict[str, Any], streaming: bool
+    ) -> AssistantMessageEventStream:
+        async def setup(
+            instrument: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        ) -> AssistantMessageEventStream:
             provider = self._require_chat_provider(model)
             if provider.fetch_deferred is None:
                 raise ModelsError("provider", f"Provider {model.provider} does not support deferred responses")
             request_model, request_options = await self._apply_auth(model, opts)
+            if instrument is not None:
+                request_options = instrument(request_options)
             return provider.fetch_deferred(request_model, handle, request_options)
 
+        telemetry = opts.get("telemetry_context")
+        if telemetry is not None and telemetry is not NOOP_TELEMETRY_CONTEXT:
+            return trace_request(model, _NO_MESSAGES, opts, "fetch_deferred", streaming, setup)
         return lazy_stream(model, setup)
 
     async def fetch_deferred(
         self, model: Model, handle: DeferredHandle, options: Mapping[str, Any] | None = None, /, **kwargs: Any
     ) -> AssistantMessage:
-        return await self.stream_deferred(model, handle, options, **kwargs).result()
+        return await self._deferred(model, handle, _merge_options(options, kwargs), False).result()
 
     async def cancel_deferred(
         self, model: Model, handle: DeferredHandle, options: Mapping[str, Any] | None = None, /, **kwargs: Any

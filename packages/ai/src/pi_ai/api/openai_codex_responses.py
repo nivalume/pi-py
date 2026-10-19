@@ -36,6 +36,7 @@ from ..abort import abort_scope
 from ..event_stream import AssistantMessageEventStream
 from ..models import clamp_thinking_level
 from ..session_resources import register_session_resource_cleanup
+from ..telemetry import record_retry
 from ..types import (
     AssistantMessage,
     DoneEvent,
@@ -507,6 +508,7 @@ async def _run_request(
     if max_retries is None:
         max_retries = DEFAULT_MAX_RETRIES
     on_response = options.get("on_response")
+    telemetry_context = options.get("telemetry_context")
 
     for attempt_index in range(max_retries + 1):
         if signal is not None and signal.aborted:
@@ -531,6 +533,7 @@ async def _run_request(
                     if retry_after_delay_ms is None
                     else _validate_retry_delay_ms(retry_after_delay_ms, options)
                 )
+                record_retry(telemetry_context, attempt_index + 1, delay_ms, response.status_code)
                 await _sleep(delay_ms)
                 continue
 
@@ -547,6 +550,8 @@ async def _run_request(
                 and not isinstance(error, RetryDelayExceededError)
                 and "usage limit" not in str(error)
             ):
+                status = response.status_code if response is not None and response.status_code >= 400 else None
+                record_retry(telemetry_context, attempt_index + 1, BASE_DELAY_MS * 2**attempt_index, status)
                 await _sleep(BASE_DELAY_MS * 2**attempt_index)
                 continue
             raise

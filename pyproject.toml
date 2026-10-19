@@ -1,6 +1,6 @@
 [project]
 name = "pi-ai-python"
-version = "1.6.0"
+version = "1.7.0"
 description = "Python port of pi's AI libraries: a unified LLM API (pi_ai) and a stateful agent runtime (pi_agent)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,7 +39,17 @@ bedrock = ["boto3>=1.43"]
 images = ["pillow>=11"]
 # Sandbox for pi_codemode scripts (pi_codemode.sandbox, on Monty).
 codemode = ["pydantic-monty>=1.2,<2"]
-all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43", "pillow>=11", "pydantic-monty>=1.2,<2"]
+# OpenTelemetry adapter for pi_telemetry (pi_telemetry.otel).
+otel = ["opentelemetry-api>=1.28"]
+all = [
+    "orjson>=3.10",
+    "websockets>=13",
+    "pydantic>=2.6",
+    "boto3>=1.43",
+    "pillow>=11",
+    "pydantic-monty>=1.2,<2",
+    "opentelemetry-api>=1.28",
+]
 
 [project.scripts]
 pi-ai = "pi_ai.cli:main"
@@ -54,13 +64,14 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-# One distribution, two import packages.
+# One distribution, several import packages.
 packages = [
     "packages/ai/src/pi_ai",
     "packages/agent/src/pi_agent",
     "packages/chord/src/pi_chord",
     "packages/durable/src/pi_durable",
     "packages/codemode/src/pi_codemode",
+    "packages/telemetry/src/pi_telemetry",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -70,16 +81,19 @@ include = [
     "packages/chord/src",
     "packages/durable/src",
     "packages/codemode/src",
+    "packages/telemetry/src",
     "packages/ai/tests",
     "packages/agent/tests",
     "packages/chord/tests",
     "packages/durable/tests",
     "packages/codemode/tests",
+    "packages/telemetry/tests",
     "packages/ai/README.md",
     "packages/agent/README.md",
     "packages/chord/README.md",
     "packages/durable/README.md",
     "packages/codemode/README.md",
+    "packages/telemetry/README.md",
     "packages/durable/DESIGN.md",
     "README.md",
     "README.zh-CN.md",
@@ -94,6 +108,8 @@ dev = [
     "pydantic>=2.9",
     "pillow>=11",
     "pydantic-monty>=1.2,<2",
+    "opentelemetry-api>=1.28",
+    "opentelemetry-sdk>=1.28",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.8",
@@ -103,13 +119,22 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests", "packages/durable/tests", "packages/codemode/tests"]
+testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests", "packages/durable/tests", "packages/codemode/tests", "packages/telemetry/tests"]
 addopts = "-q --import-mode=importlib"
+# pi instrumentation drops schema violations with a warning; in tests they are failures.
+filterwarnings = ["error::pi_telemetry.TelemetrySchemaWarning"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-src = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src", "packages/codemode/src"]
+src = [
+    "packages/ai/src",
+    "packages/agent/src",
+    "packages/chord/src",
+    "packages/durable/src",
+    "packages/codemode/src",
+    "packages/telemetry/src",
+]
 extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
@@ -133,10 +158,17 @@ ignore = [
 "packages/*/tests/**" = ["ASYNC109", "ASYNC110", "RUF043"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pi_ai", "pi_agent", "pi_chord", "pi_durable", "pi_codemode"]
+known-first-party = ["pi_ai", "pi_agent", "pi_chord", "pi_durable", "pi_codemode", "pi_telemetry"]
 
 [tool.pyright]
-include = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src", "packages/codemode/src"]
+include = [
+    "packages/ai/src",
+    "packages/agent/src",
+    "packages/chord/src",
+    "packages/durable/src",
+    "packages/codemode/src",
+    "packages/telemetry/src",
+]
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.11"

@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeAlias, T
 if TYPE_CHECKING:
     import httpx
 
+    from pi_telemetry import TelemetryContext
+
     from .abort import AbortSignal
     from .event_stream import AssistantMessageEventStream
     from .utils.diagnostics import AssistantMessageDiagnostic
@@ -904,6 +906,8 @@ class ProviderRequestOptions(TypedDict, total=False):
     """
 
     signal: AbortSignal
+    #: Explicit parent context for telemetry produced by this logical request (see :mod:`pi_ai.telemetry`).
+    telemetry_context: TelemetryContext
     api_key: str
     #: Custom ``httpx.AsyncClient`` for provider HTTP requests (the analog of pi's ``fetch`` option).
     http_client: httpx.AsyncClient

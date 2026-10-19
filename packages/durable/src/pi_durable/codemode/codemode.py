@@ -51,7 +51,8 @@ from pi_ai import TextContent, Type
 from pi_ai.serialization import content_from_dict, to_json_value
 from pi_chord.json import copy_json
 from pi_codemode.identifier import to_codemode_identifier
-from pi_codemode.source import CODEMODE_SOURCE_GRAMMAR, parse_codemode_source
+from pi_codemode.source import CODEMODE_SOURCE_GRAMMAR, ParsedCodemodeSource, parse_codemode_source
+from pi_codemode.telemetry import trace_codemode_run
 from pi_codemode.types import (
     CodemodeDeclaredGlobal,
     CodemodeDeclaredTool,
@@ -59,6 +60,7 @@ from pi_codemode.types import (
     CodemodeHostCall,
     CodemodeSuccess,
 )
+from pi_telemetry import SchemaTelemetrySpan, is_telemetry_enabled, record_content
 
 from ..documents import define_doc
 from ..errors import error_message
@@ -486,6 +488,10 @@ class _CodemodeCall:
         #: Resolves once the VM's fingerprint is checked or recorded; nothing is delivered or admitted before.
         self._gate: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._tasks: set[asyncio.Future[Any]] = set()
+        #: Telemetry only, in memory: the run's span, the sandbox's result, and why the call decided otherwise.
+        self._span: SchemaTelemetrySpan | None = None
+        self._sandbox_result: CodemodeResult | None = None
+        self._error_kind: str | None = None
 
     # ─── background work ────────────────────────────────────────────────────
 
@@ -511,9 +517,77 @@ class _CodemodeCall:
 
     async def execute(self, source: str) -> ToolExecutionResult:
         parsed = parse_codemode_source(source)
+        agent = await self._api.agent(self._context)
+        parent = getattr(self._api, "telemetry_context", None)
+        if not is_telemetry_enabled(parent):
+            return await self._execute(parsed, agent)
+
+        async def run(span: SchemaTelemetrySpan) -> ToolExecutionResult:
+            self._span = span
+            try:
+                result = await self._execute(parsed, agent)
+            finally:
+                span.set_attributes(
+                    {
+                        "pi.codemode.nested_call_count": len(self._rows),
+                        "pi.codemode.replayed": self._rerun,
+                        "pi.codemode.replayed_call_count": self._next_replayed,
+                    }
+                )
+            self._record(span, result)
+            return result
+
+        def error_kind(_error: BaseException) -> str:
+            signal = self._context.abort_signal
+            return "aborted" if signal is not None and signal.aborted else "host"
+
+        callable_count = sum(1 for tool in agent["callable"] if not tool.name.startswith(CODEMODE_INTERNAL_PREFIX))
+        return await trace_codemode_run(
+            parent,
+            parsed.code,
+            mode="deterministic",
+            timeout_ms=parsed.options.timeout_ms,
+            tool_count=callable_count,
+            run=run,
+            error_kind=error_kind,
+        )
+
+    def _note(self, kind: str) -> None:
+        """Remember why the call decided an outcome other than the script's own (telemetry only)."""
+        if self._error_kind is None:
+            self._error_kind = kind
+            span = self._span
+            if span is not None and kind == "different_path":
+                span.add_event("pi.codemode.different_path")
+            elif span is not None and kind == "deadline_passed":
+                span.add_event("pi.codemode.timeout")
+
+    def _record(self, span: SchemaTelemetrySpan, result: ToolExecutionResult) -> None:
+        """End attributes of the run: counts, the replay, and the outcome; the output only under content capture."""
+        failed = result.get("isError") is True
+        attributes: dict[str, Any] = {"pi.codemode.outcome": "error" if failed else "success"}
+        sandbox = self._sandbox_result
+        kind = self._error_kind
+        if kind is None and isinstance(sandbox, CodemodeFailure):
+            kind = sandbox.error.kind
+            if kind == "timeout":
+                timeout = self._start.get("deadline")
+                span.add_event(
+                    "pi.codemode.timeout",
+                    {"pi.codemode.timeout_ms": timeout - self._start["startedAt"]} if timeout is not None else {},
+                )
+        if failed:
+            attributes["pi.codemode.error_kind"] = kind or "script"
+            span.set_status({"status": "error", "error": {"name": kind or "script", "message": ""}})
+        span.set_attributes(attributes)
+        if span.content_capture is not None:
+            for item in result.get("output") or []:
+                if isinstance(item, TextContent):
+                    record_content(span, "output", item.text)
+
+    async def _execute(self, parsed: ParsedCodemodeSource, agent: Any) -> ToolExecutionResult:
         code, source_options = parsed.code, parsed.options
         api, context = self._api, self._context
-        agent = await api.agent(context)
         tools: list[DeclaredTool] = []
         for tool in agent["callable"]:
             declared: DeclaredTool = {
@@ -598,6 +672,7 @@ class _CodemodeCall:
         self._durable_issued = max(self._durable_issued, self._first_issued or 0)
 
         if self._start["version"] != CODEMODE_MODULE_VERSION:
+            self._note("version_mismatch")
             return await self._decide(
                 _error_result(
                     f"The script cannot resume: it started under code mode version {self._start['version']}, "
@@ -607,6 +682,7 @@ class _CodemodeCall:
         deadline = self._start.get("deadline")
         remaining = None if deadline is None else deadline - api.now()
         if remaining is not None and remaining <= 0:
+            self._note("deadline_passed")
             return await self._decide(_error_result("Script timed out: its deadline passed while it was interrupted."))
 
         signal = context.abort_signal
@@ -636,6 +712,7 @@ class _CodemodeCall:
                 on_idle=self._on_idle,
             )
             result = await self._run.result
+            self._sandbox_result = result
             if self._failure is not None:
                 raise self._failure
             if self._ended is not None:
@@ -665,6 +742,7 @@ class _CodemodeCall:
                     acknowledged = "issuedAfter" in self._replayed[during.seq - 1]
                 continued = acknowledged or any(entry["id"] > during.issued for entry in self._replayed[during.seq :])
                 if continued:
+                    self._note("different_path")
                     return await self._decide(
                         _error_result(
                             "The script took a different path when resumed after a restart: it ended after result "
@@ -701,6 +779,7 @@ class _CodemodeCall:
             return
         result = _error_result(f"The script took a different path when resumed after a restart: {message}")
         self._ended = result
+        self._note("different_path")
 
         async def end() -> None:
             try:
@@ -801,6 +880,7 @@ class _CodemodeCall:
         recorded = self._start.get("fingerprint")
         if recorded is not None:
             if recorded != fingerprint:
+                self._note("sandbox")
                 self._ended = _error_result(
                     f"The script cannot resume: the sandbox changed since it started ({recorded} -> {fingerprint})."
                 )

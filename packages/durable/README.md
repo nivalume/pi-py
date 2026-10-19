@@ -36,6 +36,7 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 - [Usage and Cost](#usage-and-cost)
 - [Storage](#storage)
 - [Errors](#errors)
+- [Telemetry](#telemetry)
 - [Differences from the TypeScript Package](#differences-from-the-typescript-package)
 - [Design Notes](#design-notes)
 
@@ -1073,6 +1074,23 @@ async def supervise(harness):
 ```
 
 A failure closes the Harness by itself; `closed` settles once that close is done, even if the storage could not close cleanly. Closing waits for running task code to return, so code that ignores its abort signal delays `closed`.
+
+## Telemetry
+
+Pass a [`pi_telemetry`](../telemetry/README.md) context as `telemetryContext` (an addition: upstream 1.3.0's pi-durable records no spans). The Harness then records a `pi.harness.generation` span for each phase of a generation (its model request is a child `pi.ai.request` span), a `pi.harness.tool` span for each tool call (a nested call is a child of its caller's span; the code mode tool's script run is a child `pi.codemode.run`), a `pi.harness.task` span for each phase of any other task, and a `pi.session.commit` span for each commit. `create_session(storage, telemetry_context=...)` records the commit spans of a plain Session.
+
+```python
+from pi_telemetry import InMemoryTelemetryContext
+
+telemetry = InMemoryTelemetryContext()
+traced = await Harness.open(MemoryStorage(), {"models": models, "registry": registry, "telemetryContext": telemetry}, context)
+traced_root = await traced.root(context, agent={"model": {"provider": "openai", "modelId": "gpt-6-sol"}})
+await (await traced_root.submit({"type": "input", "content": "Hi"}, context)).wait(context)
+await traced.close(context)
+print(sorted({span.name for span in telemetry.get_spans()}))
+```
+
+Task code gets the running phase's span as `runtime.telemetry_context`, and a tool as `api.telemetry_context`: pass it on to work that should nest under it, for example as a model request's `telemetry_context`. The context lives in memory only: it is never written to records, documents, checkpoints or journals, and a task resumed after a restart runs under the context of the process that reopened the Harness. By default no span records prompts, tool arguments or output, or error text; see the [span catalog and data policy](../telemetry/README.md#span-catalog).
 
 ## Differences from the TypeScript Package
 

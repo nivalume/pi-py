@@ -23,6 +23,7 @@ from pi_ai import (
     to_tool_declaration,
 )
 from pi_ai.utils.callbacks import maybe_await
+from pi_telemetry import TelemetryContext
 
 from .agent_loop import run_agent_loop, run_agent_loop_continue
 from .stream_fn import get_default_stream_fn
@@ -242,6 +243,7 @@ class Agent:
         max_retry_delay_ms: float | None = None,
         tool_execution: ToolExecutionMode = "parallel",
         stream_options: Mapping[str, Any] | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ) -> None:
         self._state = AgentState(initial_state)
         self._listeners: list[AgentListener] = []
@@ -275,6 +277,8 @@ class Agent:
         self.tool_execution: ToolExecutionMode = tool_execution
         #: Extra stream options (temperature, max_tokens, cache_retention, headers...).
         self.stream_options: dict[str, Any] = dict(stream_options or {})
+        #: Parent context of each run's ``pi.agent.run`` span; ``None`` records nothing (see :mod:`pi_agent.telemetry`).
+        self.telemetry_context = telemetry_context
 
     # -- events and state -------------------------------------------------------
 
@@ -545,6 +549,7 @@ class Agent:
             tool_execution=self.tool_execution,
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            telemetry_context=self.telemetry_context,
         )
 
     async def _run_with_lifecycle(self, executor: Callable[[AbortSignal], Awaitable[None]]) -> None:

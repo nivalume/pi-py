@@ -10,13 +10,15 @@ PyPI as one package, `pi-ai-python`, with these import packages:
 | [`pi_durable`](https://github.com/nivalume/pi-py/blob/main/packages/durable/README.md) | `@earendil-works/pi-durable` | Durable agent harness: conversations, model turns, tool calls and your own state are committed to storage (memory, SQLite, JSONL) before anything is shown, and work resumes after a crash or restart |
 | [`pi_chord`](https://github.com/nivalume/pi-py/blob/main/packages/chord/README.md) | `@earendil-works/chord` (subset) | What `pi_durable` builds on: explicit cancellation contexts, strict JSON, the transactional JSON tracker and op batches, replicated state, bounded output, an async SQLite layer |
 | [`pi_codemode`](https://github.com/nivalume/pi-py/blob/main/packages/codemode/README.md) | `@earendil-works/pi-codemode` | Code mode: model-written Python, run in the Monty sandbox, whose only capability is calling injected tools; Python declarations for the model, deterministic runs for durable replay |
+| [`pi_telemetry`](https://github.com/nivalume/pi-py/blob/main/packages/telemetry/README.md) | `@earendil-works/pi-telemetry` | Vendor-neutral telemetry: explicit callback-based spans, typed schemas, an in-memory reference adapter and conformance suite, an OpenTelemetry adapter with GenAI conventions and metrics; the other packages record `pi.ai.*`, `pi.agent.*`, `pi.harness.*`, `pi.session.*` and `pi.codemode.*` spans when given a context |
 
 ```bash
 pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
 pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
 pip install "pi-ai-python[images]"     # + Pillow, for pi_durable's image processor
 pip install "pi-ai-python[codemode]"   # + pydantic-monty, the sandbox of pi_codemode
-pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow, pydantic-monty
+pip install "pi-ai-python[otel]"       # + opentelemetry-api, for pi_telemetry's OpenTelemetry adapter
+pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow, pydantic-monty, opentelemetry-api
 ```
 
 中文说明见 [README.zh-CN.md](https://github.com/nivalume/pi-py/blob/main/README.zh-CN.md)。
@@ -148,6 +150,11 @@ definitions and `auth.json` credential files are interchangeable with TypeScript
 * **Async-native cancellation.** `AbortSignal` aborts interrupt pending network reads
   immediately (task cancellation scoped by `abort_scope`), and aborted requests end
   their stream with `stop_reason == "aborted"` instead of raising.
+* **Explicit telemetry.** `pi_telemetry` ports pi's callback-based span contract (no ambient current span). Pass a
+  context (`telemetry_context=`, or `HarnessOptions["telemetryContext"]`) and the packages record `pi.ai.request`,
+  `pi.agent.run`, `pi.harness.*`, `pi.session.commit` and `pi.codemode.run` spans, with no content by default;
+  `pi_telemetry.otel` exports them to OpenTelemetry with the GenAI semantic conventions and metrics. Without a
+  context nothing is recorded and the streaming path is unchanged. Upstream 1.3.0 only propagates the context.
 * **Python-friendly additions.** Pydantic models as tool parameter schemas,
   `@agent_tool` to build tools from typed functions, `Agent.events()` as an async
   iterator, `FileCredentialStore` (pi's `auth.json` format with cross-process locking),
@@ -169,7 +176,7 @@ uv run python benchmarks/bench_durable_storage.py --quick
 uv run python benchmarks/bench_codemode.py --quick
 ```
 
-The port tracks pi 1.3.0 (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-durable`, `pi-codemode`, `chord`).
+The port tracks pi 1.3.0 (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-durable`, `pi-codemode`, `pi-telemetry`, `chord`).
 
 Model catalog data (`packages/ai/src/pi_ai/providers/data/*.json`) is the generated
 catalog shipped with `@earendil-works/pi-ai` 1.3.0.

@@ -20,6 +20,7 @@ from pi_chord.context import BACKGROUND_CONTEXT, Context, await_with_context, wi
 from pi_chord.delta import Op, track
 from pi_chord.json import JsonObject
 from pi_chord.state import ReplicatedStateSourceOptions, replicated_state
+from pi_telemetry import SchemaTelemetrySpan, TelemetryContext, bind_typed_span_starter, is_telemetry_enabled
 
 from ..documents import (
     AnyDocDefinition,
@@ -34,6 +35,8 @@ from ..documents import (
 )
 from ..errors import SessionFailed, StorageRequestError
 from ..ids import MAX_SAFE_INTEGER, id_from_number
+from ..telemetry import COMMIT_SPAN, storage_kind
+from ..telemetry import STARTER as TELEMETRY_STARTER
 from ..timers import Timers, host_timers
 from ..types import (
     AnyTaskRecord,
@@ -105,16 +108,18 @@ def create_session(
     now: Callable[[], float] | None = None,
     document_retention_ms: float | None = None,
     set_timer: SetTimer | None = None,
+    telemetry_context: TelemetryContext | None = None,
 ) -> Session:
     """Open a Session kernel over one storage backend.
 
     ``now`` is the wall clock for task times (default :func:`date_now`). ``document_retention_ms`` is how long
     an unobserved document stays cached after its last use (default ten minutes). ``set_timer`` arms the
-    timers that evict idle documents (see ``HarnessOptions.setTimer``). The first error a Storage method
-    raises fails the Session (``SessionFailed``); see :class:`SessionImpl`.
+    timers that evict idle documents (see ``HarnessOptions.setTimer``). ``telemetry_context`` is the parent of a
+    ``pi.session.commit`` span per commit (see :mod:`pi_durable.telemetry`); it is held in memory only. The first
+    error a Storage method raises fails the Session (``SessionFailed``); see :class:`SessionImpl`.
     """
     retention = document_retention_ms
-    return SessionImpl(storage, now, None if retention is None else (lambda: retention), set_timer)
+    return SessionImpl(storage, now, None if retention is None else (lambda: retention), set_timer, telemetry_context)
 
 
 #: Default document retention: ten minutes, as for kept contexts.
@@ -227,8 +232,14 @@ class SessionImpl:
         now: Callable[[], float] | None = None,
         document_retention_ms: Callable[[], float | None] | None = None,
         set_timer: SetTimer | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ) -> None:
         self._storage = GuardedStorage(storage, self)
+        #: Parent of ``pi.session.commit`` spans; ``None`` when telemetry is off. Process-local, never persisted.
+        self._telemetry: TelemetryContext | None = (
+            telemetry_context if is_telemetry_enabled(telemetry_context) else None
+        )
+        self._storage_kind = storage_kind(storage)
         self._documents: dict[str, LoadedDocument] = {}
         #: Cached documents with no observer attached, by address, oldest use first, with the time of that use.
         self._idle_documents: dict[str, float] = {}
@@ -765,6 +776,45 @@ class SessionImpl:
         context: Context,
         scope: TransactionScope | None,
     ) -> T:
+        telemetry = self._telemetry
+        if telemetry is None:
+            return await self._commit_once(change, context, scope, None)
+        return await self._traced_commit(telemetry, change, context, scope)
+
+    async def _traced_commit(
+        self,
+        telemetry: TelemetryContext,
+        change: Callable[[Transaction], T | Awaitable[T]],
+        context: Context,
+        scope: TransactionScope | None,
+    ) -> T:
+        written = [0]
+
+        async def body(span: SchemaTelemetrySpan, _child: Any) -> T:
+            started = time.perf_counter()
+            try:
+                return await self._commit_once(change, context, scope, written)
+            except BaseException as error:
+                span.set_status({"status": "error", "error": {"name": type(error).__name__, "message": ""}})
+                raise
+            finally:
+                span.set_attributes(
+                    {
+                        "pi.session.write_count": written[0],
+                        "pi.session.duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    }
+                )
+
+        starter = bind_typed_span_starter(telemetry, TELEMETRY_STARTER)
+        return await starter(COMMIT_SPAN, {"pi.session.storage": self._storage_kind}, body)
+
+    async def _commit_once(
+        self,
+        change: Callable[[Transaction], T | Awaitable[T]],
+        context: Context,
+        scope: TransactionScope | None,
+        written: list[int] | None,
+    ) -> T:
         self._assert_healthy()
         context.throw_if_aborted()
         tx = Transaction(self._host, context, scope)
@@ -787,6 +837,8 @@ class SessionImpl:
             tx.discard()
             self._sweep_documents()
             return result
+        if written is not None:
+            written[0] = len(writes)
         try:
             # Once admitted, caller cancellation does not interrupt Storage settlement.
             seq = await self._storage.commit(writes, without_abort_signal(context))

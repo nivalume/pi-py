@@ -9,6 +9,7 @@
 | [`pi_durable`](packages/durable/README.md) | `@earendil-works/pi-durable` | 持久化 Agent 运行时：会话、模型调用、工具调用和你自己的状态都先写入存储（内存、SQLite、JSONL）再对外展示，崩溃或重启后从断点继续 |
 | [`pi_chord`](packages/chord/README.md) | `@earendil-works/chord`（子集） | `pi_durable` 的底层：显式取消上下文、严格 JSON、事务式 JSON 跟踪与修改操作、可订阅状态、有界输出、异步 SQLite |
 | [`pi_codemode`](packages/codemode/README.md) | `@earendil-works/pi-codemode` | 代码模式：模型编写的 Python 在 Monty 沙箱中运行，唯一的能力是调用注入的工具；为模型生成 Python 声明，并支持可重放的确定性运行 |
+| [`pi_telemetry`](packages/telemetry/README.md) | `@earendil-works/pi-telemetry` | 与后端无关的遥测：显式的回调式 span、带类型的 schema、内存参考适配器与一致性测试套件、带 GenAI 语义约定和指标的 OpenTelemetry 适配器；传入上下文后，其他模块会记录 `pi.ai.*`、`pi.agent.*`、`pi.harness.*`、`pi.session.*` 和 `pi.codemode.*` span |
 
 这些模块在 PyPI 上作为同一个包 `pi-ai-python` 发布。
 
@@ -20,7 +21,8 @@ pip install "pi-ai-python[bedrock]"       # 可选：boto3，用于 Amazon Bedro
 pip install "pi-ai-python[fast]"          # 可选：orjson 加速 JSON 解码
 pip install "pi-ai-python[images]"        # 可选：Pillow，用于 pi_durable 的图片处理
 pip install "pi-ai-python[codemode]"      # 可选：pydantic-monty，pi_codemode 的沙箱
-pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3 + pillow + pydantic-monty
+pip install "pi-ai-python[otel]"          # 可选：opentelemetry-api，pi_telemetry 的 OpenTelemetry 适配器
+pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3 + pillow + pydantic-monty + opentelemetry-api
 ```
 
 开发环境：
@@ -146,10 +148,15 @@ provider id）。`pi_ai.serialization` 读写 pi 的 camelCase JSON，会话记�
   单核每秒处理流事件：anthropic-messages 约 11 万，openai-completions 约 7 万（瓶颈在 openai SDK 的 SSE 解码，见 `benchmarks/`）。
 * **全面懒加载**：模型目录按 provider 首次访问时加载；API 实现和 OAuth 流程在首次请求时导入。
 * **原生异步取消**：`AbortSignal` 可立即中断挂起的网络读取，被中止的请求以 `stop_reason == "aborted"` 结束而不是抛异常。
+* **显式遥测**：`pi_telemetry` 移植了 pi 的回调式 span 约定（没有隐式的“当前 span”）。传入上下文
+  （`telemetry_context=` 或 `HarnessOptions["telemetryContext"]`）后，各模块记录 `pi.ai.request`、`pi.agent.run`、
+  `pi.harness.*`、`pi.session.commit` 和 `pi.codemode.run` span，默认不记录任何内容（提示词、输出、工具参数等）；
+  `pi_telemetry.otel` 按 GenAI 语义约定导出到 OpenTelemetry 并记录指标。不传上下文时什么也不记录，流式路径不变。
+  上游 1.3.0 只负责传递上下文。
 * **Python 友好的扩展**：Pydantic 模型作为工具参数、`@agent_tool` 从类型注解生成工具、`Agent.events()` 异步迭代器、
   `FileCredentialStore`（pi 的 `auth.json` 格式，带跨进程锁）、事件循环外创建的流、`async with` 关闭流。
 
-详细文档：[pi_ai](packages/ai/README.md)、[pi_agent](packages/agent/README.md)。
+详细文档：[pi_ai](packages/ai/README.md)、[pi_agent](packages/agent/README.md)、[pi_telemetry](packages/telemetry/README.md)。
 
 ## 许可证
 

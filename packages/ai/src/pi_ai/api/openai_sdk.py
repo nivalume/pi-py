@@ -174,6 +174,7 @@ async def openai_request(call: Callable[[], Awaitable[_T]], options: Mapping[str
         max_retries=options.get("max_retries") or 0,
         max_retry_delay_ms=options.get("max_retry_delay_ms"),
         signal=options.get("signal"),
+        telemetry_context=options.get("telemetry_context"),
     )
 
 

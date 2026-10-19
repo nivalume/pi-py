@@ -29,8 +29,10 @@ from pi_ai import (
     validate_tool_arguments,
 )
 from pi_ai.utils.callbacks import maybe_await
+from pi_telemetry import NOOP_TELEMETRY_CONTEXT, SchemaTelemetrySpan
 
 from .stream_fn import get_default_stream_fn
+from .telemetry import trace_agent_run
 from .types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -168,12 +170,17 @@ async def run_agent_loop(
     initial = _declare_tool_changes(context, prompts)
     new_messages: list[Any] = list(initial)
     current = AgentContext(messages=[*context.messages, *initial], tools=context.tools)
-    await _emit(emit, AgentStartEvent())
-    await _emit(emit, TurnStartEvent())
-    for message in initial:
-        await _emit(emit, MessageStartEvent(message))
-        await _emit(emit, MessageEndEvent(message))
-    await _run_loop(current, new_messages, config, signal, emit, stream_fn or get_default_stream_fn())
+    stream_function = stream_fn or get_default_stream_fn()
+
+    async def run(span: SchemaTelemetrySpan | None) -> str:
+        await _emit(emit, AgentStartEvent())
+        await _emit(emit, TurnStartEvent())
+        for message in initial:
+            await _emit(emit, MessageStartEvent(message))
+            await _emit(emit, MessageEndEvent(message))
+        return await _run_loop(current, new_messages, config, signal, emit, stream_function, span)
+
+    await _traced(config, current, "prompt", new_messages, run)
     return new_messages
 
 
@@ -188,10 +195,30 @@ async def run_agent_loop_continue(
     _check_continuable(context)
     new_messages: list[Any] = []
     current = AgentContext(messages=context.messages, tools=context.tools)
-    await _emit(emit, AgentStartEvent())
-    await _emit(emit, TurnStartEvent())
-    await _run_loop(current, new_messages, config, signal, emit, stream_fn or get_default_stream_fn())
+    stream_function = stream_fn or get_default_stream_fn()
+
+    async def run(span: SchemaTelemetrySpan | None) -> str:
+        await _emit(emit, AgentStartEvent())
+        await _emit(emit, TurnStartEvent())
+        return await _run_loop(current, new_messages, config, signal, emit, stream_function, span)
+
+    await _traced(config, current, "continue", new_messages, run)
     return new_messages
+
+
+async def _traced(
+    config: AgentLoopConfig,
+    context: AgentContext,
+    mode: str,
+    new_messages: list[Any],
+    run: Callable[[SchemaTelemetrySpan | None], Awaitable[str]],
+) -> None:
+    """Run the loop, inside a ``pi.agent.run`` span when the config has a telemetry context."""
+    telemetry = config.telemetry_context
+    if telemetry is None or telemetry is NOOP_TELEMETRY_CONTEXT:
+        await run(None)
+        return
+    await trace_agent_run(telemetry, config, len(context.tools or ()), mode, new_messages, run)
 
 
 def _apply_thinking_level(reasoning: Any, level: Any) -> Any:
@@ -217,12 +244,16 @@ async def _run_loop(
     signal: AbortSignal | None,
     emit: AgentEventSink,
     stream_function: StreamFn,
-) -> None:
+    span: SchemaTelemetrySpan | None = None,
+) -> str:
+    """The loop; returns why it ended (``AGENT_END_REASONS``)."""
     current = initial_context
     config = initial_config
     last_completed_turn: AgentTurnContext | None = None
     explicit_continuation = False
     pending: list[Any] = await _poll(config.get_steering_messages)
+    if span is not None and pending:
+        span.add_event("pi.agent.steering", {"pi.agent.message_count": len(pending)})
 
     while True:
         has_more_tool_calls = True
@@ -243,6 +274,8 @@ async def _run_loop(
                 # unless the earlier poll already returned messages (one-at-a-time would deliver two).
                 if not pending:
                     pending = await _poll(config.get_steering_messages)
+                    if span is not None and pending:
+                        span.add_event("pi.agent.steering", {"pi.agent.message_count": len(pending)})
                 await _emit(emit, TurnStartEvent())
 
             for message in _declare_tool_changes(current, [*prepared, *pending]):
@@ -266,7 +299,7 @@ async def _run_loop(
                         reasoning=_apply_thinking_level(config.reasoning, request_update.thinking_level),
                     )
 
-            message = await _stream_assistant_response(current, config, signal, emit, stream_function)
+            message = await _stream_assistant_response(current, config, signal, emit, stream_function, span)
             new_messages.append(message)
 
             if message.stop_reason in ("error", "aborted"):
@@ -275,7 +308,7 @@ async def _run_loop(
                     await maybe_await(config.finish_turn(last_completed_turn, signal))
                 await _emit(emit, TurnEndEvent(message, []))
                 await _emit(emit, AgentEndEvent(new_messages))
-                return
+                return message.stop_reason
 
             tool_calls = [block for block in message.content if block.type == "toolCall"]
             tool_results: list[ToolResultMessage] = []
@@ -302,14 +335,18 @@ async def _run_loop(
             action = _decision_action(decision)
             if action == "end":
                 await _emit(emit, AgentEndEvent(new_messages))
-                return
+                return "ended"
             explicit_continuation = action == "continue"
             pending = await _poll(config.get_steering_messages)
+            if span is not None and pending:
+                span.add_event("pi.agent.steering", {"pi.agent.message_count": len(pending)})
             if has_more_tool_calls or pending:
                 explicit_continuation = False
 
         follow_ups = await _poll(config.get_follow_up_messages)
         if follow_ups:
+            if span is not None:
+                span.add_event("pi.agent.follow_up", {"pi.agent.message_count": len(follow_ups)})
             explicit_continuation = False
             pending = follow_ups
             continue
@@ -320,6 +357,7 @@ async def _run_loop(
         break
 
     await _emit(emit, AgentEndEvent(new_messages))
+    return "completed"
 
 
 async def _poll(source: Callable[[], Awaitable[list[Any]]] | None) -> list[Any]:
@@ -388,6 +426,7 @@ async def _stream_assistant_response(
     signal: AbortSignal | None,
     emit: AgentEventSink,
     stream_function: StreamFn,
+    span: SchemaTelemetrySpan | None = None,
 ) -> AssistantMessage:
     messages = context.messages
     if config.transform_context is not None:
@@ -407,6 +446,9 @@ async def _stream_assistant_response(
         options["api_key"] = resolved_key
     if signal is not None:
         options["signal"] = signal
+    if span is not None:
+        # The run span is the explicit parent of the request's pi.ai.request span.
+        options["telemetry_context"] = span
     response = await maybe_await(stream_function(config.model, llm_context, options))
     thinking_level = config.reasoning or "off"
 

@@ -35,6 +35,7 @@ from typing import Any, Final, Protocol, TypeAlias
 from pi_ai.abort import AbortController, AbortSignal
 from pi_chord.context import Context
 from pi_chord.json import JsonValue
+from pi_telemetry import NOOP_TELEMETRY_CONTEXT, TelemetryContext
 
 from ..identifier import is_codemode_identifier, to_codemode_identifier
 from ..types import (
@@ -646,6 +647,7 @@ class CodemodeSandboxBase:
         context: Context | None = None,
         timeout_ms: float | None = None,
         store: Mapping[str, Any] | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ) -> CodemodeResult:
         """Run ``code``, the body of an async function: top-level ``await`` and ``return`` work.
 
@@ -658,9 +660,39 @@ class CodemodeSandboxBase:
                 used when no signal is given.
             timeout_ms: Overrides the sandbox default for this execution.
             store: Values the script reads with ``load(key)``. Must be JSON-serializable.
+            telemetry_context: Parent of the execution's ``pi.codemode.run`` span (see
+                :mod:`pi_codemode.telemetry`); without one nothing is recorded.
         """
         if self._closed:
             raise RuntimeError("Sandbox is closed")
+        if telemetry_context is None or telemetry_context is NOOP_TELEMETRY_CONTEXT:
+            return await self._execute(code, signal, context, timeout_ms, store)
+        from ..telemetry import record_codemode_result, trace_codemode_run
+
+        effective_timeout = self._timeout_ms if timeout_ms is None else timeout_ms
+
+        async def run(span: Any) -> CodemodeResult:
+            result = await self._execute(code, signal, context, timeout_ms, store)
+            record_codemode_result(span, result, effective_timeout)
+            return result
+
+        return await trace_codemode_run(
+            telemetry_context,
+            code,
+            mode="execute",
+            timeout_ms=effective_timeout,
+            tool_count=len(self._tools_by_name),
+            run=run,
+        )
+
+    async def _execute(
+        self,
+        code: str,
+        signal: AbortSignal | None,
+        context: Context | None,
+        timeout_ms: float | None,
+        store: Mapping[str, Any] | None,
+    ) -> CodemodeResult:
         tools = dict(self._tools_by_name)
         execution = _Execution(
             code=code,

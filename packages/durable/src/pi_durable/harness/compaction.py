@@ -24,6 +24,7 @@ from pi_chord.context import Context
 
 from ..entries import CompactionEntry
 from ..tasks import define_task
+from ..telemetry import phase_span
 from ..types import ConversationId, EntryId, Task, TaskId, Tx
 from .live import (
     LiveDoc,
@@ -231,6 +232,10 @@ async def _summarize(task: Any, runtime: Any, context: Context) -> None:
     thinking = request["thinkingLevel"]
     if thinking != "off":
         options["reasoning"] = thinking
+    span = phase_span(runtime)
+    if span is not None:
+        # The compaction phase's pi.harness.task span is the parent of the summary request.
+        options["telemetry_context"] = span
     message: AssistantMessage = await runtime.models.complete_simple(model, {"messages": messages}, options)
     # An abort mark or close: the abort invocation or the reopened task handles the committed state.
     runtime.signal.throw_if_aborted()

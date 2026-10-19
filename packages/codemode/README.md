@@ -268,6 +268,28 @@ async with CodemodeSandbox() as sandbox:
 
 A run has no deadline unless `timeout_ms` is given. Result numbers must run 1, 2, ... without gaps. The same script, `started_at`, `seed`, tools (with their `js_name`), globals and store, answered with the same results in the same order, makes the same calls with the same arguments and produces the same output on any sandbox with the same fingerprint. A host replays a run by starting it again from the same start data and delivering its journaled results in their order, each once the sandbox has made the call it answers; when a replayed script makes another call than the journal holds, or its `on_idle` counts differ from the journaled ones, it took a different path, and the host ends it. To end a run with an error the script cannot catch, abort its `signal`. A failed answer (`{"ok": False, "message": ...}`) raises `Exception(message)`; its optional `properties` are validated but not visible to the script, since Monty exceptions hold only a message.
 
+## Telemetry
+
+`execute()` and `create_codemode_tool()` take a [`pi_telemetry`](../telemetry/README.md) context as `telemetry_context` (an addition to upstream): each run then records a `pi.codemode.run` span with the script's line count, its deadline, the number of tool calls, the duration, and the outcome or error kind (`script`, `timeout`, `aborted`, `sandbox`), with a `pi.codemode.timeout` event when the deadline expires. Without a context nothing is recorded. The span never holds the script, its arguments, output or error text, unless the context opted in with `with_content_capture()`.
+
+```python
+from pi_codemode import CodemodeSandbox, CodemodeTool
+from pi_telemetry import InMemoryTelemetryContext
+
+
+async def double(args, context):
+    return args["n"] * 2
+
+
+telemetry = InMemoryTelemetryContext()
+async with CodemodeSandbox(tools=[CodemodeTool("double", double)]) as traced:
+    await traced.execute("return await tools.double(n=21)", telemetry_context=telemetry)
+[span] = telemetry.get_spans()
+print(span.name, span.attributes["pi.codemode.outcome"], span.attributes["pi.codemode.nested_call_count"])
+```
+
+Hosts of deterministic runs record the span with `pi_codemode.telemetry.trace_codemode_run()`; pi_durable's code mode tool does, adding whether the run replayed a journal after a restart and a `pi.codemode.different_path` event when a replay diverges. `pi_telemetry` is pi_codemode's only other pi dependency, and needs nothing.
+
 ## Results
 
 `execute()` never raises for script failures. `result.error.kind` is one of:

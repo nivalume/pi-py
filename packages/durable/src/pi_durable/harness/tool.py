@@ -32,11 +32,15 @@ from pi_chord.output import (
     bound_output,
     utf8_byte_length,
 )
+from pi_telemetry import NOOP_TELEMETRY_CONTEXT, SchemaTelemetrySpan, bind_typed_span_starter, is_telemetry_enabled
+from pi_telemetry import record_content as record_telemetry_content
 
 from ..documents import define_doc_family
 from ..entries import AssistantEntry, ToolResultEntry
 from ..errors import error_message
 from ..tasks import define_task
+from ..telemetry import STARTER as TELEMETRY_STARTER
+from ..telemetry import TOOL_ERROR_KINDS, TOOL_SPAN
 from ..truncate import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
 from ..types import ConversationId, EntryId, Task, TaskDocFamilyToken, TaskId, Tx
 from .agent import tool_extension
@@ -152,14 +156,37 @@ async def _call(task: Any, runtime: Any, context: Context) -> None:
     task_input = task["input"]
     call = await _read_call(runtime, task_input, context)
     tool = await _resolve_tool(runtime, task_input, call.name, context)
+    await _traced_tool(
+        runtime,
+        task,
+        "call",
+        call,
+        tool,
+        context,
+        lambda telemetry: _call_body(runtime, task_input, call, tool, telemetry, context),
+    )
+
+
+async def _call_body(
+    runtime: Any,
+    task_input: Any,
+    call: ToolHookCall,
+    tool: ToolRegistration | None,
+    telemetry: _ToolTelemetry,
+    context: Context,
+) -> None:
     if tool is None:
         error = harness_error("tool_unavailable", f"Tool {call.name} is not available")
-        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: error, context)
+        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: error, context, telemetry=telemetry)
+    telemetry.content("tool_arguments", call.arguments, call.name)
     prepared = _prepare(tool, call.arguments)
     checked = prepared if "error" in prepared else _validate(tool, call, prepared["args"])
     if "error" in checked:
         failure = checked["error"]
-        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context)
+        telemetry.validation_failed("arguments")
+        return await _settle(
+            runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context, telemetry=telemetry
+        )
     state: dict[str, Any] = {"args": checked["json"], "block": None}
 
     async def before_tool(hook: Any) -> None:
@@ -180,11 +207,15 @@ async def _call(task: Any, runtime: Any, context: Context) -> None:
     await runtime.hooks.each("before_tool", before_tool)
     if state["block"] is not None:
         blocked = harness_error("blocked", f"Tool call blocked: {state['block']}")
-        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: blocked, context)
+        telemetry.blocked()
+        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: blocked, context, telemetry=telemetry)
     validated = _validate(tool, call, state["args"])
     if "error" in validated:
         failure = validated["error"]
-        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context)
+        telemetry.validation_failed("hook_arguments")
+        return await _settle(
+            runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context, telemetry=telemetry
+        )
     # Strict JSON: repair may set optional properties to UNDEFINED, which the slot and checkpoint cannot hold.
     final: dict[str, Any] = copy_json(validated["json"], omit_undefined_properties=True)  # type: ignore[assignment]
 
@@ -201,16 +232,36 @@ async def _call(task: Any, runtime: Any, context: Context) -> None:
         return {"status": "running", "checkpoint": checkpoint}
 
     await runtime.commit(intent, context)
-    await _run(runtime, task_input, call, tool, final, validated["args"], context)
+    await _run(runtime, task_input, call, tool, final, validated["args"], context, telemetry)
 
 
 async def _execute(task: Any, runtime: Any, context: Context) -> None:
     """Recovery after intent: rerun only when the stored and the current policy both say ``safe``."""
-    checkpoint = task["state"]["checkpoint"]
-    args = checkpoint["arguments"]
     task_input = task["input"]
     call = await _read_call(runtime, task_input, context)
     tool = await _resolve_tool(runtime, task_input, call.name, context)
+    await _traced_tool(
+        runtime,
+        task,
+        "execute",
+        call,
+        tool,
+        context,
+        lambda telemetry: _execute_body(runtime, task, call, tool, telemetry, context),
+    )
+
+
+async def _execute_body(
+    runtime: Any,
+    task: Any,
+    call: ToolHookCall,
+    tool: ToolRegistration | None,
+    telemetry: _ToolTelemetry,
+    context: Context,
+) -> None:
+    checkpoint = task["state"]["checkpoint"]
+    args = checkpoint["arguments"]
+    task_input = task["input"]
     if checkpoint["replay"] == "safe" and tool is not None and tool.replay == "safe":
         # The rerun reports from scratch; clear what the interrupted attempt published.
         async def clear(tx: Tx, _current: Any) -> None:
@@ -219,15 +270,35 @@ async def _execute(task: Any, runtime: Any, context: Context) -> None:
                 clear_progress(slot)
 
         await runtime.commit(clear, context)
-        return await _run(runtime, task_input, call, tool, args, _execution_args(tool, args), context)
+        return await _run(runtime, task_input, call, tool, args, _execution_args(tool, args), context, telemetry)
     message = f"Tool {call.name} was interrupted and may have partially run"
     # ``failed`` records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
     ending = {"status": "failed", "message": message}
-    await _settle(runtime, task_input, call, ending, lambda slot: _from_slot(slot, "interrupted", message), context)
+    await _settle(
+        runtime,
+        task_input,
+        call,
+        ending,
+        lambda slot: _from_slot(slot, "interrupted", message),
+        context,
+        telemetry=telemetry,
+    )
 
 
 async def _abort(task: Any, runtime: Any, context: Context) -> None:
     call = await _read_call(runtime, task["input"], context)
+    await _traced_tool(
+        runtime,
+        task,
+        "abort",
+        call,
+        None,
+        context,
+        lambda telemetry: _abort_body(runtime, task, call, telemetry, context),
+    )
+
+
+async def _abort_body(runtime: Any, task: Any, call: ToolHookCall, telemetry: _ToolTelemetry, context: Context) -> None:
     # Abandoned after a restart (``TaskOptions.abandonOnRestart``): say whether the call may have run.
     if task.get("abortReason") != "restart":
         code, message = "aborted", f"Tool {call.name} was aborted"
@@ -236,7 +307,13 @@ async def _abort(task: Any, runtime: Any, context: Context) -> None:
     else:
         code, message = "abandoned", f"Tool {call.name} was not started: its caller ended with a restart"
     await _settle(
-        runtime, task["input"], call, {"status": "aborted"}, lambda slot: _from_slot(slot, code, message), context
+        runtime,
+        task["input"],
+        call,
+        {"status": "aborted"},
+        lambda slot: _from_slot(slot, code, message),
+        context,
+        telemetry=telemetry,
     )
 
 
@@ -365,8 +442,11 @@ class _ToolApi:
         state: dict[str, Any],
         execute_tool: Callable[..., Awaitable[NestedToolExecutionResult]],
         create_task: Callable[..., Awaitable[Any]],
+        telemetry_context: Any = NOOP_TELEMETRY_CONTEXT,
     ) -> None:
         self._runtime = runtime
+        #: The call's ``pi.harness.tool`` span (``NOOP_TELEMETRY_CONTEXT`` when telemetry is off).
+        self.telemetry_context = telemetry_context
         self._reported = reported
         self._progress = progress
         self._state = state
@@ -482,6 +562,7 @@ async def _run(
     args: Any,
     execution_args: Any,
     context: Context,
+    telemetry: _ToolTelemetry,
 ) -> None:
     """Execute with the resolved implementation, then settle its result."""
     limits_option = tool.output_limits or {}
@@ -578,7 +659,7 @@ async def _run(
         admissions.append(admission)
         return nested_key, admission
 
-    api = _ToolApi(runtime, call, reported, progress, state, execute_tool, create_task)
+    api = _ToolApi(runtime, call, reported, progress, state, execute_tool, create_task, telemetry.context)
     ending: dict[str, Any] = _COMPLETED
     duration_ms: float | None = None
     try:
@@ -609,7 +690,9 @@ async def _run(
     pending = await progress.stop()
     try:
         settled_result = await _final_result(runtime, input, call, tool, result, reported, context)
-        await _settle(runtime, input, call, ending, lambda _slot: settled_result, context, duration_ms)
+        await _settle(
+            runtime, input, call, ending, lambda _slot: settled_result, context, duration_ms, telemetry=telemetry
+        )
     except BaseException as error:
         for waiter in pending:
             if not waiter.done():
@@ -802,6 +885,8 @@ async def _settle(
     build: Callable[[Any], Any],
     context: Context,
     duration_ms: float | None = None,
+    *,
+    telemetry: _ToolTelemetry | None = None,
 ) -> None:
     """Commit the tool's terminal state and mark its slot done.
 
@@ -822,11 +907,14 @@ async def _settle(
     if nested_ids:
         await asyncio.gather(*(runtime.abort_owned(id, context) for id in nested_ids))
 
+    built: list[Any] = []
+
     async def change(tx: Tx, _current: Any) -> Any:
         conversation_id = runtime.conversation_id
         live = await tx.doc(LiveDoc, conversation_id)
         slot = tool_slot(live, runtime.task_id)
         result = build(None if slot is None else copy_json(slot))
+        built[:] = [result]
         settled: Any
         if input["kind"] == "nested":
             nested = _nested_result(runtime.task_id, result, duration_ms)
@@ -866,6 +954,8 @@ async def _settle(
         return {"status": "terminal", "outcome": {"status": "completed", "result": settled}}
 
     await runtime.commit(change, context)
+    if telemetry is not None and telemetry.span is not None and built:
+        telemetry.settled(ending, built[0], duration_ms)
 
 
 def _nested_result(task_id: TaskId[Any], result: Any, duration_ms: float | None) -> dict[str, Any]:
@@ -1008,6 +1098,140 @@ def _fallback_result(task_id: TaskId[Any], name: str, outcome: Any) -> NestedToo
 
 
 _COMPLETED: Final[dict[str, Any]] = {"status": "completed"}
+
+
+# ─── telemetry ──────────────────────────────────────────────────────────────
+
+
+class _ToolTelemetry:
+    """The call's ``pi.harness.tool`` span, or nothing when telemetry is off (``span`` is ``None``)."""
+
+    __slots__ = ("finished", "span")
+
+    def __init__(self, span: SchemaTelemetrySpan | None) -> None:
+        self.span = span
+        self.finished = False
+
+    @property
+    def context(self) -> Any:
+        return NOOP_TELEMETRY_CONTEXT if self.span is None else self.span
+
+    def blocked(self) -> None:
+        if self.span is not None:
+            self.span.add_event("pi.harness.tool.blocked")
+
+    def validation_failed(self, stage: str) -> None:
+        if self.span is not None:
+            self.span.add_event("pi.harness.tool.validation_failed", {"pi.harness.tool.validation_stage": stage})
+
+    def content(self, kind: str, value: Any, name: str | None = None) -> None:
+        span = self.span
+        if span is None or span.content_capture is None:
+            return
+        try:
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return
+        record_telemetry_content(span, kind, text, name=name)
+
+    def settled(self, ending: Mapping[str, Any], result: Mapping[str, Any], duration_ms: float | None) -> None:
+        """Record the outcome of the result the call settled with: kinds and sizes, never its text."""
+        span = self.span
+        if span is None:
+            return
+        self.finished = True
+        diagnostics = result.get("diagnostics") or []
+        codes = [entry.get("code") for entry in diagnostics if entry.get("severity") == "error"]
+        status = ending["status"]
+        kind: str | None = None
+        if status == "aborted":
+            outcome = "interrupted"
+            kind = next((code for code in codes if code in ("aborted", "interrupted", "abandoned")), "aborted")
+        elif status == "failed":
+            interrupted = "interrupted" in codes
+            outcome = "interrupted" if interrupted else "error"
+            kind = "interrupted" if interrupted else "tool_error"
+        elif result.get("isError") is True:
+            kind = next((code for code in codes if code in TOOL_ERROR_KINDS), "tool_error")
+            outcome = "blocked" if kind == "blocked" else "error"
+        else:
+            outcome = "success"
+        output = [item for item in result.get("output") or [] if isinstance(item, TextContent)]
+        attributes: dict[str, Any] = {
+            "pi.harness.tool.outcome": outcome,
+            "pi.harness.tool.error_kind": kind,
+            "pi.harness.tool.output_bytes": sum(utf8_byte_length(item.text) for item in output),
+            "pi.harness.tool.truncated": any(entry.get("code") == "truncated" for entry in diagnostics),
+        }
+        if duration_ms is not None:
+            attributes["pi.harness.tool.duration_ms"] = duration_ms
+        span.set_attributes(attributes)
+        if kind is not None:
+            span.set_status({"status": "error", "error": {"name": kind, "message": ""}})
+        if span.content_capture is not None:
+            for item in output:
+                self.content("tool_output", item.text)
+
+
+_NO_TOOL_TELEMETRY: Final = _ToolTelemetry(None)
+
+
+async def _traced_tool(
+    runtime: Any,
+    task: Any,
+    phase: str,
+    call: ToolHookCall,
+    tool: ToolRegistration | None,
+    context: Context,
+    body: Callable[[_ToolTelemetry], Awaitable[None]],
+) -> None:
+    """Run a tool phase inside its ``pi.harness.tool`` span when the runtime has a telemetry parent."""
+    parent = getattr(runtime, "telemetry_context", None)
+    if not is_telemetry_enabled(parent):
+        return await body(_NO_TOOL_TELEMETRY)
+    task_input = task["input"]
+    attributes: dict[str, Any] = {
+        "pi.harness.task_id": runtime.task_id,
+        "pi.harness.conversation_id": runtime.conversation_id,
+        "pi.harness.phase": phase,
+        "pi.harness.tool.name": call.name,
+        "pi.harness.tool.nested": task_input.get("kind") == "nested",
+        "pi.harness.restarts": task.get("restarts"),
+    }
+    if tool is not None:
+        attributes["pi.harness.tool.replay"] = "safe" if tool.replay == "safe" else "unsafe"
+        try:
+            attributes["pi.harness.tool.extension"] = tool_extension(await runtime.agent(context), tool.name)
+        except Exception:
+            pass
+    else:
+        checkpoint = task["state"].get("checkpoint") if isinstance(task.get("state"), dict) else None
+        replay = checkpoint.get("replay") if isinstance(checkpoint, dict) else None
+        if replay in ("safe", "unsafe"):
+            attributes["pi.harness.tool.replay"] = replay
+
+    async def run(span: SchemaTelemetrySpan, _child: Any) -> None:
+        telemetry = _ToolTelemetry(span)
+        bind = getattr(runtime, "bind_tool_span", None)
+        release = bind(span) if bind is not None else None
+        try:
+            await body(telemetry)
+        except BaseException as error:
+            if not telemetry.finished:
+                aborted = runtime.signal.aborted
+                span.set_attributes(
+                    {
+                        "pi.harness.tool.outcome": "interrupted" if aborted else "error",
+                        "pi.harness.tool.error_kind": "aborted" if aborted else "tool_error",
+                    }
+                )
+            span.set_status({"status": "error", "error": {"name": type(error).__name__, "message": ""}})
+            raise
+        finally:
+            if release is not None:
+                release()
+
+    await bind_typed_span_starter(parent, TELEMETRY_STARTER)(TOOL_SPAN, attributes, run)
 
 
 def _from_slot(slot: Any, code: str, message: str) -> ToolExecutionResult:

@@ -17,6 +17,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
+from pi_telemetry import NOOP_TELEMETRY_CONTEXT
+
 from . import *  # noqa: F403  (the compat entry point re-exports the root API)
 from . import __all__ as _root_all
 from .api.lazy import LazyApi
@@ -59,6 +61,7 @@ from .providers.all import (
 )
 from .providers.catalog import BUILTIN_PROVIDERS, load_catalog
 from .providers.faux import FauxModelDefinition, FauxProviderState, FauxResponseStep, create_faux_core
+from .telemetry import trace_request
 from .types import (
     AssistantImages,
     AssistantMessage,
@@ -417,6 +420,45 @@ def _resolve_api_provider(api: str) -> ApiProvider:
     return provider
 
 
+def _dispatch(
+    model: Model,
+    context: Context | Mapping[str, Any] | TranscriptContext,
+    options: Mapping[str, Any] | None,
+    kwargs: Mapping[str, Any],
+    simple: bool,
+    streaming: bool,
+) -> AssistantMessageEventStream:
+    transcript = normalize_context(context)
+    opts = _merge_options(options, kwargs)
+    builtin_provider = _get_builtin_provider_for_model(model)
+    if builtin_provider is not None:
+        if model.provider.startswith("cloudflare-") and not _has_resolved_cloudflare_auth(opts):
+            # ``Models`` resolves the auth, and traces the request itself.
+            models = _compat_models()
+            return models.stream_simple(model, transcript, opts) if simple else models.stream(model, transcript, opts)
+        target: Any = builtin_provider
+    else:
+        target = _resolve_api_provider(model.api)
+    request_options = _with_env_api_key(model, opts)
+    telemetry = None if request_options is None else request_options.get("telemetry_context")
+    if telemetry is None or telemetry is NOOP_TELEMETRY_CONTEXT:
+        if simple:
+            return target.stream_simple(model, transcript, request_options)
+        return target.stream(model, transcript, request_options)
+
+    async def setup(instrument: Callable[[dict[str, Any]], dict[str, Any]] | None = None) -> Any:
+        traced = dict(request_options or {})
+        if instrument is not None:
+            traced = instrument(traced)
+        if simple:
+            return target.stream_simple(model, transcript, traced)
+        return target.stream(model, transcript, traced)
+
+    return trace_request(
+        model, transcript, request_options or {}, "stream_simple" if simple else "stream", streaming, setup
+    )
+
+
 def stream(
     model: Model,
     context: Context | Mapping[str, Any] | TranscriptContext,
@@ -429,16 +471,9 @@ def stream(
     Built-in providers' models go through their provider (so provider request shaping
     applies); the API key comes from ``options["api_key"]`` or the provider's env var.
     Raises :class:`ValueError` when no implementation is registered for ``model.api``.
+    With a ``telemetry_context`` the request gets a ``pi.ai.request`` span, as through ``Models``.
     """
-    transcript = normalize_context(context)
-    opts = _merge_options(options, kwargs)
-    builtin_provider = _get_builtin_provider_for_model(model)
-    if builtin_provider is not None:
-        if model.provider.startswith("cloudflare-") and not _has_resolved_cloudflare_auth(opts):
-            return _compat_models().stream(model, transcript, opts)
-        return builtin_provider.stream(model, transcript, _with_env_api_key(model, opts))
-    provider = _resolve_api_provider(model.api)
-    return provider.stream(model, transcript, _with_env_api_key(model, opts))
+    return _dispatch(model, context, options, kwargs, False, True)
 
 
 async def complete(
@@ -448,7 +483,7 @@ async def complete(
     /,
     **kwargs: Any,
 ) -> AssistantMessage:
-    return await stream(model, context, options, **kwargs).result()
+    return await _dispatch(model, context, options, kwargs, False, False).result()
 
 
 def stream_simple(
@@ -459,15 +494,7 @@ def stream_simple(
     **kwargs: Any,
 ) -> AssistantMessageEventStream:
     """Like :func:`stream` with provider-neutral options (``reasoning="medium"``, ``tool_choice``...)."""
-    transcript = normalize_context(context)
-    opts = _merge_options(options, kwargs)
-    builtin_provider = _get_builtin_provider_for_model(model)
-    if builtin_provider is not None:
-        if model.provider.startswith("cloudflare-") and not _has_resolved_cloudflare_auth(opts):
-            return _compat_models().stream_simple(model, transcript, opts)
-        return builtin_provider.stream_simple(model, transcript, _with_env_api_key(model, opts))
-    provider = _resolve_api_provider(model.api)
-    return provider.stream_simple(model, transcript, _with_env_api_key(model, opts))
+    return _dispatch(model, context, options, kwargs, True, True)
 
 
 async def complete_simple(
@@ -477,7 +504,7 @@ async def complete_simple(
     /,
     **kwargs: Any,
 ) -> AssistantMessage:
-    return await stream_simple(model, context, options, **kwargs).result()
+    return await _dispatch(model, context, options, kwargs, True, False).result()
 
 
 # ---------------------------------------------------------------------------

@@ -211,7 +211,8 @@ class Harness(SessionImpl):
             return None if settings is None else settings.get("documentRetentionMs")
 
         # Read at each use, as all settings are, but only this field: it is read on every commit.
-        super().__init__(raw_storage, now, retention, options.get("setTimer"))
+        telemetry = options.get("telemetryContext")
+        super().__init__(raw_storage, now, retention, options.get("setTimer"), telemetry)
         # Every component reads and writes through the Session's failure guard: ``raw_storage`` serves only ``super()``.
         storage = self.storage
         self._options = options
@@ -247,6 +248,7 @@ class Harness(SessionImpl):
                 withdraw_inputs=withdraw_queued_inputs,
                 conversation=conversation,
                 context=without_abort_signal(context),
+                telemetry_context=telemetry,
             )
         )
         self.submissions = Submissions(self, storage, now, settings, self.tasks.resume)
@@ -260,7 +262,7 @@ class Harness(SessionImpl):
         """Open a Harness over ``storage``. The registry may keep changing while the Harness runs.
 
         ``options`` is the ``HarnessOptions`` dict (``models``, ``registry``, ``settings``, ``env``,
-        ``conversationCreated``, ``now``, ``setTimer``, ``onWake``, ``onReport``).
+        ``conversationCreated``, ``now``, ``setTimer``, ``onWake``, ``onReport``, ``telemetryContext``).
         """
         context.throw_if_aborted()
         snapshot = options["registry"].snapshot()

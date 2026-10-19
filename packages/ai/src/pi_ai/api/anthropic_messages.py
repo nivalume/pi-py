@@ -1505,6 +1505,7 @@ async def _stream_response(
                 max_retries=options.get("max_retries") or 0,
                 max_retry_delay_ms=options.get("max_retry_delay_ms"),
                 signal=signal,
+                telemetry_context=options.get("telemetry_context"),
             )
             break
         except Exception as error:

@@ -249,6 +249,7 @@ agent = Agent(
     finish_turn=finish_turn,
     thinking_budgets={"minimal": 128, "low": 512, "medium": 1024, "high": 2048},
     stream_options={"temperature": 0.2, "max_tokens": 4096},   # any other SimpleStreamOptions
+    telemetry_context=telemetry,          # pi_telemetry context: one pi.agent.run span per run (see Telemetry)
 )
 ```
 
@@ -394,6 +395,37 @@ These low-level streams are observational: they preserve event order but do not 
 for your event handling before later loop phases continue. Use `Agent` when message
 processing must be a barrier before tool preflight. `run_tool_call()` runs one tool call
 through the same preparation, validation and hooks without emitting events.
+
+## Telemetry
+
+`Agent(telemetry_context=...)` (or `AgentLoopConfig.telemetry_context`) takes a
+[`pi_telemetry`](../telemetry/README.md) context; this is an addition, upstream 1.3.0's agent-core records no spans.
+Each run then records a `pi.agent.run` span: the model, tool count and mode at the start; turns, tool calls, tokens,
+cost and the end reason (`completed`, `ended`, `error`, `aborted`, `failed`) at the end; `pi.agent.steering` and
+`pi.agent.follow_up` events when queued messages join the run. The loop passes the run span to the stream function as
+`telemetry_context`, so with `models.stream_simple` every model request is a child `pi.ai.request` span.
+
+```python
+from pi_agent import Agent, AgentInitialState
+from pi_ai import create_models, faux_assistant_message, faux_provider
+from pi_telemetry import InMemoryTelemetryContext
+
+faux = faux_provider()
+models = create_models()
+models.set_provider(faux.provider)
+faux.set_responses([faux_assistant_message("Hello!")])
+
+telemetry = InMemoryTelemetryContext()
+agent = Agent(initial_state=AgentInitialState(model=faux.get_model()), stream_fn=models, telemetry_context=telemetry)
+await agent.prompt("Hi")
+spans = telemetry.get_spans()
+names = {span.id: span.name for span in spans}
+print([(span.name, names.get(span.parent_id)) for span in spans])
+print(spans[0].attributes["pi.agent.end_reason"], spans[0].attributes["pi.agent.turns"])
+```
+
+Without a context nothing is recorded and requests get no `telemetry_context`. The span records counts and usage,
+never messages; the schema is `pi_agent.telemetry.AGENT_TELEMETRY_SCHEMA`.
 
 ## License
 

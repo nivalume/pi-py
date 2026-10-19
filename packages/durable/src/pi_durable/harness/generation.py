@@ -23,6 +23,7 @@ from pi_chord.json import copy_json
 
 from ..entries import AssistantEntry, ResetEntry, SystemEntry, UserEntry
 from ..tasks import define_task
+from ..telemetry import phase_span
 from ..types import ConversationId, EntryId, SubmissionId, SubmissionSettlement, Task, TaskId, Tx
 from .agent import add_tools, section_extension
 from .compaction import compaction_policy, create_compaction, estimate_context, select_cut
@@ -254,9 +255,24 @@ async def _request(task: Any, runtime: Any, context: Context) -> None:
     options["session_id"] = await ensure_provider_session_id(runtime, context)
     if thinking_level != "off":
         options["reasoning"] = thinking_level
+    span = phase_span(runtime)
+    if span is not None:
+        # The phase span is the explicit parent of the request's pi.ai.request span.
+        options["telemetry_context"] = span
     message = await _stream_response(runtime, model, messages[0], options, attempt, context)
+    if span is not None:
+        _record_response(span, message)
     request = {"attempt": attempt, "compacted": compacted, "model": ref, "cutoff": cutoff, "messages": view["messages"]}
     await _classify(runtime, request, message, context)
+
+
+def _record_response(span: Any, message: AssistantMessage) -> None:
+    span.set_attributes(
+        {
+            "pi.harness.generation.stop_reason": message.stop_reason,
+            "pi.harness.generation.tool_calls": sum(1 for block in message.content if block.type == "toolCall"),
+        }
+    )
 
 
 async def _retry(task: Any, runtime: Any, context: Context) -> None:
@@ -286,7 +302,13 @@ async def _poll(task: Any, runtime: Any, context: Context) -> None:
     if model is None:
         return await _fail_no_model(runtime, ref, context)
     handle = from_dict(DeferredHandle, checkpoint["handle"])
-    message = await runtime.models.fetch_deferred(model, handle, {"signal": runtime.signal})
+    fetch_options: dict[str, Any] = {"signal": runtime.signal}
+    span = phase_span(runtime)
+    if span is not None:
+        fetch_options["telemetry_context"] = span
+    message = await runtime.models.fetch_deferred(model, handle, fetch_options)
+    if span is not None:
+        _record_response(span, message)
     request = {
         "attempt": checkpoint["attempt"],
         "compacted": checkpoint.get("compacted"),

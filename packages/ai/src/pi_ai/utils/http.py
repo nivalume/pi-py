@@ -26,6 +26,7 @@ from typing import Any, Literal
 import httpx
 
 from ..abort import AbortError, AbortSignal, sleep
+from ..telemetry import record_http_status, record_retry
 from . import fastjson
 from .misc import get_provider_env_value
 
@@ -275,6 +276,7 @@ async def send_request(
         max_retry_delay_ms=options.get("max_retry_delay_ms") if options else None,
         signal=signal,
         no_retry_statuses=no_retry_statuses,
+        telemetry_context=options.get("telemetry_context") if options else None,
     )
 
 
@@ -329,11 +331,14 @@ async def retry_provider_request(
     max_retry_delay_ms: float | None = None,
     signal: AbortSignal | None = None,
     no_retry_statuses: Sequence[int] = (),
+    telemetry_context: Any = None,
 ) -> Any:
     """Retry ``request()`` like the OpenAI/Anthropic SDKs, with an interruptible backoff.
 
     Provider-requested delays above ``max_retry_delay_ms`` (60s by default, 0 disables)
-    fail immediately so outer retry logic can surface them.
+    fail immediately so outer retry logic can surface them. When ``telemetry_context`` is
+    the request's ``pi.ai.request`` span (the provider's ``options["telemetry_context"]``
+    under :class:`pi_ai.Models`), each retry adds a ``pi.ai.retry`` event to it.
     """
     retries_remaining = max_retries
     while True:
@@ -343,12 +348,19 @@ async def retry_provider_request(
             if signal is not None and signal.aborted:
                 raise AbortError(signal.reason) from error
             if retries_remaining <= 0 or not _is_retryable(error):
+                if telemetry_context is not None:
+                    record_http_status(telemetry_context, error.status)
                 raise
             if error.status is not None and error.status in no_retry_statuses:
+                if telemetry_context is not None:
+                    record_http_status(telemetry_context, error.status)
                 raise
             retry_index = max_retries - retries_remaining
             retries_remaining -= 1
-            await sleep(_retry_delay_ms(error, retry_index, max_retry_delay_ms) / 1000, signal)
+            delay_ms = _retry_delay_ms(error, retry_index, max_retry_delay_ms)
+            if telemetry_context is not None:
+                record_retry(telemetry_context, retry_index + 1, delay_ms, error.status)
+            await sleep(delay_ms / 1000, signal)
 
 
 # ---------------------------------------------------------------------------

@@ -138,6 +138,7 @@ async def post_json(
                 max_retry_delay_ms=options.get("max_retry_delay_ms"),
                 signal=signal,
                 no_retry_statuses=no_retry_statuses,
+                telemetry_context=options.get("telemetry_context"),
             )
     except AbortError as error:
         raise AbortError("Request aborted") from error

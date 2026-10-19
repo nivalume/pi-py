@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
     from pi_ai.abort import AbortSignal
     from pi_ai.models import Models
+    from pi_telemetry import TelemetryContext
 
     from .env import ExecutionEnv
     from .harness.types import Agent, ContextView, ConversationHandle, RegistrySnapshot, Settings, SettledTask
@@ -1618,6 +1619,12 @@ class TaskRuntime(DocumentObserver, DocumentReader, Protocol[I, S, R, H_co]):
     @property
     def models(self) -> Models:
         """``HarnessOptions.models``, resolved at each access."""
+        ...
+
+    @property
+    def telemetry_context(self) -> TelemetryContext:
+        """Parent context for telemetry of the running phase (see :mod:`pi_durable.telemetry`): the phase's span,
+        or ``NOOP_TELEMETRY_CONTEXT`` without ``HarnessOptions["telemetryContext"]``. Never persist it."""
         ...
 
     async def env(self, context: Context) -> ExecutionEnv | None:

@@ -16,9 +16,18 @@ from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 from pi_ai.abort import AbortController, AbortSignal
 from pi_chord.context import Context, await_with_context, with_abort_signal
 from pi_chord.json import copy_json
+from pi_telemetry import (
+    NOOP_TELEMETRY_CONTEXT,
+    SchemaTelemetrySpan,
+    TelemetryContext,
+    bind_typed_span_starter,
+    is_telemetry_enabled,
+)
 
 from ..errors import error_message
 from ..session._futures import consume, rejected
+from ..telemetry import GENERATION_SPAN, TASK_SPAN
+from ..telemetry import STARTER as TELEMETRY_STARTER
 from ..timers import Timers
 from ..types import (
     AnyTask,
@@ -126,6 +135,8 @@ class _Phase:
     snapshot: Callable[[], RegistrySnapshot]
     task: Callable[[], AnyTask]
     agent: asyncio.Future[Agent] | None = None
+    #: The running handler's telemetry parent (``runtime.telemetry_context``): its span while one is open.
+    telemetry: Any = NOOP_TELEMETRY_CONTEXT
 
 
 @dataclass(slots=True, eq=False)
@@ -248,6 +259,8 @@ class TaskSchedulerOptions:
     conversation: Callable[[ConversationId, InvocationBinding, Context], Awaitable[Any]]
     #: Context for scheduler commits and invocations; carries no caller cancellation.
     context: Context
+    #: ``HarnessOptions.telemetryContext``: parent of phase spans. Process-local, never persisted.
+    telemetry_context: TelemetryContext | None = None
 
 
 _REGISTRY: Final[ReportInfo] = {"type": "host_error", "callback": "registry"}
@@ -298,6 +311,10 @@ class TaskScheduler:
         self._withdraw_inputs = options.withdraw_inputs
         self._conversation = options.conversation
         self._context = options.context
+        telemetry = options.telemetry_context
+        self._telemetry: TelemetryContext | None = telemetry if is_telemetry_enabled(telemetry) else None
+        #: Open ``pi.harness.tool`` spans by task, so a nested call's span becomes a child of its caller's. Memory only.
+        self._tool_spans: dict[TaskId[Any], Any] = {}
         self._live: dict[TaskId[Any], AnyTaskRecord] = {}
         #: Context range last read through a task runtime, per conversation, and when it was first seen idle.
         self._contexts: dict[ConversationId, list[Any]] = {}
@@ -1700,7 +1717,16 @@ class TaskScheduler:
             phase.agent = None
             try:
                 handler = state.task.definition.phases[checkpoint["phase"]]
-                await handler(current, runtime, invocation.context)  # type: ignore[arg-type]
+                if self._telemetry is None:
+                    await handler(current, runtime, invocation.context)  # type: ignore[arg-type]
+                else:
+                    await self._traced_phase(
+                        invocation,
+                        current,
+                        checkpoint,
+                        phase,
+                        lambda handler=handler, current=current: handler(current, runtime, invocation.context),  # type: ignore[misc]
+                    )
                 previous = _PhaseResult(checkpoint)
             except Exception as error:
                 previous = _PhaseResult(checkpoint, error, True)
@@ -1757,13 +1783,92 @@ class TaskScheduler:
         try:
             phase = _Phase(snapshot=lambda: reservation.snapshot, task=lambda: reservation.task)
             runtime = _Runtime(self, invocation, phase)
-            await reservation.task.definition.abort(current, runtime, invocation.context)  # type: ignore[arg-type]
+            abort = reservation.task.definition.abort
+            if self._telemetry is None:
+                await abort(current, runtime, invocation.context)  # type: ignore[arg-type]
+            else:
+                checkpoint = {**cast(Any, current["state"]).get("checkpoint", {}), "phase": "abort"}
+                await self._traced_phase(
+                    invocation,
+                    current,
+                    checkpoint,
+                    phase,
+                    lambda: abort(current, runtime, invocation.context),  # type: ignore[arg-type]
+                )
         except Exception as error:
             failure = error
         message = f"Abort handler of task {invocation.task_id} returned without a terminal outcome"
         await self._step(
             invocation, lambda _tx, _current: _Fault(failure if failure is not None else RuntimeError(message))
         )
+
+    async def _traced_phase(
+        self,
+        invocation: _Invocation,
+        record: AnyTaskRecord,
+        checkpoint: Any,
+        phase: _Phase,
+        call: Callable[[], Awaitable[Any]],
+    ) -> None:
+        """Run one handler under its telemetry span; tool tasks open their own (``pi.harness.tool``)."""
+        telemetry = self._telemetry
+        assert telemetry is not None
+        kind = invocation.kind
+        if kind == "pi.tool":
+            phase.telemetry = self._tool_parent(record, telemetry)
+            try:
+                await call()
+            finally:
+                phase.telemetry = NOOP_TELEMETRY_CONTEXT
+            return
+        attributes: dict[str, Any] = {
+            "pi.harness.task_id": invocation.task_id,
+            "pi.harness.conversation_id": invocation.conversation_id,
+            "pi.harness.phase": checkpoint.get("phase") if isinstance(checkpoint, dict) else None,
+            "pi.harness.restarts": record.get("restarts"),
+        }
+        if kind == "pi.generation":
+            name = GENERATION_SPAN
+            attributes["pi.harness.attempt"] = checkpoint.get("attempt")
+            model = checkpoint.get("model")
+            if isinstance(model, dict):
+                attributes["pi.harness.model.provider"] = model.get("provider")
+                attributes["pi.harness.model.id"] = model.get("modelId")
+        else:
+            name = TASK_SPAN
+            attributes["pi.harness.task.kind"] = kind
+            attributes["pi.harness.task.extension"] = invocation.extension
+        signal = invocation.controller.signal
+
+        async def body(span: SchemaTelemetrySpan, _child: Any) -> None:
+            phase.telemetry = span
+            started = asyncio.get_running_loop().time()
+            outcome = "returned"
+            try:
+                await call()
+            except BaseException as error:
+                outcome = "aborted" if signal.aborted else "raised"
+                span.set_status({"status": "error", "error": {"name": type(error).__name__, "message": ""}})
+                raise
+            finally:
+                phase.telemetry = NOOP_TELEMETRY_CONTEXT
+                span.set_attributes(
+                    {
+                        "pi.harness.phase_outcome": outcome,
+                        "pi.harness.duration_ms": round((asyncio.get_running_loop().time() - started) * 1000, 3),
+                    }
+                )
+
+        await bind_typed_span_starter(telemetry, TELEMETRY_STARTER)(name, attributes, body)
+
+    def _tool_parent(self, record: AnyTaskRecord, root: TelemetryContext) -> TelemetryContext:
+        """A nested call's span parents to its caller's span while that is open here; anything else to the root."""
+        task_input = record.get("input")
+        if isinstance(task_input, dict) and task_input.get("kind") == "nested":
+            caller = self._tool_spans.get(task_input.get("parent"))  # type: ignore[arg-type]
+            if caller is not None:
+                return caller
+        return root
 
     async def _step(self, invocation: _Invocation, decide: Callable[[Any, AnyTaskRecord], Any]) -> AnyTaskRecord | None:
         """One synchronous decision on the Session line."""
@@ -2033,6 +2138,24 @@ class _Runtime:
     @property
     def models(self) -> Any:
         return self._scheduler._models()
+
+    @property
+    def telemetry_context(self) -> Any:
+        """The running phase's telemetry parent: its span, or ``NOOP_TELEMETRY_CONTEXT``."""
+        return self._phase.telemetry
+
+    def bind_tool_span(self, span: Any) -> Callable[[], None]:
+        """Internal (``pi.tool``): make ``span`` the parent of this call's nested calls until the returned
+        function runs."""
+        spans = self._scheduler._tool_spans
+        task_id = self.task_id
+        spans[task_id] = span
+
+        def release() -> None:
+            if spans.get(task_id) is span:
+                del spans[task_id]
+
+        return release
 
     @property
     def settings(self) -> Any:

@@ -29,6 +29,7 @@ essential for agentic workflows. Image and classifier catalogs use their own cap
 - [Context serialization](#context-serialization)
 - [OAuth providers](#oauth-providers)
 - [Legacy global API](#legacy-global-api)
+- [Telemetry](#telemetry)
 - [Performance notes](#performance-notes)
 - [Differences from the TypeScript package](#differences-from-the-typescript-package)
 
@@ -795,6 +796,41 @@ from pi_ai.compat import complete, get_model
 
 New code should use `create_models()` and provider factories.
 
+## Telemetry
+
+Every request option surface accepts `telemetry_context`, a [`pi_telemetry`](../telemetry/README.md) context: the
+explicit parent of the telemetry a request produces. As upstream, `build_base_options()` passes it on, so every
+provider receives it in its options.
+
+Beyond upstream, `Models` (and `pi_ai.compat`) record one `pi.ai.request` span per chat request: `stream`,
+`stream_simple`, `complete`, `complete_simple`, `stream_deferred` and `fetch_deferred`, whichever provider serves it.
+It carries the provider, API, model, operation, reasoning level, tool and message counts, the session ID when set,
+and at the end token usage, cost, stop reason, time to first token, duration, HTTP status, retry count and response
+model; retries (`pi.ai.retry`, from the HTTP retry path), context overflows and aborts are events, and a failure sets
+an error status with its kind only. The provider receives the request span as `telemetry_context`, so its own spans
+nest under it.
+
+```python
+from pi_ai import Context, UserMessage, create_models, faux_assistant_message, faux_provider
+from pi_telemetry import InMemoryTelemetryContext
+
+faux = faux_provider()
+models = create_models()
+models.set_provider(faux.provider)
+faux.set_responses([faux_assistant_message("Hi there")])
+
+telemetry = InMemoryTelemetryContext()
+await models.complete(faux.get_model(), Context(messages=[UserMessage("Hello")]), telemetry_context=telemetry)
+[span] = telemetry.get_spans()
+print(span.name, {key: span.attributes[key] for key in ("pi.ai.provider", "pi.ai.stop_reason", "pi.ai.usage.output_tokens")})
+```
+
+Without a `telemetry_context` (or with `NOOP_TELEMETRY_CONTEXT`) nothing is built: the request runs exactly as before,
+with no measurable cost. By default the span holds no prompt, completion, thinking, tool arguments, headers or error
+text; `pi_telemetry.with_content_capture()` opts in. The `pi.ai` schema is `pi_ai.telemetry.AI_TELEMETRY_SCHEMA`;
+`pi_telemetry.otel` exports it to OpenTelemetry with the GenAI semantic conventions and metrics. Image generation and
+classification receive `telemetry_context` but record no span.
+
 ## Performance notes
 
 - Streaming objects are slotted dataclasses; the event queue is a deque with direct
@@ -827,7 +863,8 @@ New code should use `create_models()` and provider factories.
   `google-genai`, and `boto3` in place of `@aws-sdk/client-bedrock-runtime`). Error messages
   keep the JS SDK wording that pi's overflow and retry detection rely on.
 - Cloudflare Workers AI *bindings* (Workers runtime only) are not available.
-- Telemetry options (`telemetry_context`) are accepted and ignored.
+- `telemetry_context` is propagated as upstream does; `Models` additionally records `pi.ai.request` spans (see
+  [Telemetry](#telemetry)).
 
 ## License
 

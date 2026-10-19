@@ -30,6 +30,7 @@ DEFAULT_THINKING_BUDGETS: dict[str, int] = {"minimal": 1024, "low": 2048, "mediu
 _BASE_OPTION_KEYS = (
     "temperature",
     "signal",
+    "telemetry_context",
     "http_client",
     "transport",
     "cache_retention",
