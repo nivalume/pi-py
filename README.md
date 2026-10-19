@@ -9,12 +9,14 @@ PyPI as one package, `pi-ai-python`, with these import packages:
 | [`pi_agent`](https://github.com/nivalume/pi-py/blob/main/packages/agent/README.md) | `@earendil-works/pi-agent-core` | Stateful agent: tool execution (parallel or sequential), steering and follow-up queues, lifecycle events, hooks |
 | [`pi_durable`](https://github.com/nivalume/pi-py/blob/main/packages/durable/README.md) | `@earendil-works/pi-durable` | Durable agent harness: conversations, model turns, tool calls and your own state are committed to storage (memory, SQLite, JSONL) before anything is shown, and work resumes after a crash or restart |
 | [`pi_chord`](https://github.com/nivalume/pi-py/blob/main/packages/chord/README.md) | `@earendil-works/chord` (subset) | What `pi_durable` builds on: explicit cancellation contexts, strict JSON, the transactional JSON tracker and op batches, replicated state, bounded output, an async SQLite layer |
+| [`pi_codemode`](https://github.com/nivalume/pi-py/blob/main/packages/codemode/README.md) | `@earendil-works/pi-codemode` | Code mode: model-written Python, run in the Monty sandbox, whose only capability is calling injected tools; Python declarations for the model, deterministic runs for durable replay |
 
 ```bash
 pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
 pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
 pip install "pi-ai-python[images]"     # + Pillow, for pi_durable's image processor
-pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow
+pip install "pi-ai-python[codemode]"   # + pydantic-monty, the sandbox of pi_codemode
+pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow, pydantic-monty
 ```
 
 中文说明见 [README.zh-CN.md](https://github.com/nivalume/pi-py/blob/main/README.zh-CN.md)。
@@ -163,9 +165,10 @@ uv run python benchmarks/bench_stream.py
 uv run python benchmarks/bench_chord_delta.py
 uv run python benchmarks/bench_chord_sqlite.py
 uv run python benchmarks/bench_durable_storage.py --quick
+uv run python benchmarks/bench_codemode.py --quick
 ```
 
-The port tracks pi 1.3.0 (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-durable`, `chord`).
+The port tracks pi 1.3.0 (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-durable`, `pi-codemode`, `chord`).
 
 Model catalog data (`packages/ai/src/pi_ai/providers/data/*.json`) is the generated
 catalog shipped with `@earendil-works/pi-ai` 1.3.0.

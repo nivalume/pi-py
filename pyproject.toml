@@ -37,7 +37,9 @@ pydantic = ["pydantic>=2.6"]
 bedrock = ["boto3>=1.43"]
 # Image processing for pi_durable's read tool (pi_durable.images, on Pillow).
 images = ["pillow>=11"]
-all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43", "pillow>=11"]
+# Sandbox for pi_codemode scripts (pi_codemode.sandbox, on Monty).
+codemode = ["pydantic-monty>=1.2,<2"]
+all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43", "pillow>=11", "pydantic-monty>=1.2,<2"]
 
 [project.scripts]
 pi-ai = "pi_ai.cli:main"
@@ -58,6 +60,7 @@ packages = [
     "packages/agent/src/pi_agent",
     "packages/chord/src/pi_chord",
     "packages/durable/src/pi_durable",
+    "packages/codemode/src/pi_codemode",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -66,14 +69,17 @@ include = [
     "packages/agent/src",
     "packages/chord/src",
     "packages/durable/src",
+    "packages/codemode/src",
     "packages/ai/tests",
     "packages/agent/tests",
     "packages/chord/tests",
     "packages/durable/tests",
+    "packages/codemode/tests",
     "packages/ai/README.md",
     "packages/agent/README.md",
     "packages/chord/README.md",
     "packages/durable/README.md",
+    "packages/codemode/README.md",
     "packages/durable/DESIGN.md",
     "README.md",
     "README.zh-CN.md",
@@ -87,6 +93,7 @@ dev = [
     "boto3>=1.43",
     "pydantic>=2.9",
     "pillow>=11",
+    "pydantic-monty>=1.2,<2",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.8",
@@ -96,13 +103,13 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests", "packages/durable/tests"]
+testpaths = ["packages/ai/tests", "packages/agent/tests", "packages/chord/tests", "packages/durable/tests", "packages/codemode/tests"]
 addopts = "-q --import-mode=importlib"
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-src = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src"]
+src = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src", "packages/codemode/src"]
 extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
@@ -126,10 +133,10 @@ ignore = [
 "packages/*/tests/**" = ["ASYNC109", "ASYNC110", "RUF043"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["pi_ai", "pi_agent", "pi_chord", "pi_durable"]
+known-first-party = ["pi_ai", "pi_agent", "pi_chord", "pi_durable", "pi_codemode"]
 
 [tool.pyright]
-include = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src"]
+include = ["packages/ai/src", "packages/agent/src", "packages/chord/src", "packages/durable/src", "packages/codemode/src"]
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.11"

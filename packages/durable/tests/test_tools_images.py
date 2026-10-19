@@ -653,11 +653,13 @@ async def test_prepares_concurrent_images_and_starts_a_new_worker_after_close() 
 
 @needs_pillow
 async def test_runs_on_a_given_executor_also_a_process_pool() -> None:
+    import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
     from pi_durable.images import create_pillow_images
 
-    with ProcessPoolExecutor(max_workers=1) as executor:
+    # spawn, not fork: other libraries in the test process (Monty's runtime) keep threads alive.
+    with ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn")) as executor:
         result = await create_pillow_images(executor=executor).prepare(
             encode(4000, 1000, "png"), "image/png", DEFAULT_IMAGE_LIMITS
         )

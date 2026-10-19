@@ -8,6 +8,7 @@
 | [`pi_agent`](packages/agent/README.md) | `@earendil-works/pi-agent-core` | 有状态 Agent：工具执行（并行/串行）、steering 与 follow-up 队列、生命周期事件、钩子 |
 | [`pi_durable`](packages/durable/README.md) | `@earendil-works/pi-durable` | 持久化 Agent 运行时：会话、模型调用、工具调用和你自己的状态都先写入存储（内存、SQLite、JSONL）再对外展示，崩溃或重启后从断点继续 |
 | [`pi_chord`](packages/chord/README.md) | `@earendil-works/chord`（子集） | `pi_durable` 的底层：显式取消上下文、严格 JSON、事务式 JSON 跟踪与修改操作、可订阅状态、有界输出、异步 SQLite |
+| [`pi_codemode`](packages/codemode/README.md) | `@earendil-works/pi-codemode` | 代码模式：模型编写的 Python 在 Monty 沙箱中运行，唯一的能力是调用注入的工具；为模型生成 Python 声明，并支持可重放的确定性运行 |
 
 这些模块在 PyPI 上作为同一个包 `pi-ai-python` 发布。
 
@@ -18,7 +19,8 @@ pip install pi-ai-python                  # 依赖 httpx 和官方 SDK：anthrop
 pip install "pi-ai-python[bedrock]"       # 可选：boto3，用于 Amazon Bedrock
 pip install "pi-ai-python[fast]"          # 可选：orjson 加速 JSON 解码
 pip install "pi-ai-python[images]"        # 可选：Pillow，用于 pi_durable 的图片处理
-pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3 + pillow
+pip install "pi-ai-python[codemode]"      # 可选：pydantic-monty，pi_codemode 的沙箱
+pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3 + pillow + pydantic-monty
 ```
 
 开发环境：
