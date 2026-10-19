@@ -58,7 +58,17 @@ from .types import (
     TurnStartEvent,
 )
 
-__version__ = "1.3.0"
+
+def _distribution_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("pi-ai-python")
+    except PackageNotFoundError:  # running from a source tree without installed metadata
+        return "0.0.0"
+
+
+__version__ = _distribution_version()
 
 __all__ = [
     "__version__",

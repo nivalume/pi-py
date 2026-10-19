@@ -1,12 +1,14 @@
 # pi-py
 
 Python port of [pi](https://github.com/earendil-works/pi)'s core libraries, published on
-PyPI as one package, `pi-ai-python`, with two import packages:
+PyPI as one package, `pi-ai-python`, with these import packages:
 
 | Import | Upstream | What it does |
 | --- | --- | --- |
 | [`pi_ai`](https://github.com/nivalume/pi-py/blob/main/packages/ai/README.md) | `@earendil-works/pi-ai` | Unified LLM API: provider collections, auth resolution (API keys, OAuth), streaming events, token and cost tracking, tool calling, cross-provider context hand-off, image generation, classification |
 | [`pi_agent`](https://github.com/nivalume/pi-py/blob/main/packages/agent/README.md) | `@earendil-works/pi-agent-core` | Stateful agent: tool execution (parallel or sequential), steering and follow-up queues, lifecycle events, hooks |
+| [`pi_durable`](https://github.com/nivalume/pi-py/blob/main/packages/durable/README.md) | `@earendil-works/pi-durable` | Durable agent harness: conversations, model turns, tool calls and your own state are committed to storage (memory, SQLite, JSONL) before anything is shown, and work resumes after a crash or restart |
+| [`pi_chord`](https://github.com/nivalume/pi-py/blob/main/packages/chord/README.md) | `@earendil-works/chord` (subset) | What `pi_durable` builds on: explicit cancellation contexts, strict JSON, the transactional JSON tracker and op batches, replicated state, bounded output, an async SQLite layer |
 
 ```bash
 pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
@@ -58,6 +60,44 @@ agent = Agent(
 async for event in agent.events("What time is it in Tokyo?"):
     print(event.type)
 ```
+
+A durable conversation keeps its transcript, running turns and tool calls in storage. Run
+the same script again after a crash and `resume()` picks the work up where it stopped:
+
+```python
+import asyncio
+
+from pi_ai import create_models
+from pi_ai.providers.openai import openai_provider
+from pi_chord import BACKGROUND_CONTEXT
+from pi_durable import AssistantEntry, Harness, create_registry
+from pi_durable.storage.sqlite.stdlib import open_sqlite_storage
+
+
+async def main() -> None:
+    context = BACKGROUND_CONTEXT
+    models = create_models()
+    models.set_provider(openai_provider())  # reads OPENAI_API_KEY
+
+    storage = await open_sqlite_storage("./session.sqlite")
+    harness = await Harness.open(storage, {"models": models, "registry": create_registry()}, context)
+    root = await harness.root(context, agent={"model": {"provider": "openai", "modelId": "gpt-6-sol"}})
+    harness.resume()  # continue any run an earlier process left unfinished
+
+    submission = await root.submit({"type": "input", "content": "What is the capital of France?"}, context)
+    settled = await submission.wait(context)
+    if settled["status"] == "done" and settled["type"] == "input":
+        answer = await root.commit(lambda tx: tx.entry(AssistantEntry, settled["answer"]), context)
+        print(answer["model"][0].content[0].text if answer else None)
+    await harness.close(context)
+
+
+asyncio.run(main())
+```
+
+`pi_durable` stores records in the same format as TypeScript pi-durable, so a SQLite or JSONL
+storage written by one opens in the other. Not ported yet: the built-in coding tools
+(read/write/edit/bash/image), tool search, images and the code mode extension.
 
 ## Same API, Python conventions
 
@@ -118,7 +158,12 @@ uv run ruff check . && uv run ruff format --check .
 uv run pyright
 uv run python benchmarks/bench_partial_json.py
 uv run python benchmarks/bench_stream.py
+uv run python benchmarks/bench_chord_delta.py
+uv run python benchmarks/bench_chord_sqlite.py
+uv run python benchmarks/bench_durable_storage.py --quick
 ```
+
+The port tracks pi 1.3.0 (`@earendil-works/pi-ai`, `pi-agent-core`, `pi-durable`, `chord`).
 
 Model catalog data (`packages/ai/src/pi_ai/providers/data/*.json`) is the generated
 catalog shipped with `@earendil-works/pi-ai` 1.3.0.

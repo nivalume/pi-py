@@ -1,13 +1,15 @@
 # pi-py
 
-[pi](https://github.com/earendil-works/pi) 核心库的 Python 实现，包含两个模块：
+[pi](https://github.com/earendil-works/pi) 核心库的 Python 实现，包含以下模块：
 
 | Import 名 | 对应上游 | 作用 |
 | --- | --- | --- |
 | [`pi_ai`](packages/ai/README.md) | `@earendil-works/pi-ai` | 统一的 LLM API：provider 集合、鉴权解析（API key / OAuth）、流式事件、token 与费用统计、工具调用、跨 provider 上下文切换、图像生成、分类 |
 | [`pi_agent`](packages/agent/README.md) | `@earendil-works/pi-agent-core` | 有状态 Agent：工具执行（并行/串行）、steering 与 follow-up 队列、生命周期事件、钩子 |
+| [`pi_durable`](packages/durable/README.md) | `@earendil-works/pi-durable` | 持久化 Agent 运行时：会话、模型调用、工具调用和你自己的状态都先写入存储（内存、SQLite、JSONL）再对外展示，崩溃或重启后从断点继续 |
+| [`pi_chord`](packages/chord/README.md) | `@earendil-works/chord`（子集） | `pi_durable` 的底层：显式取消上下文、严格 JSON、事务式 JSON 跟踪与修改操作、可订阅状态、有界输出、异步 SQLite |
 
-两者在 PyPI 上作为同一个包 `pi-ai-python` 发布。
+这些模块在 PyPI 上作为同一个包 `pi-ai-python` 发布。
 
 ## 安装
 
@@ -72,6 +74,43 @@ async for event in agent.events("北京天气怎么样？"):
     if event.type == "message_update" and event.assistant_message_event.type == "text_delta":
         print(event.assistant_message_event.delta, end="")
 ```
+
+持久化会话把对话记录、进行中的模型调用和工具调用都存进存储。进程崩溃后重新运行同一个脚本，
+`resume()` 会从断点继续：
+
+```python
+import asyncio
+
+from pi_ai import create_models
+from pi_ai.providers.openai import openai_provider
+from pi_chord import BACKGROUND_CONTEXT
+from pi_durable import AssistantEntry, Harness, create_registry
+from pi_durable.storage.sqlite.stdlib import open_sqlite_storage
+
+
+async def main() -> None:
+    context = BACKGROUND_CONTEXT
+    models = create_models()
+    models.set_provider(openai_provider())  # 读取 OPENAI_API_KEY
+
+    storage = await open_sqlite_storage("./session.sqlite")
+    harness = await Harness.open(storage, {"models": models, "registry": create_registry()}, context)
+    root = await harness.root(context, agent={"model": {"provider": "openai", "modelId": "gpt-6-sol"}})
+    harness.resume()  # 继续上一个进程没跑完的工作
+
+    submission = await root.submit({"type": "input", "content": "What is the capital of France?"}, context)
+    settled = await submission.wait(context)
+    if settled["status"] == "done" and settled["type"] == "input":
+        answer = await root.commit(lambda tx: tx.entry(AssistantEntry, settled["answer"]), context)
+        print(answer["model"][0].content[0].text if answer else None)
+    await harness.close(context)
+
+
+asyncio.run(main())
+```
+
+`pi_durable` 的存储格式和 TypeScript 版 pi-durable 一致，一方写的 SQLite 或 JSONL 存储另一方可以直接打开。
+尚未移植：内置编码工具（read/write/edit/bash/image）、工具搜索、图片处理和 codemode 扩展。
 
 ## 与 pi 保持一致的 API
 

@@ -1,6 +1,6 @@
 name: Release
 
-# Publish the version in pyproject.toml to PyPI, either by pushing a tag like v1.3.0 or
+# Publish the version in pyproject.toml to PyPI, either by pushing a tag like v1.4.0 or
 # by running this workflow manually (Actions -> Release -> Run workflow), which then
 # creates the tag itself.
 on:
