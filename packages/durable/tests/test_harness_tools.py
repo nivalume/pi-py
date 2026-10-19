@@ -1134,3 +1134,14 @@ async def test_answers_an_aborted_tool_with_only_its_durable_output_discarding_b
         "durable\n|<harness>\n[error] Tool slow was aborted\n</harness>"
     )
     await opened.harness.close(context)
+
+
+def test_output_limits_bound_text_given_as_pi_json() -> None:
+    from pi_chord.output import OutputLimits
+    from pi_durable.harness.tool import _bound_content
+
+    content = [{"type": "text", "text": "x" * 100}, {"type": "image", "data": "AA==", "mimeType": "image/png"}]
+    bounded, dropped_bytes, _ = _bound_content(content, OutputLimits(max_bytes=10, max_lines=100, retain="head"))
+    assert dropped_bytes == 90
+    assert isinstance(bounded[0], TextContent) and len(bounded[0].text.encode()) <= 10
+    assert bounded[1].type == "image" and bounded[1].mime_type == "image/png"

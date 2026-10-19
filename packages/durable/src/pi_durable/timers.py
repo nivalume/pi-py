@@ -48,7 +48,11 @@ class Timers:
             disarm = self._arm(callback, delay_ms, {"background": False})
             if disarm is not None:
                 return disarm
-            self._fall_back(RuntimeError("HarnessOptions.setTimer declined a timer that paces work; using setTimeout"))
+            self._fall_back(
+                RuntimeError(
+                    "HarnessOptions.setTimer declined a timer that paces work; using the event loop's call_later"
+                )
+            )
         except Exception as error:
             self._fall_back(error)
         return native_timer(callback, delay_ms, {"background": False})

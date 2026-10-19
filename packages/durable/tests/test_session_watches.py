@@ -549,3 +549,15 @@ async def test_continues_after_the_tracker_cache_unloads(storage_backend: Storag
     await flush()
     assert watch.value["value"] == 7
     await watch.stop()
+
+
+async def test_watch_listeners_may_declare_fewer_arguments_like_javascript(storage_backend: StorageBackend) -> None:
+    _, session, _ = await create_state(storage_backend)
+    watch = await session.watch_doc(StateDoc, context)
+    values: list[Any] = []
+    watch.start(lambda value: values.append(value))
+    await session.commit(set_value(1), context)
+    await flush()
+    assert values and values[-1] is watch.value
+    await watch.stop()
+    await session.close(context)

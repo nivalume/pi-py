@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from typing import Any, Final, Generic, TypeAlias, TypeVar
 
 from pi_ai.abort import AbortSignal
+from pi_chord._callbacks import trim_arguments
 from pi_chord.context import Context, without_abort_signal
 from pi_chord.delta import Op
 from pi_chord.json import JsonObject
@@ -246,7 +247,8 @@ class CommittedWatch(Generic[T]):
         if self._end is not None:
             raise RuntimeError("Watch is stopped")
         self._started = True
-        self._listener = listener
+        # Called with (value, ops, context); a listener may declare only the leading ones.
+        self._listener = trim_arguments(listener, 3)
         if self._pending:
             self._schedule()
 

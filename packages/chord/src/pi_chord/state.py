@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, Protocol, TypeVar, overload
 
+from ._callbacks import trim_arguments
 from .context import BACKGROUND_CONTEXT, Context
 from .delta import Draft, Op, Prepared, Tracker, track
 
@@ -187,7 +188,8 @@ class _StateSubscriber(Generic[T]):
     __slots__ = ("_closed", "_listener", "_pending", "_report_error", "_running", "_started")
 
     def __init__(self, listener: StateListener[T], report_error: Callable[[Exception], None]) -> None:
-        self._listener = listener
+        # Called with (value, context, delivery); a listener may declare only the leading ones.
+        self._listener = trim_arguments(listener, 3)
         self._report_error = report_error
         self._pending: deque[_Delivery[T]] = deque()
         self._running = False

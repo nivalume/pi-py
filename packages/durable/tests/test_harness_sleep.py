@@ -305,7 +305,7 @@ async def test_arms_a_foreground_timer_the_host_declines_with_the_loop_timer_rep
     assert (await harness.wait_for_task(first, context))["state"]["outcome"]["status"] == "completed"
     assert (await harness.wait_for_task(second, context))["state"]["outcome"]["status"] == "completed"
     assert [str(error) for error in reports] == [
-        "HarnessOptions.setTimer declined a timer that paces work; using setTimeout"
+        "HarnessOptions.setTimer declined a timer that paces work; using the event loop's call_later"
     ]
     await harness.close(context)
 

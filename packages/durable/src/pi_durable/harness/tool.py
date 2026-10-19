@@ -12,7 +12,7 @@ import inspect
 import json
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, TypeVar, cast
 
 from pi_ai.serialization import content_from_dict, to_json_value
@@ -1127,6 +1127,8 @@ def _bound_content(content: Content, limits: OutputLimits) -> tuple[Content, int
     When the joined text exceeds the limits, the text items are replaced by one bounded item at the position of
     the first (head) or last (tail) text item; other content is kept.
     """
+    # Content given as pi JSON ({"type": "text", ...}) is decoded, so the limits apply to it too.
+    content = [_content_block(item) for item in content]
     texts = [item for item in content if isinstance(item, TextContent)]
     bounded = bound_output("".join(item.text for item in texts), limits)
     if bounded.dropped_bytes == 0:
@@ -1139,6 +1141,14 @@ def _bound_content(content: Content, limits: OutputLimits) -> tuple[Content, int
         elif item is keep:
             result.append(dataclasses.replace(item, text=bounded.text))
     return result, bounded.dropped_bytes, bounded.dropped_lines
+
+
+def _content_block(item: Any) -> Any:
+    if isinstance(item, Mapping) and item.get("type") in ("text", "image"):
+        from pi_ai.serialization import content_from_dict
+
+        return content_from_dict(item)
+    return item
 
 
 _POSITIVE_INTEGER: Final = re.compile(r"^[1-9][0-9]*$")

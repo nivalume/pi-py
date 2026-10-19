@@ -409,3 +409,13 @@ def test_disposes_the_attachment_when_activation_fails() -> None:
     with pytest.raises(RuntimeError, match="activation failed"):
         replicated_state(Source())
     assert disposed == [True]
+
+
+def test_listeners_may_declare_fewer_arguments_like_javascript() -> None:
+    state = replicated_state({"value": 0})
+    seen: list[Any] = []
+    state.subscribe(lambda value: seen.append(value["value"]))
+    state.subscribe(lambda value, context: seen.append(context is BACKGROUND_CONTEXT))
+    state.subscribe(lambda *arguments: seen.append(len(arguments)))
+    state.change(BACKGROUND_CONTEXT, lambda draft: draft.__setitem__("value", 1))
+    assert seen[-3:] == [1, True, 3]
