@@ -17,7 +17,8 @@
 pip install pi-ai-python                  # 依赖 httpx 和官方 SDK：anthropic、openai、google-genai
 pip install "pi-ai-python[bedrock]"       # 可选：boto3，用于 Amazon Bedrock
 pip install "pi-ai-python[fast]"          # 可选：orjson 加速 JSON 解码
-pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3
+pip install "pi-ai-python[images]"        # 可选：Pillow，用于 pi_durable 的图片处理
+pip install "pi-ai-python[all]"           # 可选：orjson + websockets + pydantic + boto3 + pillow
 ```
 
 开发环境：
@@ -110,7 +111,7 @@ asyncio.run(main())
 ```
 
 `pi_durable` 的存储格式和 TypeScript 版 pi-durable 一致，一方写的 SQLite 或 JSONL 存储另一方可以直接打开。
-尚未移植：内置编码工具（read/write/edit/bash/image）、工具搜索、图片处理和 codemode 扩展。
+已包含编码工具（`pi_durable.tools`：read/write/edit/bash）、工具搜索和基于 Pillow 的图片处理；尚未移植：codemode 扩展和 Cloudflare 适配器。
 
 ## 与 pi 保持一致的 API
 

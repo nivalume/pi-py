@@ -3,10 +3,9 @@
 Upstream only compile-checks the spec's examples; here each one runs: the Session sequences against a
 Session, the Harness sequences against a Harness with the faux provider.
 
-The coding tools of ``src/tools/`` (``CodingTools``, ``createReadTool``, ``createEditTool``,
-``createBashTool``) are not ported in phase 1; the examples that use them (section 7.1 ``Timing`` and
-``Venv``, the ``host`` and ``childInToolCommit`` sequences) run with plain stand-in tools of the same
-names. ``liveSettings`` is a settings function (``HarnessOptions.settings`` may be one), Python's
+The examples that use the coding tools (section 7.1 ``Timing`` and ``Venv``, the ``host`` and
+``childInToolCommit`` sequences) run the real ones from :mod:`pi_durable.tools`, with arguments the
+faux model sends and a ``.venv/bin/activate`` script for ``Venv``'s command prefix. ``liveSettings`` is a settings function (``HarnessOptions.settings`` may be one), Python's
 equivalent of upstream's class with getters; ``containerEnv`` builds a ``LocalExecutionEnv`` for both
 branches instead of a container.
 """
@@ -44,6 +43,7 @@ from pi_durable import (
     wrap_tool,
 )
 from pi_durable.env.local import LocalExecutionEnv
+from pi_durable.tools import CodingTools, create_bash_tool, create_edit_tool, create_read_tool
 
 
 async def _noop(*_args: Any) -> None:
@@ -171,9 +171,7 @@ async def test_sections_2_2_and_7_host_setup_tool_filters_extension_selection_pl
 ) -> None:
     setup = chat_setup()
     registry = setup.registry
-    # Stand-ins for createReadTool(), createEditTool() and createBashTool().
-    read_tool, edit_tool, bash_tool = tool("read"), tool("edit"), tool("bash")
-    CodingTools = define_extension("coding-tools", tools=[read_tool, edit_tool, bash_tool])
+    edit_tool, bash_tool = create_edit_tool(), create_bash_tool()
 
     # Section 7.1: extensions and host setup.
     ContextFiles = define_extension("context-files", sections=[section("agents-md", lambda _input, _c: "Use tabs.")])
@@ -217,12 +215,12 @@ async def test_sections_2_2_and_7_host_setup_tool_filters_extension_selection_pl
 
     Timing = define_extension("timing", wraps=[wrap_tool(bash_tool, timing)])
 
-    async def venv_bash(_args: Any, _api: Any, _context: Any) -> Any:
-        return {"output": [TextContent("in .venv")]}
-
     # A bash inside a Python virtualenv for one conversation: it replaces CodingTools' bash in place,
     # and Timing, if selected, wraps it.
-    Venv = define_extension("venv", tools=[define_tool(name="bash", description="bash in .venv", execute=venv_bash)])
+    Venv = define_extension("venv", tools=[create_bash_tool(command_prefix="source .venv/bin/activate")])
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "activate").write_text("VIRTUAL_ENV=.venv\n")
+    in_venv = {"command": "printf 'in %s' \"$VIRTUAL_ENV\""}
 
     # Section 7.2: hooks reading extension state.
     PlanModeDoc = define_doc(
@@ -297,18 +295,24 @@ async def test_sections_2_2_and_7_host_setup_tool_filters_extension_selection_pl
         [
             record(
                 faux_assistant_message(
-                    [faux_tool_call("edit", {}, id="e1"), faux_tool_call("bash", {}, id="b1")], stop_reason="toolUse"
+                    [
+                        faux_tool_call(
+                            "edit", {"path": "notes.txt", "edits": [{"oldText": "a", "newText": "b"}]}, id="e1"
+                        ),
+                        faux_tool_call("bash", in_venv, id="b1"),
+                    ],
+                    stop_reason="toolUse",
                 )
             ),
             record(faux_assistant_message([faux_text("done")])),
-            record(faux_assistant_message([faux_tool_call("bash", {}, id="b2")], stop_reason="toolUse")),
+            record(faux_assistant_message([faux_tool_call("bash", in_venv, id="b2")], stop_reason="toolUse")),
             record(faux_assistant_message([faux_text("again")])),
             record(faux_assistant_message([faux_text("bye")])),
         ]
     )
     settled = await (await root.submit({"type": "input", "content": "go"}, context)).wait(context)
     assert settled["status"] == "done"
-    assert requests[0].tools == ["read", "edit", "bash"]
+    assert requests[0].tools == ["read", "write", "edit", "bash"]
     assert requests[0].sections == {
         "preamble": "You are an expert coding assistant.",
         "cwd": f"<cwd>\nWorking directory: {tmp_path}\n</cwd>",
@@ -452,7 +456,7 @@ async def test_section_7_3_a_named_subagents_spawn_commit() -> None:
 
 async def test_section_2_2_a_tools_commit_creates_a_configured_child() -> None:
     setup = chat_setup()
-    read_tool = tool("read")  # stand-in for createReadTool()
+    read_tool = create_read_tool()
     worktree = "/tmp/worktree"
     created: list[Any] = []
 

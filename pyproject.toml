@@ -1,6 +1,6 @@
 [project]
 name = "pi-ai-python"
-version = "1.4.0"
+version = "1.5.0"
 description = "Python port of pi's AI libraries: a unified LLM API (pi_ai) and a stateful agent runtime (pi_agent)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,7 +35,9 @@ websocket = ["websockets>=13"]
 pydantic = ["pydantic>=2.6"]
 # Amazon Bedrock (bedrock-converse-stream) through the AWS SDK.
 bedrock = ["boto3>=1.43"]
-all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43"]
+# Image processing for pi_durable's read tool (pi_durable.images, on Pillow).
+images = ["pillow>=11"]
+all = ["orjson>=3.10", "websockets>=13", "pydantic>=2.6", "boto3>=1.43", "pillow>=11"]
 
 [project.scripts]
 pi-ai = "pi_ai.cli:main"
@@ -84,6 +86,7 @@ dev = [
     "websockets>=13",
     "boto3>=1.43",
     "pydantic>=2.9",
+    "pillow>=11",
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "ruff>=0.8",

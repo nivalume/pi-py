@@ -1,8 +1,4 @@
-"""Port of ``test/harness-tools-recovery.test.ts``.
-
-Dropped: "answers a real bash command interrupted by close and reopen, then finishes the run", which needs
-``createBashTool`` from ``src/tools/``, not ported in phase 1.
-"""
+"""Port of ``test/harness-tools-recovery.test.ts``."""
 
 from __future__ import annotations
 
@@ -30,6 +26,7 @@ from pi_chord.context import Context
 from pi_durable import GenerationTask, LiveDoc, ToolResultEntry, ToolTask, define_tool
 from pi_durable.env.local import LocalExecutionEnv
 from pi_durable.storage.sqlite.stdlib import open_sqlite_storage
+from pi_durable.tools import create_bash_tool
 
 
 async def open(path: Path, setup: ChatSetup, env: Any = None) -> Any:
@@ -318,6 +315,41 @@ async def test_lets_context_derivation_answer_a_faulted_tool_and_continues_the_r
     tasks = await opened.harness.commit(lambda tx: tx.scan_tasks({"conversationId": opened.root.id}, 20), context)
     faulted = next(task for task in tasks["items"] if task["kind"] == "pi.tool")
     assert match_object(faulted["state"], {"status": "terminal", "outcome": {"status": "faulted"}})
+    await opened.harness.close(context)
+
+
+async def test_answers_a_real_bash_command_interrupted_by_close_and_reopen_then_finishes_the_run(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "session.sqlite"
+    env = LocalExecutionEnv(cwd=str(tmp_path))
+    setup = chat_setup()
+    add_tool(setup.registry, create_bash_tool())
+    setup.faux.set_responses(
+        [
+            faux_assistant_message(
+                [faux_tool_call("bash", {"command": "echo started; sleep 30"}, id="b")], stop_reason="toolUse"
+            ),
+            DONE,
+        ]
+    )
+    opened = await open(path, setup, env)
+    id = (await opened.root.submit({"type": "input", "content": "go"}, context)).id
+
+    async def started() -> bool:
+        live = await opened.harness.snapshot(LiveDoc, opened.root.id, context)
+        tools = (live or {}).get("tools") or []
+        return bool(tools) and tools[0].get("output") == "started\n"
+
+    await wait_for(started)
+    await opened.harness.close(context)
+
+    opened = await open(path, setup, env)
+    assert await submission_status(opened.harness, id) == "done"
+    [result] = results(await all_entries(opened.root))
+    assert (
+        text(result) == "started\n|<harness>\n[error] Tool bash was interrupted and may have partially run\n</harness>"
+    )
     await opened.harness.close(context)
 
 

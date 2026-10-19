@@ -329,7 +329,7 @@ Rules:
 registry, submissions, task_graph, usage, util, view`, plus `stream.py` (no upstream module: it converts the
 stored camelCase `ConversationStreamOptions` to pi-ai's snake_case keyword options, and a resolved
 `ConversationRetryPolicy` to `pi_ai.utils.retry.RetryPolicy`). `pi_durable/__init__.py` now mirrors
-`index.ts` completely (except `src/tools/`, not ported in phase 1).
+`index.ts` completely.
 
 API shape:
 
@@ -413,3 +413,61 @@ Test helpers (`tests/durable_harness_support.py`, ports of `harness-support.ts`,
 - Races: Python commits settle in fewer loop turns than JavaScript's (an `await` of a completed
   awaitable does not yield), so a test that relies on a JS microtask interleaving may need an explicit
   gate. `test_harness_tasks.py`'s double-abort case holds the abort handler on a gate for that reason.
+
+## 11. Tools, tool search, and images (phase 2)
+
+| Upstream | Python |
+|---|---|
+| `tools/index.ts` | `pi_durable/tools/__init__.py`: `create_coding_tools(*, images=None)`, `CodingTools`, the `create_*_tool` factories and their types |
+| `tools/{read,write,edit,bash,image,env}.ts` | `pi_durable/tools/{read,write,edit,bash,image,env}.py` |
+| `tools/{edit-diff,image-processor,path-utils,file-mutation-queue}.ts` | `pi_durable/tools/{edit_diff,image_processor,path_utils,file_mutation_queue}.py` |
+| `diff` (jsdiff 8.0.4, npm) | `pi_durable/tools/_jsdiff.py` (private; BSD-3-Clause notice in its header) |
+| `tool-search/{index,tool-search}.ts` | `pi_durable/tool_search/{__init__,tool_search}.py` |
+| `images/index.ts`, `images/node.ts` (+ `node-worker.ts`) | `pi_durable/images/__init__.py` (Pillow): `prepare_image`, `PillowImages`, `create_pillow_images` |
+| `images/exif.ts` | `pi_durable/images/exif.py` |
+
+Not ported: `images/cloudflare.ts`, `images/photon-wasm.d.ts` (Photon-specific).
+
+API shape:
+
+- Factories take upstream's options object as keyword arguments: `create_read_tool(*, images=None)`,
+  `create_bash_tool(*, command_prefix=None, prepare=None)`, `create_powershell_tool(*, command_prefix=None,
+  prepare=None, programs=None)`. `BashExecution` is a `TypedDict` with upstream's keys (`command`, `cwd`, `env`,
+  `inheritEnv`) that `prepare(execution, api, context)` changes in place (sync or async).
+- Data shapes keep upstream's keys: `ImageLimits` (`maxWidth`, `maxHeight`, `maxBytes`), `PreparedImage` (`data`,
+  `mimeType`, `resized: {"from", "to"}`, `convertedFrom`), `EditToolDetails` (`diff`, `patch`, `firstChangedLine`),
+  `ReadToolDetails` (`truncation`), the bash `structuredOutput` (`output`, `truncated`, `fullOutputPath`, `exitCode`),
+  `ToolSearchToolDetails` (`loaded`). `ImageProcessor` is a `Protocol` with `async def prepare(data, mime_type,
+  limits)`. `ByteSource` (image header sniffing) is a frozen dataclass `(size, read)`.
+- Tool names, descriptions, and parameter schemas equal upstream's (compared against upstream's `createCodingTools()`
+  and `createPowerShellTool()` under Node), so the transcript and prompt caches see the same tools.
+
+Rules:
+
+- **Exact text.** What the model sees is upstream's text: `edit`'s diff and patch come from the jsdiff port (Myers
+  `diffLines`, `structuredPatch`, `formatPatch`, `createTwoFilesPatch`), never `difflib`. `tests/test_tools_edit_diff.py`
+  replays a corpus run through upstream's `edit-diff.ts` with jsdiff 8.0.4 under Node
+  (`tests/fixtures/edit_diff/upstream.json`). JavaScript string functions that differ are reproduced: `trimEnd`'s
+  whitespace set, `split("")` counting UTF-16 code units, `JSON.parse` without `NaN`.
+- **JavaScript numbers in `read`.** `offset` and `limit` are used as floats with `slice`, `Math.trunc`, NaN-propagating
+  `Math.min`, and `Number.isSafeInteger` semantics (`tools/_js.py`), and printed like `String(number)` (`2.5`, `61`,
+  `100000000000000000000`), so every argument selects and reports what upstream does
+  (`tests/test_tools_read_differential.py`, whose reference read uses the same seeds as upstream's).
+- **Mutation queue.** Per event loop, keyed by `env.id` and canonical path; a call waiting for its turn waits through
+  `asyncio.shield`, so cancelling it does not cancel the call ahead of it, and its slot is released in `finally`.
+- **Images.** `pi_durable.images` imports Pillow at module load and raises `ImportError` naming
+  `pi-ai-python[images]` without it; `pi_durable` and `pi_durable.tools` never import it
+  (`tests/test_storage_runtime_boundary.py`). `prepare_image` follows Photon's rules: pass-through of an upright,
+  inline, within-limits image after it decodes; EXIF orientation from `exif.py` (Pillow's own transpose per
+  orientation); scale to fit with `Math.round`; PNG then JPEG 80/70/55/40 (JPEG first for JPEG sources), then 3/4
+  steps down to 1x1; BMP and other non-inline formats become PNG; decoded as RGB, or RGBA with transparency, alpha
+  dropped for JPEG; LANCZOS resampling. Output bytes differ from Photon's. Where only the byte limit decides how far
+  an image shrinks, Pillow's JPEGs (smaller at the same quality) may stop at a larger size than Photon's.
+- **Off the loop.** `PillowImages` runs `prepare_image` on one worker thread of its own (started at the first image,
+  `close()` stops it), as upstream's single worker thread; `worker=False` runs it on the calling thread; `executor=`
+  takes any `concurrent.futures.Executor`. A thread, not a process: Pillow releases the GIL while it decodes,
+  converts, resizes, and encodes, so the loop keeps running (the test measures the longest loop stall), and nothing is
+  pickled; a `ProcessPoolExecutor` works too, since `prepare_image` and its arguments pickle. There is no idle
+  timeout: an idle thread holds no image memory, unlike Photon's WebAssembly memory.
+- `tool_search` builds a tool's search text from `pi_ai.utils.schema.parameters_schema(tool.parameters)`, so Pydantic
+  parameters are searched like JSON Schema ones.

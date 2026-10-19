@@ -1,15 +1,10 @@
-"""Port of ``test/harness-structured-output.test.ts``.
-
-Dropped: "gives callers of bash its retained output and exit code, also for a nonzero exit" needs upstream's
-``createBashTool`` (``src/tools/``), which phase 1 does not port.
-"""
+"""Port of ``test/harness-structured-output.test.ts``."""
 
 from __future__ import annotations
 
 import json
 from typing import Any
 
-import pytest
 from durable_harness_support import ChatSetup, add_hooks, add_tool, all_entries, assert_match, chat_setup, open_chat
 from durable_session_support import context
 
@@ -17,6 +12,8 @@ from pi_ai import Type, faux_assistant_message, faux_text, faux_tool_call
 from pi_ai.serialization import to_json_value
 from pi_ai.types import AssistantMessage, ImageContent, TextContent, ToolResultMessage
 from pi_durable import MemoryStorage, NestedCallDoc, ToolResultEntry, ToolTask, define_tool, watch_events
+from pi_durable.env.local import LocalExecutionEnv
+from pi_durable.tools import create_bash_tool
 
 Count = Type.Object({"count": Type.Number()})
 
@@ -331,6 +328,25 @@ async def test_keeps_structured_output_when_after_tool_replaces_the_output_and_v
     assert codes(results["other"]) == ["invalid_structured_output"]
 
 
-@pytest.mark.skip(reason="needs upstream's createBashTool (src/tools/), not ported in phase 1")
-async def test_gives_callers_of_bash_its_retained_output_and_exit_code_also_for_a_nonzero_exit() -> None:
-    pass
+async def test_gives_callers_of_bash_its_retained_output_and_exit_code_also_for_a_nonzero_exit(tmp_path: Any) -> None:
+    setup = chat_setup()
+    add_tool(setup.registry, create_bash_tool())
+    received: list[Any] = []
+
+    async def probe(_args: Any, api: Any, call_context: Any) -> Any:
+        received.append(await api.execute_tool("bash", {"command": "printf ok"}, call_context))
+        received.append(await api.execute_tool("bash", {"command": "printf bad; exit 4"}, call_context))
+        return {}
+
+    add_tool(setup.registry, define_tool(name="probe", description="probe", parameters=Type.Object({}), execute=probe))
+    setup.faux.set_responses([call("probe"), DONE])
+    opened = await open_chat(MemoryStorage(), setup, env=LocalExecutionEnv(cwd=str(tmp_path)))
+    await (await opened.root.submit({"type": "input", "content": "go"}, context)).wait(context)
+    await opened.harness.close(context)
+    assert_match(
+        received[0], {"isError": False, "structuredOutput": {"output": "ok", "truncated": False, "exitCode": 0}}
+    )
+    assert_match(
+        received[1], {"isError": True, "structuredOutput": {"output": "bad", "truncated": False, "exitCode": 4}}
+    )
+    assert codes(received[1]) == ["exit_code"]

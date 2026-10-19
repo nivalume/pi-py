@@ -9,7 +9,7 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 ## Table of Contents
 
 - [Installation](#installation)
-- [What Phase 1 Includes](#what-phase-1-includes)
+- [What This Port Includes](#what-this-port-includes)
 - [Quick Start](#quick-start)
 - [Two Python Rules](#two-python-rules)
 - [Concepts](#concepts)
@@ -42,19 +42,17 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 
 ```bash
 pip install pi-ai-python    # contains pi_durable, pi_chord, pi_ai and pi_agent
+pip install "pi-ai-python[images]"    # adds Pillow, for the image processor of the read tool
 ```
 
 Python 3.11 or newer. Everything runs on `asyncio`.
 
-## What Phase 1 Includes
+## What This Port Includes
 
-This release ports the core of pi-durable: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites.
+pi-durable's core: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites. Also the coding tools of `pi_durable.tools` (`read`, `write`, `edit`, `bash`, `powershell`, and the `CodingTools` extension), the `tool_search` tool of `pi_durable.tool_search`, and an image processor for `read` on Pillow in `pi_durable.images` (the `images` extra). See [Tools](#tools).
 
 Not included yet:
 
-- The built-in coding tools of `@earendil-works/pi-durable/tools` (`read`, `write`, `edit`, `bash`, and image reading) and the `CodingTools` extension. Define your own tools with `define_tool()` (see [Tools](#tools)); they get the [environment](#environment) through `api.env`.
-- Tool search (`@earendil-works/pi-durable/tool-search`). Deferred tools (`deferred=True`) and `control.addTools` work; there is no `tool_search` tool that loads them.
-- Image processing (`@earendil-works/pi-durable/images`).
 - The code mode extension (`@earendil-works/pi-durable/codemode`).
 - The Cloudflare adapters: Durable Object SQLite storage and the Workers image processor.
 
@@ -286,7 +284,29 @@ An extension may bring `tools`, `sections`, `hooks`, `wraps` (decorators of a to
 
 ## Tools
 
-Phase 1 has no built-in tools (see [What Phase 1 Includes](#what-phase-1-includes)); define your own. `define_tool()` takes keyword arguments. `parameters` is a JSON Schema built with `pi_ai.Type` (or a plain dict, or a Pydantic model), which the Harness validates before `execute(args, api, context)` runs. `api.output()` streams running output, which becomes the result when `execute()` returns no `output`:
+`pi_durable.tools` provides `read`, `write`, `edit`, and `bash`, and the `CodingTools` extension with all four (`create_powershell_tool()` adds `powershell`). They touch files and processes only through the call's environment (see [Environment](#environment)), and nothing installs them automatically:
+
+```python
+from pi_durable.tools import CodingTools
+
+registry.install(CodingTools)
+```
+
+`read` returns text with continuation remarks as diagnostics (`Use offset=2001 to continue.`), and an image file as one image block, which programs calling it get as an `ImageContent`. Image limits are the model's `input_limits.images.resize`, by default 2000x2000 pixels and 4.5 MiB of base64. Without an image processor it sends PNG, JPEG, GIF, and WebP files within them (dimensions read from the file's header) as they are, without decoding them, and refuses larger ones and other formats. With one, it decodes every image, turns it upright by its EXIF orientation, converts BMP to PNG, and shrinks it to fit. The Pillow-based processor needs the `images` extra and is only loaded when you import it:
+
+```python
+from pi_durable.images import create_pillow_images
+from pi_durable.tools import create_coding_tools
+
+images = create_pillow_images()
+registry.install(create_coding_tools(images=images))
+```
+
+A model without image input sees a placeholder instead of the image, and `read` says so in a diagnostic. The processor prepares images one at a time in a worker thread of its own, so a large photo (a second or so of work) never blocks the event loop: Pillow releases the GIL while it decodes, resizes, and encodes. `create_pillow_images(worker=False)` works on the calling thread instead, and `executor=` runs the work on an executor of yours (a thread pool to prepare several images at once, or a process pool). `images.close()` stops its worker thread; an idle one holds no image memory. The images it writes are not Photon's bytes, but their sizes, formats, and orientation follow the same rules; where only the byte limit decides how far an image shrinks, Pillow's smaller JPEGs can stop at a larger size.
+
+`edit` replaces exact, unique, non-overlapping texts (with a fuzzy fallback for trailing spaces, smart quotes, dashes, and special spaces), keeps a file's BOM and CRLF line endings, and returns a display diff and a unified patch in its `details`, the same text upstream's jsdiff writes. `edit` and `write` serialize changes to one file within the process. `bash` streams output and keeps its tail; output beyond 2000 lines or 50KB is spilled to a file named in a diagnostic. `create_bash_tool(command_prefix=..., prepare=...)` runs lines before each command or changes its command, working directory, and environment.
+
+Define your own tool with `define_tool()`, which takes keyword arguments. `parameters` is a JSON Schema built with `pi_ai.Type` (or a plain dict, or a Pydantic model), which the Harness validates before `execute(args, api, context)` runs. `api.output()` streams running output, which becomes the result when `execute()` returns no `output`:
 
 ```python
 from pi_ai import Type
@@ -333,7 +353,7 @@ lines = define_tool(
 )
 ```
 
-A missing, undeclared, or invalid `structuredOutput` turns a nested call's result into an error result with an `invalid_structured_output` diagnostic; for a call the model made, which never sees it, it is dropped and reported through `onReport`. An error result may omit it, and programs then find its text in a `tool_error` diagnostic; error results the Harness writes itself (blocked, invalid, interrupted, aborted) carry none, and their `diagnostics` say what went wrong. An `after_tool` hook that redacts a schema tool's `output` must redact its `structuredOutput` too.
+A missing, undeclared, or invalid `structuredOutput` turns a nested call's result into an error result with an `invalid_structured_output` diagnostic; for a call the model made, which never sees it, it is dropped and reported through `onReport`. An error result may omit it, and programs then find its text in a `tool_error` diagnostic; error results the Harness writes itself (blocked, invalid, interrupted, aborted) carry none, and their `diagnostics` say what went wrong. An `after_tool` hook that redacts a schema tool's `output` must redact its `structuredOutput` too. The built-in `bash` returns `{"output", "truncated", "fullOutputPath"?, "exitCode"}`, where `output` is the retained tail the model sees, read with `api.retained_output()`, and answers a nonzero exit with an error result that still carries it.
 
 A later extension's tool with the same name replaces an earlier one where both are selected, and `wrap_tool()` decorates whichever tool won. A `ToolRegistration` is a dataclass; a wrapper returns a changed copy with `dataclasses.replace()`:
 
@@ -342,6 +362,7 @@ import dataclasses
 import time
 
 from pi_durable import wrap_tool
+from pi_durable.tools import create_bash_tool
 
 
 def timed(tool):
@@ -357,6 +378,9 @@ def timed(tool):
 
 Timing = define_extension("timing", wraps=[wrap_tool(count, timed)])
 registry.install(Timing)
+
+# A bash inside a Python virtualenv: where both are selected, it replaces CodingTools' bash.
+Venv = define_extension("venv", tools=[create_bash_tool(command_prefix="source .venv/bin/activate")])
 ```
 
 ### Calling tools from tools
@@ -421,7 +445,27 @@ print([tool.name for tool in agent["tools"]], [tool.name for tool in agent["call
 
 `conversation.agent()` resolves both lists: `tools`, offered to the model, and `callable`, which nested calls resolve among. `tools` still decides what is enabled at all; `modelTools` cannot add to it.
 
-A `deferred=True` tool is not offered to the model until it is loaded, though other tools can call it any time. A tool result loads deferred tools with `"control": {"addTools": [...]}`, which records them in `modelTools`; loaded tools stay offered on that branch, also after a compaction. Upstream's `tool_search` tool, which lets the model search and load deferred tools, is not ported yet.
+A `deferred=True` tool is not offered to the model until it is loaded, though other tools can call it any time. The `tool_search` tool from `pi_durable.tool_search` (`create_tool_search_extension()`) lets the model search the deferred tools (BM25 over their names, descriptions, and parameters) and loads the matches with `"control": {"addTools": [...]}`, which records them in `modelTools`; loaded tools stay offered on that branch, also after a compaction. Any tool result can load deferred tools that way. Use it for large tool sets, such as an MCP server's:
+
+```python
+from pi_durable.tool_search import create_tool_search_extension
+
+
+async def get_issue_execute(args, api, context):
+    return {"output": [TextContent(f"Issue {args['number']}: flaky login test")]}
+
+
+get_issue = define_tool(
+    name="github_get_issue",
+    description="Get a GitHub issue by number",
+    parameters=Type.Object({"number": Type.Number()}),
+    deferred=True,
+    execute=get_issue_execute,
+)
+registry.install(define_extension("github", tools=[get_issue]))
+registry.install(create_tool_search_extension())
+# The model is offered tool_search; calling it with {"query": "github issue"} loads github_get_issue.
+```
 
 ### Tasks a restart abandons
 
@@ -510,7 +554,7 @@ harness = await Harness.open(
 )
 ```
 
-A raise from `env` becomes the call's error result. Without an environment, `api.env` is `None`. A fresh environment object per call is fine. A custom `ExecutionEnv` sets `id` so that equal ids see the same files at the same paths, for example one id per container; `LocalExecutionEnv`'s id is `"local"`.
+A raise from `env` becomes the call's error result. Without an environment, `api.env` is `None` and the built-in tools fail with an error result. A fresh environment object per call is fine: `edit` and `write` serialize changes to one file by the environment's `id` and canonical path. A custom `ExecutionEnv` sets `id` so that equal ids see the same files at the same paths, for example one id per container; `LocalExecutionEnv`'s id is `"local"`.
 
 File and shell operations return a result dict instead of raising expected failures: `{"ok": True, "value": ...}` or `{"ok": False, "error": FileError(...)}` (`get_or_throw()` and `get_or_none()` in `pi_durable.env` unwrap one). Hosts can use the environment directly too, for example to show a project's files. `open_binary_reader()` reads byte ranges of one opened file, `open_dir_reader()` pages a directory, and `exec()` with an argument list runs a program without a shell, reporting which stream each output chunk came from:
 
@@ -994,7 +1038,8 @@ A failure closes the Harness by itself; `closed` settles once that close is done
 - **Errors** keep upstream's classes and messages. A bare JavaScript `Error` is `RuntimeError`, `RangeError` is `ValueError`.
 - **Storage and environment modules**: `openNodeSqliteStorage` is `open_sqlite_storage` (on `sqlite3`), `openNodeJsonlStorage` is `open_local_jsonl_storage`, `NodeExecutionEnv` is `LocalExecutionEnv` (id `"local"`), `Storage.entry(conversationId, id)` is `visible_entry()`, and `FileSystem.list_files()` is a required method that may return `not_supported`. The conformance suites register with pytest.
 - **Binary data** is `bytes`; IDs are plain `int`s (`TaskId`, `EntryId`, ... are type-checker brands).
-- **Not ported in phase 1**: the coding tools, tool search, images, code mode, and the Cloudflare adapters (see [What Phase 1 Includes](#what-phase-1-includes)).
+- **Tools and images**: `createCodingTools({ images })` is `create_coding_tools(images=...)`, `createBashTool({ commandPrefix, prepare })` is `create_bash_tool(command_prefix=..., prepare=...)` (`prepare` changes the `BashExecution` dict's `command`, `cwd`, `env`, and `inheritEnv`), and `createNodePhotonImages()` is `create_pillow_images()`, on Pillow instead of Photon, in a worker thread without an idle timeout. `read` keeps JavaScript's number semantics for `offset` and `limit`, so fractional, negative, and huge values select and print the same lines.
+- **Not ported yet**: code mode and the Cloudflare adapters (see [What This Port Includes](#what-this-port-includes)).
 
 ## Design Notes
 

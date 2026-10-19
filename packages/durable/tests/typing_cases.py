@@ -27,11 +27,13 @@ from pi_durable import (
 )
 from pi_durable.env import ExecutionEnv, FileSystem
 from pi_durable.env.local import LocalExecutionEnv
-from pi_durable.harness.types import CompactionResult, SubmissionDraft
+from pi_durable.harness.types import CompactionResult, Extension, SubmissionDraft, ToolRegistration
 from pi_durable.harness.types import Conversation as ConversationProtocol
 from pi_durable.harness.types import Harness as HarnessProtocol
+from pi_durable.images import PillowImages
 from pi_durable.storage.jsonl import JsonlStorage
 from pi_durable.storage.sqlite import SqliteStorage
+from pi_durable.tools import ImageProcessor, create_coding_tools, create_read_tool
 from pi_durable.types import (
     ContextEdit,
     ConversationId,
@@ -325,3 +327,12 @@ def builtin_backends_are_storages_and_environments(
     env: ExecutionEnv = local
     file_system: FileSystem = local
     del storage, env, file_system
+
+
+def the_pillow_processor_is_an_image_processor(images: PillowImages) -> None:
+    processor: ImageProcessor = images
+    extension = create_coding_tools(images=images)
+    assert_type(extension, Extension)
+    assert_type(create_read_tool(images=processor), ToolRegistration)
+    create_read_tool(images=object())  # pyright: ignore[reportArgumentType]
+    del processor

@@ -1,8 +1,4 @@
-"""Port of ``test/harness-tools.test.ts``.
-
-Dropped: the two "coding tools" cases, which need ``src/tools/`` (``createBashTool``, ``createReadTool``,
-``createEditTool``), not ported in phase 1.
-"""
+"""Port of ``test/harness-tools.test.ts``."""
 
 from __future__ import annotations
 
@@ -51,6 +47,7 @@ from pi_durable import (
     section,
 )
 from pi_durable.env.local import LocalExecutionEnv
+from pi_durable.tools import create_bash_tool, create_edit_tool, create_read_tool
 
 EchoParameters = Type.Object({"text": Type.Optional(Type.String())})
 
@@ -876,6 +873,61 @@ async def test_answers_a_raising_environment_with_a_tool_error_result_and_report
     # Each preparation reports the failure and renders without an environment.
     assert len([error for error in setup.reports if str(error) == "no sandbox"]) == 2
     await ran.harness.close(context)
+
+
+# ─── coding tools ───────────────────────────────────────────────────────────
+
+
+async def test_answers_a_failing_command_with_its_retained_tail_and_diagnostics_in_order(tmp_path: Any) -> None:
+    setup = chat_setup()
+    add_tool(setup.registry, create_bash_tool())
+    command = "i=1; while [ $i -le 3000 ]; do echo line-$i; i=$((i + 1)); done; exit 7"
+    setup.faux.set_responses([calls(("bash", {"command": command}, "b")), DONE])
+    env = LocalExecutionEnv(cwd=str(tmp_path))
+    opened = await open_chat(MemoryStorage(), setup, env=env)
+    await (await opened.root.submit({"type": "input", "content": "go"}, context)).wait(context)
+    entry = next(candidate for candidate in await all_entries(opened.root) if ToolResultEntry.is_(candidate))
+    [result] = results([entry])
+    assert result.is_error is True
+    text = result_text(result)
+    assert text.startswith("line-1001\n")
+    assert [diagnostic["code"] for diagnostic in entry["data"]["diagnostics"]] == [
+        "full_output",
+        "exit_code",
+        "truncated",
+    ]
+    assert "line-3000\n|<harness>\n[info] Full output: " in text
+    assert "\n[error] Command exited with code 7\n[warn] Output truncated to its end: 1000 lines, " in text
+    await opened.harness.close(context)
+
+
+async def test_reads_edits_and_runs_a_command_in_one_run_then_answers(tmp_path: Any) -> None:
+    (tmp_path / "notes.txt").write_text("hello world\n")
+    setup = chat_setup()
+    setup.registry.install(
+        define_extension("coding", tools=[create_read_tool(), create_edit_tool(), create_bash_tool()])
+    )
+    setup.faux.set_responses(
+        [
+            calls(("read", {"path": "notes.txt"}, "r")),
+            calls(("edit", {"path": "notes.txt", "edits": [{"oldText": "world", "newText": "durable"}]}, "e")),
+            calls(("bash", {"command": "cat notes.txt"}, "b")),
+            DONE,
+        ]
+    )
+    env = LocalExecutionEnv(cwd=str(tmp_path))
+    opened = await open_chat(MemoryStorage(), setup, env=env)
+    settled = await (await opened.root.submit({"type": "input", "content": "go"}, context)).wait(context)
+    assert settled["status"] == "done"
+    entries = await all_entries(opened.root)
+    assert [(result.tool_name, result.is_error, result_text(result)) for result in results(entries)] == [
+        ("read", False, "hello world\n"),
+        ("edit", False, "Successfully replaced 1 block(s) in notes.txt."),
+        ("bash", False, "hello durable\n"),
+    ]
+    assert entries[-1]["kind"] == "pi.assistant"
+    assert (tmp_path / "notes.txt").read_text() == "hello durable\n"
+    await opened.harness.close(context)
 
 
 # ─── tool progress and lifetime ─────────────────────────────────────────────

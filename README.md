@@ -13,7 +13,8 @@ PyPI as one package, `pi-ai-python`, with these import packages:
 ```bash
 pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
 pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
-pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3
+pip install "pi-ai-python[images]"     # + Pillow, for pi_durable's image processor
+pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow
 ```
 
 中文说明见 [README.zh-CN.md](https://github.com/nivalume/pi-py/blob/main/README.zh-CN.md)。
@@ -96,8 +97,9 @@ asyncio.run(main())
 ```
 
 `pi_durable` stores records in the same format as TypeScript pi-durable, so a SQLite or JSONL
-storage written by one opens in the other. Not ported yet: the built-in coding tools
-(read/write/edit/bash/image), tool search, images and the code mode extension.
+storage written by one opens in the other. The coding tools (`pi_durable.tools`: read, write,
+edit, bash), tool search and an image processor on Pillow are included; not ported yet: the code
+mode extension and the Cloudflare adapters.
 
 ## Same API, Python conventions
 
