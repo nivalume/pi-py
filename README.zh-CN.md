@@ -113,7 +113,7 @@ asyncio.run(main())
 ```
 
 `pi_durable` 的存储格式和 TypeScript 版 pi-durable 一致，一方写的 SQLite 或 JSONL 存储另一方可以直接打开。
-已包含编码工具（`pi_durable.tools`：read/write/edit/bash）、工具搜索和基于 Pillow 的图片处理；尚未移植：codemode 扩展和 Cloudflare 适配器。
+已包含编码工具（`pi_durable.tools`：read/write/edit/bash）、工具搜索、基于 Pillow 的图片处理，以及代码模式扩展（`pi_durable.codemode`：脚本是由 Monty 运行的 Python，进程重启后可继续执行）；尚未移植：Cloudflare 适配器。
 
 ## 与 pi 保持一致的 API
 

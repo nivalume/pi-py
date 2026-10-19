@@ -16,6 +16,7 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 - [Persist and Resume](#persist-and-resume)
 - [Extensions](#extensions)
 - [Tools](#tools)
+- [Code Mode](#code-mode)
 - [System Prompt](#system-prompt)
 - [Per-Conversation Agent](#per-conversation-agent)
 - [Settings](#settings)
@@ -43,18 +44,16 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 ```bash
 pip install pi-ai-python    # contains pi_durable, pi_chord, pi_ai and pi_agent
 pip install "pi-ai-python[images]"    # adds Pillow, for the image processor of the read tool
+pip install "pi-ai-python[codemode]"  # adds pydantic-monty, the sandbox of code mode
 ```
 
 Python 3.11 or newer. Everything runs on `asyncio`.
 
 ## What This Port Includes
 
-pi-durable's core: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites. Also the coding tools of `pi_durable.tools` (`read`, `write`, `edit`, `bash`, `powershell`, and the `CodingTools` extension), the `tool_search` tool of `pi_durable.tool_search`, and an image processor for `read` on Pillow in `pi_durable.images` (the `images` extra). See [Tools](#tools).
+pi-durable's core: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites. Also the coding tools of `pi_durable.tools` (`read`, `write`, `edit`, `bash`, `powershell`, and the `CodingTools` extension), the `tool_search` tool of `pi_durable.tool_search`, an image processor for `read` on Pillow in `pi_durable.images` (the `images` extra), and the code mode extension of `pi_durable.codemode`, whose scripts are Python run by Monty (the `codemode` extra). See [Tools](#tools) and [Code Mode](#code-mode).
 
-Not included yet:
-
-- The code mode extension (`@earendil-works/pi-durable/codemode`).
-- The Cloudflare adapters: Durable Object SQLite storage and the Workers image processor.
+Not included yet: the Cloudflare adapters (Durable Object SQLite storage and the Workers image processor).
 
 ## Quick Start
 
@@ -385,7 +384,7 @@ Venv = define_extension("venv", tools=[create_bash_tool(command_prefix="source .
 
 ### Calling tools from tools
 
-A tool calls another tool with `api.execute_tool(name, args, context, *, key=None, progress=None)`, as an MCP bridge does. The nested call is its own tool task, owned by the calling one: it is validated, runs the `ToolTask` hooks, keeps its own output limits and replay policy, and returns its result to the caller instead of the transcript:
+A tool calls another tool with `api.execute_tool(name, args, context, *, key=None, progress=None)`, as a code mode script or an MCP bridge does. The nested call is its own tool task, owned by the calling one: it is validated, runs the `ToolTask` hooks, keeps its own output limits and replay policy, and returns its result to the caller instead of the transcript:
 
 ```python
 async def word_count_execute(args, api, context):
@@ -445,7 +444,7 @@ print([tool.name for tool in agent["tools"]], [tool.name for tool in agent["call
 
 `conversation.agent()` resolves both lists: `tools`, offered to the model, and `callable`, which nested calls resolve among. `tools` still decides what is enabled at all; `modelTools` cannot add to it.
 
-A `deferred=True` tool is not offered to the model until it is loaded, though other tools can call it any time. The `tool_search` tool from `pi_durable.tool_search` (`create_tool_search_extension()`) lets the model search the deferred tools (BM25 over their names, descriptions, and parameters) and loads the matches with `"control": {"addTools": [...]}`, which records them in `modelTools`; loaded tools stay offered on that branch, also after a compaction. Any tool result can load deferred tools that way. Use it for large tool sets, such as an MCP server's:
+A `deferred=True` tool is not offered to the model until it is loaded, though other tools can call it any time. The `tool_search` tool from `pi_durable.tool_search` (`create_tool_search_extension()`) lets the model search the deferred tools (BM25 over their names, descriptions, and parameters) and loads the matches with `"control": {"addTools": [...]}`, which records them in `modelTools`; loaded tools stay offered on that branch, also after a compaction, and the `codemode` section leaves deferred tools out. Any tool result can load deferred tools that way. Use it for large tool sets, such as an MCP server's:
 
 ```python
 from pi_durable.tool_search import create_tool_search_extension
@@ -470,6 +469,54 @@ registry.install(create_tool_search_extension())
 ### Tasks a restart abandons
 
 A task that its creator awaits only in memory, and that the creator never resumes after a restart, can be created with `"abandonOnRestart": True` in its task options. When a later Harness starts scheduling and finds it still live, it is aborted with `abortReason` `"restart"`, together with everything it owns, before any of it runs again. Nested calls of tools that are not replay-safe get this automatically, and so do the child tasks such a tool creates with `api.create_task()`. A task abandoned this way whose definition is missing waits until its extension is installed, so its abort handler still cleans up. Its caller, and the conversation, wait with it; `harness.inspect()` shows it as blocked. Aborting it then orphans it, as any abort does.
+
+## Code Mode
+
+`pi_durable.codemode` adds a `codemode` tool: the model writes Python that calls the conversation's tools as `await tools.<name>(...)`, in a Monty sandbox ([`pi_codemode`](../codemode/README.md)). Each call is a nested tool call, and only the script's output reaches the model. The script survives a restart: it resumes where it was, without running its finished calls again. This is upstream's code mode with Python scripts instead of JavaScript; the sandbox needs the `codemode` extra (`pip install "pi-ai-python[codemode]"`).
+
+```python
+from pi_codemode import CodemodeSandbox
+from pi_durable.codemode import create_codemode_extension
+
+sandbox = CodemodeSandbox(memory_limit_bytes=256 * 1024 * 1024)
+registry.install(create_codemode_extension(sandbox=sandbox))
+# A codemode call with {"code": 'return await tools.word_count(text="a b c")'} answers '{"words":3}'.
+# When the process shuts down: await harness.close(context), then await sandbox.close().
+```
+
+A script is the body of an async function, written by the model as the tool's raw input:
+
+```text
+# @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
+import asyncio
+contents = await asyncio.gather(*[tools.read(path=path) for path in ["a.txt", "b.txt"]])
+print("read", len(contents), "files")
+found = await search_tools("github issues", limit=3)
+return [tool["name"] for tool in found]
+```
+
+The extension also adds a `codemode` prompt section listing the tools scripts can call, as Python declarations (`async def read(self, *, path: str) -> str`) within a token budget (`inline_budget=`, default 3000); scripts find the others with `search_tools()`, `describe_tool()`, and `describe_namespace()`. Group tools by name prefix with `namespaces=[{"name": ..., "description": ..., "prefix": ...}]`, for example an MCP server's `mcp__github__`. The result reads like the coding agent's: a header, the script's output, and on failure the calls already made; text past `max_output_tokens` is cut, with the full text in a temp file. Scripts also get `models.*`: the model catalog, `models.classify()`, and `models.generate_images()`, which run as nested calls of internal tools (`models=False` turns them off). Closing the sandbox while a script runs (for example when shutting down) is not an outcome: the script resumes with the next process's sandbox. A failed nested call raises an `Exception` with its error text in the script, unless the tool declares a schema and returned its own value with the error: `tools.bash` returns `{"output": ..., "exitCode": ..., ...}` also for a nonzero exit, so scripts check `exitCode`. `store(key, value)` and `load(key)` keep JSON values per conversation; a fork sees them as they were at its entry. `pi_durable.codemode` imports no sandbox: any `pi_codemode.CodemodeSandboxBase` works.
+
+Script globals are snake_case where upstream's are camelCase; tool names do not change (`tools.mcp__github__list_issues`, and the internal tools `pi.codemode.models.classify` and `pi.codemode.models.generateImages`):
+
+| Upstream (JavaScript) | Here (Python) |
+| --- | --- |
+| `// @options: {...}` | `# @options: {...}` |
+| `await tools.read({ path })` | `await tools.read(path=...)` or `await tools.read({"path": ...})` |
+| `Promise.all([...])` | `asyncio.gather(...)` |
+| `console.log(...)` | `print(...)` |
+| `searchTools(query, { limit, namespace })` | `search_tools(query, limit=8, namespace=None)`, or the options as one dict |
+| `describeTool(name)`, `describeNamespace(name)` | `describe_tool(name)`, `describe_namespace(name)` |
+| `models.getModelsOfType(type, provider?)` | `models.get_models_of_type(type, provider=None)` |
+| `models.getAvailableOfType(type, provider?)` | `models.get_available_of_type(type, provider=None)` |
+| `models.getModelOfType(type, provider, id)` | `models.get_model_of_type(type, provider, id)` |
+| `models.classify(model, context)` | `models.classify(model, context)` |
+| `models.generateImages(model, context)` | `models.generate_images(model, context)` |
+| `undefined` (a missing value) | `None` |
+
+Catalog entries, classifier and image contexts, and model results are pi-ai's JSON, with camelCase keys (`result["stopReason"]`, `{"type": "image", "data": ..., "mimeType": ...}`). Exceptions in Monty carry only a message, so the `structuredOutput` upstream attaches to a failed call's error is not visible to scripts. A script that returns `None` adds no value to the output, since Python cannot tell `return None` from no `return`.
+
+How it survives a restart: the sandbox runs the script deterministically (a virtual clock, seeded randomness, UTC), and the tool writes each result the script gets to a journal before handing it over. After a restart, the tool runs the script again and hands it the journaled results in the same order, so it makes the same calls with the same arguments; these reattach to their nested calls by key, and then the script continues. A rerun ends the call with an error instead when the script takes another path than before, when the sandbox's fingerprint or the code mode version changed, or when its `timeout_ms` passed meanwhile. A nested call running at the restart follows its own replay policy. The run and journal documents keep upstream's format, but a run cannot move between languages: a TypeScript run resumed here (or the other way round) ends with "the sandbox changed since it started", since the scripts, the globals' names, and the sandbox fingerprints differ.
 
 ## System Prompt
 
@@ -1039,7 +1086,8 @@ A failure closes the Harness by itself; `closed` settles once that close is done
 - **Storage and environment modules**: `openNodeSqliteStorage` is `open_sqlite_storage` (on `sqlite3`), `openNodeJsonlStorage` is `open_local_jsonl_storage`, `NodeExecutionEnv` is `LocalExecutionEnv` (id `"local"`), `Storage.entry(conversationId, id)` is `visible_entry()`, and `FileSystem.list_files()` is a required method that may return `not_supported`. The conformance suites register with pytest.
 - **Binary data** is `bytes`; IDs are plain `int`s (`TaskId`, `EntryId`, ... are type-checker brands).
 - **Tools and images**: `createCodingTools({ images })` is `create_coding_tools(images=...)`, `createBashTool({ commandPrefix, prepare })` is `create_bash_tool(command_prefix=..., prepare=...)` (`prepare` changes the `BashExecution` dict's `command`, `cwd`, `env`, and `inheritEnv`), and `createNodePhotonImages()` is `create_pillow_images()`, on Pillow instead of Photon, in a worker thread without an idle timeout. `read` keeps JavaScript's number semantics for `offset` and `limit`, so fractional, negative, and huge values select and print the same lines.
-- **Not ported yet**: code mode and the Cloudflare adapters (see [What This Port Includes](#what-this-port-includes)).
+- **Code mode** runs Python scripts in Monty instead of JavaScript in QuickJS: `createCodemodeExtension({ sandbox })` is `create_codemode_extension(sandbox=...)`, script globals are snake_case (`search_tools()`, `models.generate_images()`), and a run journaled by one language does not resume in the other (see [Code Mode](#code-mode)).
+- **Not ported yet**: the Cloudflare adapters (see [What This Port Includes](#what-this-port-includes)).
 
 ## Design Notes
 

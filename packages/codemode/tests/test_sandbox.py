@@ -65,6 +65,35 @@ class TestScriptExecution:
         assert success(await sandbox.execute("1 + 1")).value is None
         assert success(await sandbox.execute("x = 2\nif x > 1:\n    return 'big'\nreturn 'small'")).value == "big"
 
+    async def test_comprehension_variables_may_shadow_builtins(self, create_sandbox: CreateSandbox) -> None:
+        # Monty 1.2 resolves such top-level comprehension variables to the builtin; the sandbox renames them.
+        sandbox = create_sandbox()
+        script = """
+pairs = [("a", 1), ("b", 2)]
+ids = [id for id in [1, 2, 3]]
+by_type = {type: n for type, n in pairs}
+nested = [[id * max for max in range(1, 3)] for id in [2, 3]]
+lambdas = [(lambda id: id * 10)(id) for id in [1]]
+first = list(id for id in range(id(ids) % 1, 2))
+sums = [sum for sum in [5]]
+return [ids, by_type, nested, lambdas, first, sums, len(ids), max(ids), type(ids).__name__]
+"""
+        assert success(await sandbox.execute(script)).value == [
+            [1, 2, 3],
+            {"a": 1, "b": 2},
+            [[2, 4], [3, 6]],
+            [10],
+            [0, 1],
+            [5],
+            3,
+            3,
+            "list",
+        ]
+
+        failure = await sandbox.execute("bad = [id for id in [1]]\nraise ValueError('boom')")
+        assert not failure.ok
+        assert 'codemode.py", line 2' in (failure.error.stack or "")
+
     async def test_supports_top_level_await(self, create_sandbox: CreateSandbox) -> None:
         sandbox = create_sandbox()
         result = await sandbox.execute("async def f():\n    return 41\nx = await f()\nreturn x + 1")

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import datetime as dt
 import json
 import math
@@ -703,10 +704,66 @@ def _script_source(code: str) -> str:
     the body of a function, only returns what ``return`` gives. A script that parses gets a final
     ``None`` statement; one that does not is fed unchanged, so its syntax error points at its own lines."""
     try:
-        ast.parse(code)
+        tree = ast.parse(code)
     except (SyntaxError, ValueError):
         return code
-    return code + "\nNone"
+    return _rename_shadowing_comprehension_targets(code, tree) + "\nNone"
+
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_BUILTIN_NAMES: frozenset[str] = frozenset(dir(builtins))
+
+
+def _rename_shadowing_comprehension_targets(code: str, tree: ast.Module) -> str:
+    """Work around Monty (1.2) resolving a top-level comprehension variable named like a builtin
+    (``[id for id in xs]``, ``{type: n for type, n in pairs}``) to the builtin instead of the loop value.
+
+    Such targets are renamed inside their comprehension, in place: only those names change, so line
+    numbers and the rest of the script stay as written.
+    """
+    edits: list[tuple[int, int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, _COMPREHENSIONS):
+            continue
+        shadowing: set[str] = set()
+        for generator in node.generators:
+            for target in ast.walk(generator.target):
+                if isinstance(target, ast.Name) and target.id in _BUILTIN_NAMES:
+                    shadowing.add(target.id)
+        if not shadowing:
+            continue
+        # The first iterable is evaluated in the enclosing scope; everything else sees the targets.
+        scoped: list[ast.AST] = [node.generators[0].target, *node.generators[0].ifs]
+        for generator in node.generators[1:]:
+            scoped.extend([generator.target, generator.iter, *generator.ifs])
+        scoped.extend([node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt])
+        for part in scoped:
+            _collect_renames(part, shadowing, edits)
+    if not edits:
+        return code
+    lines = code.splitlines(keepends=True)
+    for line, start, end, name in sorted(set(edits), reverse=True):
+        raw = lines[line - 1].encode()
+        lines[line - 1] = (raw[:start] + f"__codemode_{name}".encode() + raw[end:]).decode()
+    return "".join(lines)
+
+
+def _collect_renames(node: ast.AST, names: set[str], edits: list[tuple[int, int, int, str]]) -> None:
+    if isinstance(node, ast.Lambda):
+        bound = {arg.arg for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)}
+        bound.update(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)
+        for default in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
+            _collect_renames(default, names, edits)
+        names = names - bound
+        if not names:
+            return
+        _collect_renames(node.body, names, edits)
+        return
+    if isinstance(node, ast.Name) and node.id in names and node.end_col_offset is not None:
+        edits.append((node.lineno, node.col_offset, node.end_col_offset, node.id))
+        return
+    for child in ast.iter_child_nodes(node):
+        _collect_renames(child, names, edits)
 
 
 def _display(error: MontyError) -> str:

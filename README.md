@@ -100,8 +100,9 @@ asyncio.run(main())
 
 `pi_durable` stores records in the same format as TypeScript pi-durable, so a SQLite or JSONL
 storage written by one opens in the other. The coding tools (`pi_durable.tools`: read, write,
-edit, bash), tool search and an image processor on Pillow are included; not ported yet: the code
-mode extension and the Cloudflare adapters.
+edit, bash), tool search, an image processor on Pillow, and the code mode extension
+(`pi_durable.codemode`, whose scripts are Python run by Monty and survive a restart) are included;
+not ported yet: the Cloudflare adapters.
 
 ## Same API, Python conventions
 

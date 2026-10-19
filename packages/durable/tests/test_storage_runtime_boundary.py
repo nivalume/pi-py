@@ -2,7 +2,8 @@
 
 Upstream walks the import graph for ``node:`` built-ins; here each portable entry point is imported in a fresh
 interpreter and must not load the local (host OS) adapters, ``sqlite3``, or the backends the package root
-keeps out. The tools, tool search, and image processor (phase 2) are their own entry points as well.
+keeps out. The tools, tool search, and image processor (phase 2) are their own entry points as well, and so is code
+mode, which loads only pi_codemode's portable parts: the sandbox (and Monty) comes from the caller.
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ def test_keeps_the_package_root_limited_to_portable_core_storage() -> None:
     assert not any(name.startswith("pi_durable.tool_search") for name in modules)
     assert not any(name.startswith("pi_durable.images") for name in modules)
     assert not any(name == "PIL" or name.startswith("PIL.") for name in modules)
+    assert not any(name.startswith("pi_durable.codemode") for name in modules)
+    assert not any(name == "pi_codemode" or name.startswith("pi_codemode.") for name in modules)
+    assert not any(name.startswith("pydantic_monty") for name in modules)
     assert "sqlite3" not in modules
 
 
@@ -69,6 +73,24 @@ def test_keeps_tool_search_free_of_the_coding_tools_and_the_image_processor() ->
     assert not any(name == "PIL" or name.startswith("PIL.") for name in modules)
     assert "pi_durable.env.local" not in modules
     assert "sqlite3" not in modules
+
+
+def test_keeps_code_mode_free_of_the_sandbox_monty_and_the_local_environment() -> None:
+    modules = loaded_after("pi_durable.codemode")
+    assert "pi_codemode.sandbox" not in modules
+    assert "pi_codemode.runtime.monty" not in modules
+    assert not any(name.startswith("pydantic_monty") for name in modules)
+    assert not any(name == "pi_agent" or name.startswith("pi_agent.") for name in modules)
+    assert not any(name.startswith("pi_durable.tools") for name in modules)
+    assert not any(name.startswith("pi_durable.images") for name in modules)
+    assert "pi_durable.env.local" not in modules
+    assert "sqlite3" not in modules
+
+
+def test_imports_code_mode_without_monty() -> None:
+    # A None entry in sys.modules makes `import pydantic_monty` raise ImportError, as if the extra were not installed.
+    code = "import sys\nsys.modules['pydantic_monty'] = None\nimport pi_durable.codemode\n"
+    assert subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True).returncode == 0
 
 
 @pytest.mark.skipif(importlib.util.find_spec("PIL") is None, reason="needs Pillow (the images extra)")

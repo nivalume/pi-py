@@ -228,7 +228,7 @@ Calling `tool.execute()` directly skips the agent's `before_tool_call` and `afte
 
 ## Deterministic runs
 
-`sandbox.start(code, ...)` runs a script so that a host can run it again after a restart and get the same behavior, for example to resume it from a durable log of its calls' results. `execute()` is unaffected.
+`sandbox.start(code, ...)` runs a script so that a host can run it again after a restart and get the same behavior, for example to resume it from a durable log of its calls' results. `execute()` is unaffected. `pi_durable.codemode` builds its durable `codemode` tool on this (see the [pi_durable README](../durable/README.md#code-mode)).
 
 The sandbox only runs when the host hands it something, so it is deterministic except for what it reads from its environment. `start()` fixes that through Monty's `os_policy`:
 
@@ -300,3 +300,4 @@ The host owns the deadline and the abort signal. When either fires, it cancels t
 - Every host round trip costs about 0.3 ms, and an awaited tool call takes two (the call and its result), so a loop of sequential calls runs at about 0.6 ms per call; gathered calls overlap.
 - A worker that dies while its script waits on tools is noticed when the next result is handed to it.
 - Deeper recursion than `max_recursion_depth` (default 1000) raises a catchable `RecursionError`.
+- Monty 1.2 resolves a top-level comprehension variable named like a builtin (`[id for id in ids]`, `{type: n for type, n in pairs}`) to the builtin instead of the loop value. Before feeding a script, the sandbox renames such variables inside their comprehension (to `__codemode_<name>`), in place, so the script works as written and line numbers stay the same; an error message that names the variable shows the new name.

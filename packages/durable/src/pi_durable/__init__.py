@@ -6,8 +6,9 @@ anything is shown; reopening the storage picks work up where it stopped. See
 
 This root mirrors upstream ``index.ts``: records and interfaces (:mod:`pi_durable.types`), document,
 entry and task definitions, errors, the memory storage, the Session, and the Harness with its built-in
-documents, tasks, registry, and events. The SQLite and JSONL storages, the local environment, and the
-testing suites are imported from their own modules, so importing the root loads none of them.
+documents, tasks, registry, and events. The SQLite and JSONL storages, the local environment, the testing
+suites, the coding tools, tool search, the image processor, and code mode (``pi_durable.codemode``) are imported
+from their own modules, so importing the root loads none of them.
 """
 
 from __future__ import annotations
