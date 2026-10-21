@@ -1,35 +1,31 @@
-"""``CodemodeSandbox``: runs scripts in Monty, Pydantic's sandbox for AI-written Python.
+"""``CodemodeSandbox``: runs JavaScript in QuickJS, compiled to WebAssembly and run by wasmtime.
 
-Importing this module needs the ``codemode`` extra (``pip install 'pi-ai-python[codemode]'``);
-without it the import raises an ``ImportError`` that says so. The rest of pi_codemode (types,
-source parsing, declarations, :class:`~pi_codemode.CodemodeSandboxBase`) works without Monty.
+This is upstream's sandbox: the same QuickJS build (``quickjs-wasi`` 3.6.2), the same prelude, the same results.
+Importing this module needs the ``codemode`` extra (``pip install 'pi-ai-python[codemode]'``); without it the import
+raises an ``ImportError`` that says so. The rest of pi_codemode (types, source parsing, declarations,
+:class:`~pi_codemode.CodemodeSandboxBase`) works without wasmtime.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Iterable, Mapping
-from pathlib import Path
-from typing import Any
+import os
+from collections.abc import Iterable
 
 from .runtime.execution import DEFAULT_TIMEOUT_MS, CodemodeSandboxBase
-from .runtime.monty import DEFAULT_MAX_RECURSION_DEPTH, monty_launcher
+from .runtime.host import quickjs_launcher
+from .runtime.quickjs import MAX_STACK_SIZE
 from .types import CodemodeTool
 
 __all__ = ["CodemodeSandbox"]
 
 
 class CodemodeSandbox(CodemodeSandboxBase):
-    """Runs each execution in its own session of a Monty worker pool.
+    """Runs each execution, a JavaScript script, in a fresh QuickJS VM on a thread of its own.
 
-    A session is a dedicated ``monty`` worker subprocess, so a runaway script cannot block the
-    host's event loop, and a worker that crashes (``MontyCrashedError``) fails only its own
-    execution: the pool replaces it. Executions run in parallel up to the pool's
-    ``max_processes``; later ones wait for a free worker.
-
-    By default the sandbox owns its pool: it starts an ``AsyncMonty`` on first use and closes it
-    in :meth:`close`. Pass an entered ``AsyncMonty`` (or ``AsyncMontyWebsocket``) as ``pool`` to
-    share one between sandboxes; the sandbox then never closes it.
+    Each VM is its own wasm instance, so runs share nothing, and a VM that traps or runs out of memory fails only its
+    own execution. wasmtime releases the GIL while a script computes, so the host's event loop keeps going; the
+    deadline, an abort and :meth:`close` interrupt a computing script at once. The wasm module is compiled once per
+    process, on first use (a few hundred milliseconds, off the event loop).
     """
 
     def __init__(
@@ -39,66 +35,26 @@ class CodemodeSandbox(CodemodeSandboxBase):
         globals: Iterable[CodemodeTool] = (),
         timeout_ms: float = DEFAULT_TIMEOUT_MS,
         memory_limit_bytes: int | None = None,
-        pool: Any = None,
-        max_processes: int | None = None,
-        binary_path: str | Path | None = None,
-        max_recursion_depth: int = DEFAULT_MAX_RECURSION_DEPTH,
-        timezone: str | Mapping[str, Any] | None = None,
+        wasm_path: str | os.PathLike[str] | None = None,
+        max_stack_size: int = MAX_STACK_SIZE,
+        interrupt_budget: int | None = None,
     ) -> None:
         """
         Args:
             tools, globals, timeout_ms, memory_limit_bytes: See :class:`~pi_codemode.CodemodeSandboxBase`.
-            pool: An entered Monty pool to check sessions out of. Default: a pool of this sandbox's own.
-            max_processes: Workers of the sandbox's own pool (default: the CPU count).
-            binary_path: The ``monty`` binary of the sandbox's own pool (default: the one
-                ``pydantic-monty-runtime`` installs).
-            max_recursion_depth: Deeper recursion raises a catchable ``RecursionError``. Default 1000.
-            timezone: The zone ``execute()`` runs in: an IANA name or ``{"offset_seconds": ..., "name": ...}``.
-                Default: the host's. Deterministic runs always use UTC.
+            wasm_path: ``quickjs.wasm`` to load. Default: the bundled ``quickjs-wasi`` 3.6.2 build.
+            max_stack_size: QuickJS's stack limit in bytes, at most the default 512 KiB; deeper recursion throws a
+                catchable ``RangeError``.
+            interrupt_budget: Ends a script that computes for more than this many interrupt polls (QuickJS polls
+                about every 10,000 opcodes) with ``kind="timeout"``. Default: none, only the deadline.
         """
-        self._shared_pool = pool
-        self._max_processes = max_processes
-        self._binary_path = binary_path
-        self._own_pool: Any = None
-        self._pool_lock = asyncio.Lock()
-        self._drivers: set[asyncio.Task[None]] = set()
+        if not 0 <= max_stack_size <= MAX_STACK_SIZE:
+            raise ValueError(f"max_stack_size must be an integer between 0 and {MAX_STACK_SIZE}")
         super().__init__(
-            monty_launcher(
-                self._pool,
-                max_recursion_depth=max_recursion_depth,
-                timezone=timezone,
-                on_driver=self._track_driver,
-            ),
+            quickjs_launcher(wasm_path=wasm_path, max_stack_size=max_stack_size, interrupt_budget=interrupt_budget),
+            language="javascript",
             tools=tools,
             globals=globals,
             timeout_ms=timeout_ms,
             memory_limit_bytes=memory_limit_bytes,
         )
-
-    def _track_driver(self, task: asyncio.Task[None]) -> None:
-        self._drivers.add(task)
-        task.add_done_callback(self._drivers.discard)
-
-    async def _pool(self) -> Any:
-        if self._shared_pool is not None:
-            return self._shared_pool
-        async with self._pool_lock:
-            if self.closed:
-                raise RuntimeError("Sandbox is closed")
-            if self._own_pool is None:
-                from pydantic_monty import AsyncMonty
-
-                pool = AsyncMonty(max_processes=self._max_processes, binary_path=self._binary_path)
-                await pool.__aenter__()
-                self._own_pool = pool
-            return self._own_pool
-
-    async def close(self) -> None:
-        """Aborts in-flight executions, waits for their sessions to be released, and closes the sandbox's own pool."""
-        await super().close()
-        if self._drivers:
-            await asyncio.gather(*list(self._drivers), return_exceptions=True)
-        async with self._pool_lock:
-            pool, self._own_pool = self._own_pool, None
-        if pool is not None:
-            await pool.__aexit__(None, None, None)

@@ -18,14 +18,39 @@ _TESTS_DIR = str(Path(__file__).resolve().parent)
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 
-from pi_codemode import CodemodeSandbox, CodemodeTool  # noqa: E402
+from pi_codemode import CodemodeSandbox, CodemodeTool, MontyCodemodeSandbox  # noqa: E402
 
-SandboxFactory = Callable[..., CodemodeSandbox]
+MontySandboxFactory = Callable[..., MontyCodemodeSandbox]
+QuickJSSandboxFactory = Callable[..., CodemodeSandbox]
 
 
 @pytest.fixture
-async def new_sandbox() -> AsyncIterator[SandboxFactory]:
-    """Creates sandboxes (keyword arguments as for ``CodemodeSandbox``) and closes them after the test."""
+async def new_monty_sandbox() -> AsyncIterator[MontySandboxFactory]:
+    """Creates Python sandboxes (keyword arguments as for ``MontyCodemodeSandbox``) and closes them after the test."""
+    created: list[MontyCodemodeSandbox] = []
+
+    def make(**options: Any) -> MontyCodemodeSandbox:
+        sandbox = MontyCodemodeSandbox(**options)
+        created.append(sandbox)
+        return sandbox
+
+    yield make
+    await asyncio.gather(*(sandbox.close() for sandbox in created))
+
+
+@pytest.fixture
+def create_monty_sandbox(new_monty_sandbox: MontySandboxFactory) -> Callable[..., MontyCodemodeSandbox]:
+    """``create_monty_sandbox(tools, timeout_ms=10_000)``, upstream's ``createSandbox``."""
+
+    def make(tools: list[CodemodeTool] | None = None, timeout_ms: float = 10_000) -> MontyCodemodeSandbox:
+        return new_monty_sandbox(tools=tools or [], timeout_ms=timeout_ms)
+
+    return make
+
+
+@pytest.fixture
+async def new_quickjs_sandbox() -> AsyncIterator[QuickJSSandboxFactory]:
+    """Creates JavaScript sandboxes (keyword arguments as for ``CodemodeSandbox``) and closes them after the test."""
     created: list[CodemodeSandbox] = []
 
     def make(**options: Any) -> CodemodeSandbox:
@@ -38,10 +63,10 @@ async def new_sandbox() -> AsyncIterator[SandboxFactory]:
 
 
 @pytest.fixture
-def create_sandbox(new_sandbox: SandboxFactory) -> Callable[..., CodemodeSandbox]:
-    """``create_sandbox(tools, timeout_ms=10_000)``, upstream's ``createSandbox``."""
+def create_quickjs_sandbox(new_quickjs_sandbox: QuickJSSandboxFactory) -> Callable[..., CodemodeSandbox]:
+    """``create_quickjs_sandbox(tools, timeout_ms=10_000)``, upstream's ``createSandbox``."""
 
     def make(tools: list[CodemodeTool] | None = None, timeout_ms: float = 10_000) -> CodemodeSandbox:
-        return new_sandbox(tools=tools or [], timeout_ms=timeout_ms)
+        return new_quickjs_sandbox(tools=tools or [], timeout_ms=timeout_ms)
 
     return make

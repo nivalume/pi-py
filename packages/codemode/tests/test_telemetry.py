@@ -6,12 +6,12 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from pi_codemode import CodemodeSandbox, CodemodeTool
+from pi_codemode import CodemodeTool, MontyCodemodeSandbox
 from pi_codemode.telemetry import CODEMODE_TELEMETRY_SCHEMAS
 from pi_telemetry import InMemoryTelemetryContext, RecordedTelemetrySpan, with_content_capture
 from pi_telemetry.testing import assert_spans_match_schemas
 
-CreateSandbox = Callable[..., CodemodeSandbox]
+CreateSandbox = Callable[..., MontyCodemodeSandbox]
 
 
 async def _echo(args: Any, _context: Any) -> Any:
@@ -22,8 +22,8 @@ def _dump(spans: list[RecordedTelemetrySpan]) -> str:
     return json.dumps([[span.attributes, [[e.name, e.attributes] for e in span.events]] for span in spans])
 
 
-async def test_execute_records_a_run_span_without_content(create_sandbox: CreateSandbox) -> None:
-    sandbox = create_sandbox([CodemodeTool("echo", _echo)])
+async def test_execute_records_a_run_span_without_content(create_monty_sandbox: CreateSandbox) -> None:
+    sandbox = create_monty_sandbox([CodemodeTool("echo", _echo)])
     telemetry = InMemoryTelemetryContext()
     code = 'a = await tools.echo(x="SECRET-ARG")\nb = await tools.echo(y=2)\ntext("SECRET-OUTPUT")\nreturn 1'
     result = await sandbox.execute(code, telemetry_context=telemetry)
@@ -44,8 +44,8 @@ async def test_execute_records_a_run_span_without_content(create_sandbox: Create
     assert_spans_match_schemas(telemetry.get_spans(), CODEMODE_TELEMETRY_SCHEMAS)
 
 
-async def test_failures_record_the_kind_and_timeouts_an_event(create_sandbox: CreateSandbox) -> None:
-    sandbox = create_sandbox([], timeout_ms=200)
+async def test_failures_record_the_kind_and_timeouts_an_event(create_monty_sandbox: CreateSandbox) -> None:
+    sandbox = create_monty_sandbox([], timeout_ms=200)
     telemetry = InMemoryTelemetryContext()
     failed = await sandbox.execute('raise ValueError("SECRET-ERROR")', telemetry_context=telemetry)
     timed_out = await sandbox.execute("while True:\n    pass", telemetry_context=telemetry)
@@ -61,8 +61,8 @@ async def test_failures_record_the_kind_and_timeouts_an_event(create_sandbox: Cr
     assert_spans_match_schemas(telemetry.get_spans(), CODEMODE_TELEMETRY_SCHEMAS)
 
 
-async def test_content_capture_records_the_script_and_its_output(create_sandbox: CreateSandbox) -> None:
-    sandbox = create_sandbox([])
+async def test_content_capture_records_the_script_and_its_output(create_monty_sandbox: CreateSandbox) -> None:
+    sandbox = create_monty_sandbox([])
     telemetry = InMemoryTelemetryContext()
     await sandbox.execute('text("hello")\nreturn 1', telemetry_context=with_content_capture(telemetry))
     [span] = telemetry.get_spans()

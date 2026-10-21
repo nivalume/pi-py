@@ -5,7 +5,7 @@ remote sandbox. Both are QuickJS/Cloudflare specifics and are dropped; what they
 side runs here against :class:`CodemodeSandboxBase` with launchers written in the test: tools run in
 the caller wherever the script runs, launcher failures are sandbox errors, an abort stops the
 sandbox, and payloads that do not decode fail the run as a broken bridge. The import tests check that
-the portable parts need no Monty.
+the portable parts need neither wasmtime nor Monty.
 """
 
 from __future__ import annotations
@@ -30,32 +30,34 @@ from pi_codemode.portable import (
     VmStartData,
 )
 
-_NO_MONTY = """
+_WITHOUT_RUNTIMES = """
 import sys
 
 class Block:
     def find_spec(self, name, path=None, target=None):
-        if name == "pydantic_monty" or name.startswith("pydantic_monty."):
-            raise ImportError("No module named 'pydantic_monty'")
+        if name.split(".")[0] in ("pydantic_monty", "wasmtime"):
+            raise ImportError(f"No module named {name!r}")
         return None
 
 sys.meta_path.insert(0, Block())
 """
 
 
-def run_without_monty(code: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, "-c", _NO_MONTY + code], capture_output=True, text=True, timeout=60)
+def run_without_runtimes(code: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, "-c", _WITHOUT_RUNTIMES + code], capture_output=True, text=True, timeout=60)
 
 
-def test_portable_parts_import_without_monty() -> None:
-    completed = run_without_monty(
+def test_portable_parts_import_without_wasmtime_or_monty() -> None:
+    completed = run_without_runtimes(
         """
 import pi_codemode, pi_codemode.portable, pi_codemode.source, pi_codemode.declarations
 from pi_codemode import CodemodeSandboxBase, CodemodeTool, parse_codemode_source, render_declarations, to_codemode_identifier
-assert parse_codemode_source("# @options: {}\\nreturn 1").code == "\\nreturn 1"
-assert render_declarations(tools=[CodemodeTool("a-b", lambda a, c: a)]) == "class tools:\\n    async def a_b(self, args: Any = None, /) -> Any: ..."
+assert parse_codemode_source("// @options: {}\\nreturn 1").code == "\\nreturn 1"
+assert parse_codemode_source("# @options: {}\\nreturn 1", "python").code == "\\nreturn 1"
+assert render_declarations(tools=[CodemodeTool("a-b", lambda a, c: a)]) == "declare const tools: {\\n  a_b(args: unknown): Promise<unknown>;\\n};"
+assert render_declarations(tools=[CodemodeTool("a-b", lambda a, c: a)], language="python") == "class tools:\\n    async def a_b(self, args: Any = None, /) -> Any: ..."
 assert to_codemode_identifier("my-tool") == "my_tool"
-assert "pydantic_monty" not in sys.modules
+assert "pydantic_monty" not in sys.modules and "wasmtime" not in sys.modules
 print("ok")
 """
     )
@@ -63,11 +65,16 @@ print("ok")
     assert completed.stdout.strip() == "ok"
 
 
-def test_the_sandbox_names_the_extra_when_monty_is_missing() -> None:
-    completed = run_without_monty(
+def test_each_sandbox_names_its_extra_when_its_runtime_is_missing() -> None:
+    completed = run_without_runtimes(
         """
 import pi_codemode
-for attempt in (lambda: pi_codemode.CodemodeSandbox, lambda: __import__("pi_codemode.sandbox")):
+for attempt in (
+    lambda: pi_codemode.CodemodeSandbox,
+    lambda: __import__("pi_codemode.sandbox"),
+    lambda: pi_codemode.MontyCodemodeSandbox,
+    lambda: __import__("pi_codemode.monty"),
+):
     try:
         attempt()
     except ImportError as error:
@@ -78,8 +85,9 @@ for attempt in (lambda: pi_codemode.CodemodeSandbox, lambda: __import__("pi_code
     )
     assert completed.returncode == 0, completed.stderr
     lines = completed.stdout.strip().splitlines()
-    assert len(lines) == 2
-    assert all("pi-ai-python[codemode]" in line for line in lines)
+    assert len(lines) == 4
+    assert all("pi-ai-python[codemode]" in line and "wasmtime" in line for line in lines[:2])
+    assert all("pi-ai-python[codemode-python]" in line for line in lines[2:])
 
 
 class FakeVm:

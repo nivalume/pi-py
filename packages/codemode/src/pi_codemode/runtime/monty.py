@@ -63,8 +63,8 @@ try:
     )
 except ImportError as error:  # pragma: no cover - exercised only without the extra
     raise ImportError(
-        "pi_codemode's sandbox runs scripts in Monty, which is not installed. "
-        "Install it with `pip install 'pi-ai-python[codemode]'` (or `pip install pydantic-monty`)."
+        "pi_codemode's Python sandbox runs scripts in Monty, which is not installed. "
+        "Install it with `pip install 'pi-ai-python[codemode-python]'` (or `pip install pydantic-monty`)."
     ) from error
 
 from ..types import CodemodeDuring, CodemodeError, CodemodeImageOutput, CodemodeTextOutput

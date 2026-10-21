@@ -45,14 +45,15 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 ```bash
 pip install pi-ai-python    # contains pi_durable, pi_chord, pi_ai and pi_agent
 pip install "pi-ai-python[images]"    # adds Pillow, for the image processor of the read tool
-pip install "pi-ai-python[codemode]"  # adds pydantic-monty, the sandbox of code mode
+pip install "pi-ai-python[codemode]"         # adds wasmtime, for code mode's JavaScript sandbox (QuickJS)
+pip install "pi-ai-python[codemode-python]"  # adds pydantic-monty, for code mode's Python sandbox (Monty)
 ```
 
 Python 3.11 or newer. Everything runs on `asyncio`.
 
 ## What This Port Includes
 
-pi-durable's core: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites. Also the coding tools of `pi_durable.tools` (`read`, `write`, `edit`, `bash`, `powershell`, and the `CodingTools` extension), the `tool_search` tool of `pi_durable.tool_search`, an image processor for `read` on Pillow in `pi_durable.images` (the `images` extra), and the code mode extension of `pi_durable.codemode`, whose scripts are Python run by Monty (the `codemode` extra). See [Tools](#tools) and [Code Mode](#code-mode).
+pi-durable's core: the Session and its storages (memory, SQLite, JSONL), the Harness with its built-in generation, tool, and compaction tasks, the registry, extensions, tools you define, hooks, documents, child tasks, the task graph, views, watches, agent events, the local execution environment, and the storage and environment conformance suites. Also the coding tools of `pi_durable.tools` (`read`, `write`, `edit`, `bash`, `powershell`, and the `CodingTools` extension), the `tool_search` tool of `pi_durable.tool_search`, an image processor for `read` on Pillow in `pi_durable.images` (the `images` extra), and the code mode extension of `pi_durable.codemode`, whose scripts are JavaScript run by QuickJS as upstream's (the `codemode` extra) or, as an alternative, Python run by Monty (the `codemode-python` extra). See [Tools](#tools) and [Code Mode](#code-mode).
 
 Not included yet: the Cloudflare adapters (Durable Object SQLite storage and the Workers image processor).
 
@@ -473,7 +474,12 @@ A task that its creator awaits only in memory, and that the creator never resume
 
 ## Code Mode
 
-`pi_durable.codemode` adds a `codemode` tool: the model writes Python that calls the conversation's tools as `await tools.<name>(...)`, in a Monty sandbox ([`pi_codemode`](../codemode/README.md)). Each call is a nested tool call, and only the script's output reaches the model. The script survives a restart: it resumes where it was, without running its finished calls again. This is upstream's code mode with Python scripts instead of JavaScript; the sandbox needs the `codemode` extra (`pip install "pi-ai-python[codemode]"`).
+`pi_durable.codemode` adds a `codemode` tool: the model writes a script that calls the conversation's tools as `await tools.<name>(...)`, run in a [`pi_codemode`](../codemode/README.md) sandbox. Each call is a nested tool call, and only the script's output reaches the model. The script survives a restart: it resumes where it was, without running its finished calls again.
+
+The sandbox decides the scripts' language, and with it everything the model reads, so a conversation offers one language, never both:
+
+- `CodemodeSandbox` (the `codemode` extra): JavaScript in QuickJS, upstream's code mode as it is, with the same description, prompt section, TypeScript declarations, globals, error messages and source grammar.
+- `MontyCodemodeSandbox` (the `codemode-python` extra): Python in Monty, the same environment with Python declarations and snake_case globals.
 
 ```python
 from pi_codemode import CodemodeSandbox
@@ -481,26 +487,25 @@ from pi_durable.codemode import create_codemode_extension
 
 sandbox = CodemodeSandbox(memory_limit_bytes=256 * 1024 * 1024)
 registry.install(create_codemode_extension(sandbox=sandbox))
-# A codemode call with {"code": 'return await tools.word_count(text="a b c")'} answers '{"words":3}'.
+# A codemode call with {"code": 'return await tools.word_count({ text: "a b c" })'} answers '{"words":3}'.
 # When the process shuts down: await harness.close(context), then await sandbox.close().
 ```
 
 A script is the body of an async function, written by the model as the tool's raw input:
 
 ```text
-# @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
-import asyncio
-contents = await asyncio.gather(*[tools.read(path=path) for path in ["a.txt", "b.txt"]])
-print("read", len(contents), "files")
-found = await search_tools("github issues", limit=3)
-return [tool["name"] for tool in found]
+// @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
+const contents = await Promise.all(["a.txt", "b.txt"].map((path) => tools.read({ path })));
+console.log("read", contents.length, "files");
+const found = await searchTools("github issues", { limit: 3 });
+return found.map((tool) => tool.name);
 ```
 
-The extension also adds a `codemode` prompt section listing the tools scripts can call, as Python declarations (`async def read(self, *, path: str) -> str`) within a token budget (`inline_budget=`, default 3000); scripts find the others with `search_tools()`, `describe_tool()`, and `describe_namespace()`. Group tools by name prefix with `namespaces=[{"name": ..., "description": ..., "prefix": ...}]`, for example an MCP server's `mcp__github__`. The result reads like the coding agent's: a header, the script's output, and on failure the calls already made; text past `max_output_tokens` is cut, with the full text in a temp file. Scripts also get `models.*`: the model catalog, `models.classify()`, and `models.generate_images()`, which run as nested calls of internal tools (`models=False` turns them off). Closing the sandbox while a script runs (for example when shutting down) is not an outcome: the script resumes with the next process's sandbox. A failed nested call raises an `Exception` with its error text in the script, unless the tool declares a schema and returned its own value with the error: `tools.bash` returns `{"output": ..., "exitCode": ..., ...}` also for a nonzero exit, so scripts check `exitCode`. `store(key, value)` and `load(key)` keep JSON values per conversation; a fork sees them as they were at its entry. `pi_durable.codemode` imports no sandbox: any `pi_codemode.CodemodeSandboxBase` works.
+The extension also adds a `codemode` prompt section listing the tools scripts can call, as declarations (`read(args: { path: string; }): Promise<string>;`) within a token budget (`inline_budget=`, default 3000); scripts find the others with `searchTools()`, `describeTool()`, and `describeNamespace()`. Group tools by name prefix with `namespaces=[{"name": ..., "description": ..., "prefix": ...}]`, for example an MCP server's `mcp__github__`. The result reads like the coding agent's: a header, the script's output, and on failure the calls already made; text past `max_output_tokens` is cut, with the full text in a temp file. Scripts also get `models.*`: the model catalog, `models.classify()`, and `models.generateImages()`, which run as nested calls of internal tools (`models=False` turns them off). Closing the sandbox while a script runs (for example when shutting down) is not an outcome: the script resumes with the next process's sandbox. A failed nested call rejects with an `Error` that carries its error text and `structuredOutput`, unless the tool declares a schema and returned its own value with the error: `tools.bash` resolves to `{ output, exitCode, ... }` also for a nonzero exit, so scripts check `exitCode`. `store(key, value)` and `load(key)` keep JSON values per conversation; a fork sees them as they were at its entry. `pi_durable.codemode` imports no sandbox: any `pi_codemode.CodemodeSandboxBase` works.
 
-Script globals are snake_case where upstream's are camelCase; tool names do not change (`tools.mcp__github__list_issues`, and the internal tools `pi.codemode.models.classify` and `pi.codemode.models.generateImages`):
+With a `MontyCodemodeSandbox` the same script is Python, and the globals are snake_case; tool names do not change (`tools.mcp__github__list_issues`, and the internal tools `pi.codemode.models.classify` and `pi.codemode.models.generateImages`):
 
-| Upstream (JavaScript) | Here (Python) |
+| JavaScript (`CodemodeSandbox`, upstream's) | Python (`MontyCodemodeSandbox`) |
 | --- | --- |
 | `// @options: {...}` | `# @options: {...}` |
 | `await tools.read({ path })` | `await tools.read(path=...)` or `await tools.read({"path": ...})` |
@@ -514,10 +519,11 @@ Script globals are snake_case where upstream's are camelCase; tool names do not 
 | `models.classify(model, context)` | `models.classify(model, context)` |
 | `models.generateImages(model, context)` | `models.generate_images(model, context)` |
 | `undefined` (a missing value) | `None` |
+| a failed call's `error.structuredOutput` | not visible: Monty exceptions carry only a message |
 
-Catalog entries, classifier and image contexts, and model results are pi-ai's JSON, with camelCase keys (`result["stopReason"]`, `{"type": "image", "data": ..., "mimeType": ...}`). Exceptions in Monty carry only a message, so the `structuredOutput` upstream attaches to a failed call's error is not visible to scripts. A script that returns `None` adds no value to the output, since Python cannot tell `return None` from no `return`.
+Catalog entries, classifier and image contexts, and model results are pi-ai's JSON, with camelCase keys (`result.stopReason`, `{ type: "image", data, mimeType }`) in both languages. A script that returns `null` or `undefined` (`None`) adds no value to the output.
 
-How it survives a restart: the sandbox runs the script deterministically (a virtual clock, seeded randomness, UTC), and the tool writes each result the script gets to a journal before handing it over. After a restart, the tool runs the script again and hands it the journaled results in the same order, so it makes the same calls with the same arguments; these reattach to their nested calls by key, and then the script continues. A rerun ends the call with an error instead when the script takes another path than before, when the sandbox's fingerprint or the code mode version changed, or when its `timeout_ms` passed meanwhile. A nested call running at the restart follows its own replay policy. The run and journal documents keep upstream's format, but a run cannot move between languages: a TypeScript run resumed here (or the other way round) ends with "the sandbox changed since it started", since the scripts, the globals' names, and the sandbox fingerprints differ.
+How it survives a restart: the sandbox runs the script deterministically (a virtual clock, seeded randomness, UTC), and the tool writes each result the script gets to a journal before handing it over. After a restart, the tool runs the script again and hands it the journaled results in the same order, so it makes the same calls with the same arguments; these reattach to their nested calls by key, and then the script continues. A rerun ends the call with an error instead when the script takes another path than before, when the sandbox's fingerprint or the code mode version changed, or when its `timeout_ms` passed meanwhile. A nested call running at the restart follows its own replay policy. The run and journal documents keep upstream's format. A run cannot move between languages: one started with a `CodemodeSandbox` and resumed with a `MontyCodemodeSandbox` (or the other way round) ends with "the sandbox changed since it started", since the scripts, the globals' names, and the sandbox fingerprints differ. A JavaScript run reports the same fingerprint as upstream's sandbox.
 
 ## System Prompt
 
@@ -1104,7 +1110,7 @@ Task code gets the running phase's span as `runtime.telemetry_context`, and a to
 - **Storage and environment modules**: `openNodeSqliteStorage` is `open_sqlite_storage` (on `sqlite3`), `openNodeJsonlStorage` is `open_local_jsonl_storage`, `NodeExecutionEnv` is `LocalExecutionEnv` (id `"local"`), `Storage.entry(conversationId, id)` is `visible_entry()`, and `FileSystem.list_files()` is a required method that may return `not_supported`. The conformance suites register with pytest.
 - **Binary data** is `bytes`; IDs are plain `int`s (`TaskId`, `EntryId`, ... are type-checker brands).
 - **Tools and images**: `createCodingTools({ images })` is `create_coding_tools(images=...)`, `createBashTool({ commandPrefix, prepare })` is `create_bash_tool(command_prefix=..., prepare=...)` (`prepare` changes the `BashExecution` dict's `command`, `cwd`, `env`, and `inheritEnv`), and `createNodePhotonImages()` is `create_pillow_images()`, on Pillow instead of Photon, in a worker thread without an idle timeout. `read` keeps JavaScript's number semantics for `offset` and `limit`, so fractional, negative, and huge values select and print the same lines.
-- **Code mode** runs Python scripts in Monty instead of JavaScript in QuickJS: `createCodemodeExtension({ sandbox })` is `create_codemode_extension(sandbox=...)`, script globals are snake_case (`search_tools()`, `models.generate_images()`), and a run journaled by one language does not resume in the other (see [Code Mode](#code-mode)).
+- **Code mode** runs JavaScript in QuickJS as upstream's does, on wasmtime instead of a worker thread; `createCodemodeExtension({ sandbox })` is `create_codemode_extension(sandbox=...)`. Python scripts in Monty are an addition: with a `MontyCodemodeSandbox` the script globals are snake_case (`search_tools()`, `models.generate_images()`), and a run journaled in one language does not resume in the other (see [Code Mode](#code-mode)).
 - **Not ported yet**: the Cloudflare adapters (see [What This Port Includes](#what-this-port-includes)).
 
 ## Design Notes

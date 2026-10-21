@@ -24,7 +24,7 @@ from typing import Any, Literal
 import pytest
 
 from pi_ai.abort import AbortController
-from pi_codemode import CodemodeFailure, CodemodeSandbox, CodemodeSuccess, CodemodeTextOutput, CodemodeTool
+from pi_codemode import CodemodeFailure, CodemodeSuccess, CodemodeTextOutput, CodemodeTool, MontyCodemodeSandbox
 
 
 def monty_workers() -> list[int]:
@@ -49,7 +49,7 @@ linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="re
 
 
 async def test_reports_a_pool_that_cannot_start_as_a_sandbox_error() -> None:
-    sandbox = CodemodeSandbox(binary_path="/nonexistent/monty")
+    sandbox = MontyCodemodeSandbox(binary_path="/nonexistent/monty")
     try:
         result = await sandbox.execute("return 1")
         assert isinstance(result, CodemodeFailure)
@@ -70,7 +70,7 @@ async def test_settles_without_waiting_for_the_worker(how: Literal["abort", "tim
         called.set()
         await asyncio.Event().wait()
 
-    sandbox = CodemodeSandbox(timeout_ms=300, tools=[CodemodeTool("hang", hang)])
+    sandbox = MontyCodemodeSandbox(timeout_ms=300, tools=[CodemodeTool("hang", hang)])
     controller = AbortController()
     code = 'text("partial")\nawait tools.hang()' if wait == "tool" else 'text("partial")\nwhile True:\n    pass'
     pending = asyncio.ensure_future(sandbox.execute(code, signal=controller.signal))
@@ -105,7 +105,7 @@ async def test_settles_without_waiting_for_the_worker(how: Literal["abort", "tim
 
 async def test_returns_the_session_to_the_pool_after_execute_and_start() -> None:
     # One worker: a session that were not released would block the next checkout.
-    sandbox = CodemodeSandbox(max_processes=1)
+    sandbox = MontyCodemodeSandbox(max_processes=1)
     try:
         for index in range(3):
             assert isinstance(await sandbox.execute(f"return {index}"), CodemodeSuccess)
@@ -129,7 +129,7 @@ async def test_max_processes_bounds_concurrent_executions() -> None:
         events.append(f"end {args}")
         return args
 
-    sandbox = CodemodeSandbox(max_processes=1, tools=[CodemodeTool("step", step)])
+    sandbox = MontyCodemodeSandbox(max_processes=1, tools=[CodemodeTool("step", step)])
     try:
         results = await asyncio.gather(
             sandbox.execute("return await tools.step('a')"), sandbox.execute("return await tools.step('b')")
@@ -142,7 +142,7 @@ async def test_max_processes_bounds_concurrent_executions() -> None:
 
 @linux_only
 async def test_a_crashed_worker_fails_only_its_own_execution() -> None:
-    sandbox = CodemodeSandbox(max_processes=2, timeout_ms=20_000)
+    sandbox = MontyCodemodeSandbox(max_processes=2, timeout_ms=20_000)
 
     def kill_workers() -> None:
         for pid in monty_workers():
@@ -177,8 +177,8 @@ async def test_a_shared_pool_outlives_the_sandboxes_that_use_it() -> None:
     from pydantic_monty import AsyncMonty
 
     async with AsyncMonty(max_processes=2) as pool:
-        first = CodemodeSandbox(pool=pool)
-        second = CodemodeSandbox(pool=pool)
+        first = MontyCodemodeSandbox(pool=pool)
+        second = MontyCodemodeSandbox(pool=pool)
         assert isinstance(await first.execute("return 1"), CodemodeSuccess)
         await first.close()
         result = await second.execute("return 2")
@@ -189,7 +189,7 @@ async def test_a_shared_pool_outlives_the_sandboxes_that_use_it() -> None:
 
 
 async def test_close_waits_for_sessions_and_closes_its_own_pool() -> None:
-    sandbox = CodemodeSandbox()
+    sandbox = MontyCodemodeSandbox()
     running = asyncio.ensure_future(sandbox.execute("while True:\n    pass"))
     await asyncio.sleep(0.1)
     await asyncio.wait_for(sandbox.close(), 10)
@@ -204,10 +204,10 @@ async def test_close_waits_for_sessions_and_closes_its_own_pool() -> None:
 _PROCESS_EXIT = """
 import asyncio, json, sys, time
 from pi_ai.abort import AbortController
-from pi_codemode import CodemodeSandbox
+from pi_codemode import MontyCodemodeSandbox
 
 async def main(how):
-    sandbox = CodemodeSandbox(timeout_ms=200 if how == "timeout" else 60_000)
+    sandbox = MontyCodemodeSandbox(timeout_ms=200 if how == "timeout" else 60_000)
     controller = AbortController()
     started = time.perf_counter()
     pending = asyncio.ensure_future(sandbox.execute("while True:\\n    pass", signal=controller.signal))

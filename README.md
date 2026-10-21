@@ -9,16 +9,17 @@ PyPI as one package, `pi-ai-python`, with these import packages:
 | [`pi_agent`](https://github.com/nivalume/pi-py/blob/main/packages/agent/README.md) | `@earendil-works/pi-agent-core` | Stateful agent: tool execution (parallel or sequential), steering and follow-up queues, lifecycle events, hooks |
 | [`pi_durable`](https://github.com/nivalume/pi-py/blob/main/packages/durable/README.md) | `@earendil-works/pi-durable` | Durable agent harness: conversations, model turns, tool calls and your own state are committed to storage (memory, SQLite, JSONL) before anything is shown, and work resumes after a crash or restart |
 | [`pi_chord`](https://github.com/nivalume/pi-py/blob/main/packages/chord/README.md) | `@earendil-works/chord` (subset) | What `pi_durable` builds on: explicit cancellation contexts, strict JSON, the transactional JSON tracker and op batches, replicated state, bounded output, an async SQLite layer |
-| [`pi_codemode`](https://github.com/nivalume/pi-py/blob/main/packages/codemode/README.md) | `@earendil-works/pi-codemode` | Code mode: model-written Python, run in the Monty sandbox, whose only capability is calling injected tools; Python declarations for the model, deterministic runs for durable replay |
+| [`pi_codemode`](https://github.com/nivalume/pi-py/blob/main/packages/codemode/README.md) | `@earendil-works/pi-codemode` | Code mode: model-written JavaScript run in QuickJS (upstream's build, on wasmtime) or, as an alternative, Python run in Monty, whose only capability is calling injected tools; TypeScript (or Python) declarations for the model, deterministic runs for durable replay |
 | [`pi_telemetry`](https://github.com/nivalume/pi-py/blob/main/packages/telemetry/README.md) | `@earendil-works/pi-telemetry` | Vendor-neutral telemetry: explicit callback-based spans, typed schemas, an in-memory reference adapter and conformance suite, an OpenTelemetry adapter with GenAI conventions and metrics; the other packages record `pi.ai.*`, `pi.agent.*`, `pi.harness.*`, `pi.session.*` and `pi.codemode.*` spans when given a context |
 
 ```bash
 pip install pi-ai-python               # httpx + official SDKs: anthropic, openai, google-genai
 pip install "pi-ai-python[bedrock]"    # + boto3 for Amazon Bedrock
 pip install "pi-ai-python[images]"     # + Pillow, for pi_durable's image processor
-pip install "pi-ai-python[codemode]"   # + pydantic-monty, the sandbox of pi_codemode
+pip install "pi-ai-python[codemode]"   # + wasmtime, pi_codemode's JavaScript sandbox (QuickJS)
+pip install "pi-ai-python[codemode-python]"  # + pydantic-monty, pi_codemode's Python sandbox (Monty)
 pip install "pi-ai-python[otel]"       # + opentelemetry-api, for pi_telemetry's OpenTelemetry adapter
-pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow, pydantic-monty, opentelemetry-api
+pip install "pi-ai-python[all]"        # + orjson, websockets, pydantic, boto3, pillow, wasmtime, pydantic-monty, opentelemetry-api
 ```
 
 中文说明见 [README.zh-CN.md](https://github.com/nivalume/pi-py/blob/main/README.zh-CN.md)。
@@ -103,7 +104,8 @@ asyncio.run(main())
 `pi_durable` stores records in the same format as TypeScript pi-durable, so a SQLite or JSONL
 storage written by one opens in the other. The coding tools (`pi_durable.tools`: read, write,
 edit, bash), tool search, an image processor on Pillow, and the code mode extension
-(`pi_durable.codemode`, whose scripts are Python run by Monty and survive a restart) are included;
+(`pi_durable.codemode`, whose scripts are JavaScript run by QuickJS, or Python run by Monty, and survive a restart)
+are included;
 not ported yet: the Cloudflare adapters.
 
 ## Same API, Python conventions

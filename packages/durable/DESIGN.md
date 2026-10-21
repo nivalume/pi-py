@@ -478,10 +478,11 @@ Rules:
 |---|---|
 | `codemode/index.ts` | `pi_durable/codemode/__init__.py`: `create_codemode_extension`, `create_codemode_tool`, `CodemodeStoreDoc`, `CodemodeNamespace`, `CodemodeToolDetails`, `CodemodeNestedCall`, `CodemodeToolInput`, `CodemodeGlobal`, `CODEMODE_MODULE_VERSION`, `CODEMODE_TOOL_NAME`, `DEFAULT_CODEMODE_INLINE_BUDGET` |
 | `codemode/codemode.ts` | `pi_durable/codemode/codemode.py` (also `CodemodeRunDoc`, `CodemodeJournalDoc`; the call is `_CodemodeCall`) |
-| `codemode/describe.ts`, `models.ts`, `output.ts` | `pi_durable/codemode/{describe,models,output}.py` |
+| `codemode/describe.ts`, `models.ts`, `output.ts` | `pi_durable/codemode/{describe,models,output}.py`; the language's names and texts in `pi_durable/codemode/dialect.py` |
 
-Scripts are Python, run by a `pi_codemode` sandbox (Monty) through `CodemodeSandboxBase.start()`/`CodemodeRun.deliver()`;
-everything else is upstream's.
+Scripts run in the `pi_codemode` sandbox the caller gives, through `CodemodeSandboxBase.start()`/`CodemodeRun.deliver()`,
+in its language (`sandbox.language`): JavaScript in QuickJS with `CodemodeSandbox` (upstream's language, the default), or
+Python in Monty with `MontyCodemodeSandbox`. A tool offers one language. Everything else is upstream's.
 
 API shape:
 
@@ -489,15 +490,20 @@ API shape:
   `create_codemode_tool(...)` take upstream's `CodemodeToolOptions` as keyword arguments. `CodemodeNamespace` is a
   `TypedDict` (`name`, `prefix`, optional `description`, `instructions`); `CodemodeGlobal(name, execute, spread=False)` is
   a frozen dataclass with `execute(args, api, context)` (internal, as upstream's `globals`).
-- What the model reads is rewritten for Python: the tool description (`await tools.<name>(key=value, ...)`,
-  `asyncio.gather`, `print`, `# @options:`), the `codemode` section (pi_codemode's Python declarations, `### \`id\``
-  headings and budget rules as upstream), the parameter description (`Raw Python source.`), the `models.*` description and
-  the error texts that show script syntax (`context["state"] must be a dict`, `models.get_model_of_type(...)`).
-- Script globals are snake_case: `search_tools`, `describe_tool`, `describe_namespace`, `models.get_models_of_type`,
+- What the model reads comes from `dialect.py`'s `JAVASCRIPT` or `PYTHON`. JavaScript's is upstream's text: the tool
+  description, the `codemode` section (TypeScript declarations, `### \`id\`` headings and budget rules), the parameter
+  description (`Raw JavaScript source.`), the `// @options:` grammar, the `models.*` description and the error texts, word
+  for word (tests compare with upstream's output). Python's is rewritten: the tool description
+  (`await tools.<name>(key=value, ...)`, `asyncio.gather`, `print`, `# @options:`), Python declarations, the parameter
+  description (`Raw Python source.`), the `models.*` description and the error texts that show Python syntax
+  (`context["state"] must be a dict`, `models.get_model_of_type(...)`).
+- JavaScript's script globals are upstream's camelCase ones (`searchTools`, `describeTool`, `describeNamespace`,
+  `models.getModelsOfType`, `models.getAvailableOfType`, `models.getModelOfType`, `models.classify`,
+  `models.generateImages`), with positional arguments. Python's script globals are snake_case: `search_tools`, `describe_tool`, `describe_namespace`, `models.get_models_of_type`,
   `models.get_available_of_type`, `models.get_model_of_type`, `models.classify`, `models.generate_images`. Tool names
   stay upstream's, including the internal `pi.codemode.models.classify` and `pi.codemode.models.generateImages` (the
   details rows show `models.generateImages` like upstream's). Spread globals receive the positional arguments as a list
-  and keyword arguments as a trailing dict; `models.bind_arguments(args, names)` binds a trailing dict whose keys all name
+  and keyword arguments as a trailing dict; `PYTHON.bind(args, names)` binds a trailing dict whose keys all name
   unfilled parameters as keywords, so `f(a, b)`, `f(a, b=b)` and `f(a=a, b=b)` agree. `search_tools(query, limit=...,
   namespace=...)` takes its options as keywords or as upstream's one options dict.
 - Model calls: contexts are checked as upstream's and decoded with `pi_ai.serialization.from_dict` into
@@ -511,7 +517,8 @@ Rules:
   `store`; `outputDir`; `result`), `pi.codemode.journal` (`entries[{id, at, issuedAfter?, global?: {name, args?,
   outcome}}]`, `firstIssued`), `pi.codemode.store` (`values`, rewindable, `fork="asOf"`). A stored `result` is the tool
   result with its `output` as pi-ai JSON. `CODEMODE_MODULE_VERSION` stays 2. Runs do not move between languages: the
-  fingerprints (`pydantic-monty ...` versus QuickJS's) differ, so a resumed foreign run ends with "the sandbox changed".
+  fingerprints (`pydantic-monty ...` versus `quickjs-wasi ...`) differ, so a run resumed in the other language ends with
+  "the sandbox changed". JavaScript's fingerprint is upstream's.
 - **Replay** follows upstream line by line: the fingerprint gate, journal-ordered delivery of replayed results, the
   per-result acknowledged counts, held calls checked against earlier attempts' `NestedCallDoc` keys (`c<VM call id>`)
   before any launches, launch only once a call's issued count is committed, divergence and mismatch decided once in the
@@ -524,13 +531,15 @@ Rules:
   the VM is still working through go with the next commit (upstream's stated rule; its code commits them at once, which
   with Monty's 0.3 ms round trips costs a commit per few results).
 - Script values: `None` is upstream's `undefined` (a global's `None` is journaled without `value`; a script returning
-  `None` adds no value to the output). A failed call's outcome keeps upstream's `properties.structuredOutput`, which Monty
-  scripts cannot see (exceptions hold a message). "aborted" results not caused by the call (`Sandbox closed`) store
+  `null`, `undefined` or `None` adds no value to the output, where upstream shows `null` for `return null`). A failed
+  call's outcome keeps upstream's `properties.structuredOutput`: JavaScript scripts see it on the `Error`, Monty scripts
+  cannot (exceptions hold a message). "aborted" results not caused by the call (`Sandbox closed`) store
   nothing and raise once the call's context aborts, as upstream.
 - Output (`output.py`): upstream's layout, budgets, spill and image files; lengths count code points, `value_text` is
   compact `json.dumps` (`separators=(",", ":")`, non-ASCII raw), wall time `f"{ms / 1000:.1f}"`.
 - `pi_durable.codemode` imports pi_codemode's portable modules only (`source`, `identifier`, `declarations`, `types`, and
   the host runtime's types); the sandbox comes from the caller. `pi_durable` does not import `pi_durable.codemode`, and
   neither loads `pi_codemode.sandbox` or `pydantic_monty` (`tests/test_storage_runtime_boundary.py`).
-- Tests (`tests/test_codemode*.py`) need Monty and skip without it, except the description/section ones; every restart
-  case runs on MemoryStorage and SQLite.
+- Tests: `tests/test_codemode.py` and `test_codemode_models.py` run Python scripts (they need Monty and skip without
+  it), `tests/test_codemode_javascript.py` and its siblings JavaScript scripts on QuickJS; the description/section tests
+  cover both languages; every restart case runs on MemoryStorage and SQLite.

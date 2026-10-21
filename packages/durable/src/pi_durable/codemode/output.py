@@ -1,7 +1,7 @@
 """A script's result as the model reads it (port of ``codemode/output.ts``).
 
 A "Script completed/failed" header with the wall time, the script's text items (``==> text N/M <==`` when there are
-several), its ``print`` lines in one ``<console_output>`` block, the returned value, and on failure the error with the
+several), its ``console``/``print`` lines in one ``<console_output>`` block, the returned value, and on failure the error with the
 calls already made. Text past the token budget is cut to its start and end, with the complete text in a temp file;
 images are saved to temp files too, with their path next to them, because a script has no other way to hand their
 bytes on.
@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Final, TypeAlias, TypedDict
 
 from pi_ai import ImageContent, TextContent
 from pi_codemode.types import CodemodeFailure, CodemodeSuccess, CodemodeTextOutput
+
+from .dialect import JAVASCRIPT, Dialect
 
 if TYPE_CHECKING:
     from pi_codemode.types import CodemodeOutputItem, CodemodeResult
@@ -71,7 +73,7 @@ def value_text(value: Any) -> str:
 
 def _format_items(output: Sequence[CodemodeOutputItem]) -> list[_Item]:
     """Lay out the script's output so the model can tell items apart: with more than one text item, each starts with
-    a ``==> text N/M <==`` line; ``print`` lines follow all other output in one ``<console_output>`` block."""
+    a ``==> text N/M <==`` line; console lines follow all other output in one ``<console_output>`` block."""
     total = sum(1 for item in output if item.type == "text" and not item.console)
     items: list[_Item] = []
     console_lines: list[str] = []
@@ -221,28 +223,23 @@ async def format_result(
     calls: Sequence[Any],
     limits: ToolOutputLimits,
     write: OutputFile,
+    dialect: Dialect = JAVASCRIPT,
 ) -> FormattedResult:
     """The tool result's content for a script's result.
 
     Args:
-        generated_images: Images ``models.generate_images()`` returned; when the script showed none, the result says so.
+        generated_images: Images ``models.generateImages()`` returned; when the script showed none, the result says so.
         calls: The code mode call's rows (``name``, ``status``), for a failure's summary.
     """
     output: list[CodemodeOutputItem] = list(result.output)
-    # A Python script cannot tell `return None` from no return: neither adds a value.
+    # The sandbox reports no value for `return null` (`return None`) and for no return: neither adds a value.
     if isinstance(result, CodemodeSuccess) and result.value is not None:
         output.append(CodemodeTextOutput(value_text(result.value)))
     items = _format_items(output)
     if isinstance(result, CodemodeFailure):
         items.append(TextContent(f"Script error:\n{_format_error(result, calls)}"))
     if generated_images > 0 and not any(isinstance(item, ImageContent) for item in items):
-        plural = "" if generated_images == 1 else "s"
-        items.append(
-            TextContent(
-                f"Note: models.generate_images() returned {generated_images} image{plural} that the script did not "
-                'show. Show each image block of result["output"] with image(block).'
-            )
-        )
+        items.append(TextContent(dialect.generated_images_note(generated_images)))
     truncated = await _truncate(_join_adjacent_text(items), max_output_tokens, limits, write)
     # After truncation, which joins the text items and moves images after them, so each path stays next to its image.
     content = _join_adjacent_text(await _save_images(truncated.items, write))

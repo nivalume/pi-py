@@ -2,11 +2,13 @@
 
 The host owns everything the script must not influence: the tool table, call records,
 output, the deadline, the caller's abort signal, and the decoding of what the sandbox
-reports. The sandbox itself runs wherever a :data:`VmLauncher` decides (a Monty worker for
-:class:`~pi_codemode.CodemodeSandbox`). The two sides only exchange the messages in
+reports. The sandbox itself runs wherever a :data:`VmLauncher` decides (a QuickJS VM on its own
+thread for :class:`~pi_codemode.CodemodeSandbox`, a Monty worker for
+:class:`~pi_codemode.MontyCodemodeSandbox`). The two sides only exchange the messages in
 :mod:`pi_codemode.runtime.protocol`, so launchers differ in transport and termination, not in
-behavior. This module imports no sandbox, so hosts that bring their own launcher (or only
-declare tools) do not need Monty.
+behavior. The host only needs to know the scripts' language for names: which identifiers tools
+get and which globals are reserved. This module imports no sandbox, so hosts that bring their
+own launcher (or only declare tools) need neither wasmtime nor Monty.
 
 Lifecycle of one execution:
 
@@ -38,6 +40,7 @@ from pi_chord.json import JsonValue
 from pi_telemetry import NOOP_TELEMETRY_CONTEXT, TelemetryContext
 
 from ..identifier import is_codemode_identifier, to_codemode_identifier
+from ..language import CodemodeLanguage, check_codemode_language
 from ..types import (
     CodemodeCall,
     CodemodeCallStatus,
@@ -85,8 +88,11 @@ __all__ = [
 ]
 
 DEFAULT_TIMEOUT_MS: Final = 300_000
-#: Names a global may not take: the script's built-in globals.
-RESERVED_GLOBALS: Final = frozenset({"tools", "ALL_TOOLS", "print", "text", "image", "exit", "store", "load"})
+#: Names a global may not take: the script's built-in globals, by language.
+RESERVED_GLOBALS: Final[Mapping[CodemodeLanguage, frozenset[str]]] = {
+    "javascript": frozenset({"tools", "ALL_TOOLS", "console", "text", "image", "exit", "globalThis", "store", "load"}),
+    "python": frozenset({"tools", "ALL_TOOLS", "print", "text", "image", "exit", "store", "load"}),
+}
 
 
 class VmEvents(Protocol):
@@ -182,16 +188,25 @@ def _check_output(item: object) -> CodemodeOutputItem:
     raise BridgeError("output item is malformed")
 
 
-def check_globals(globals: Iterable[CodemodeDeclaredGlobal | CodemodeTool]) -> None:
-    """Checks global names: identifiers or ``namespace.member``, not shadowing a built-in global or each other."""
+def check_globals(
+    globals: Iterable[CodemodeDeclaredGlobal | CodemodeTool], language: CodemodeLanguage = "javascript"
+) -> None:
+    """Checks global names: identifiers or ``namespace.member``, not shadowing a built-in global or each other.
+
+    In Python, names starting with ``__`` are the prelude's, so they are refused too.
+    """
+    reserved = RESERVED_GLOBALS[check_codemode_language(language)]
     names: set[str] = set()
     namespaces: set[str] = set()
     for global_ in globals:
         parts = global_.name.split(".")
         if (
             len(parts) > 2
-            or not all(is_codemode_identifier(part) and not part.startswith("__") for part in parts)
-            or parts[0] in RESERVED_GLOBALS
+            or not all(
+                is_codemode_identifier(part, language) and not (language == "python" and part.startswith("__"))
+                for part in parts
+            )
+            or parts[0] in reserved
         ):
             raise ValueError(f'Invalid global name "{global_.name}"')
         if global_.name in names:
@@ -260,6 +275,7 @@ class _Execution:
         deterministic: tuple[float, int] | None,
         control: _Control | None,
         launch: VmLauncher,
+        language: CodemodeLanguage,
     ) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop_thread = threading.get_ident()
@@ -297,7 +313,8 @@ class _Execution:
         data = VmStartData(
             code=code,
             tools=tuple(
-                (tool.name, tool.js_name or to_codemode_identifier(tool.name), tool.description or "") for tool in tools
+                (tool.name, tool.js_name or to_codemode_identifier(tool.name, language), tool.description or "")
+                for tool in tools
             ),
             globals=tuple((global_.name, global_.spread) for global_ in globals),
             memory_limit_bytes=memory_limit_bytes,
@@ -566,19 +583,21 @@ def _signal_of(signal: AbortSignal | None, context: Context | None) -> AbortSign
 class CodemodeSandboxBase:
     """Tool table, defaults and in-flight executions: the behavior every sandbox shares.
 
-    Subclasses only choose where the sandbox runs by passing a :data:`VmLauncher`.
+    Subclasses only choose where the sandbox runs by passing a :data:`VmLauncher`, and the
+    language its scripts are written in.
 
     The script sees ``tools.<name>(...)`` for every registered tool, ``ALL_TOOLS``, the output
-    helpers ``text``, ``image``, ``print`` and ``exit``, ``store``/``load``, and the configured
-    globals; nothing else (no filesystem, network, subprocesses or host modules). Each
-    ``execute()`` gets its own sandbox session; the sandbox object only holds the tool table
-    and defaults. ``close()`` aborts in-flight executions.
+    helpers ``text``, ``image``, ``exit`` and ``console.*`` (JavaScript) or ``print`` (Python),
+    ``store``/``load``, and the configured globals; nothing else (no filesystem, network,
+    subprocesses or host modules). Each ``execute()`` gets its own sandbox session; the sandbox
+    object only holds the tool table and defaults. ``close()`` aborts in-flight executions.
     """
 
     def __init__(
         self,
         launch: VmLauncher,
         *,
+        language: CodemodeLanguage = "javascript",
         tools: Iterable[CodemodeTool] = (),
         globals: Iterable[CodemodeTool] = (),
         timeout_ms: float = DEFAULT_TIMEOUT_MS,
@@ -587,19 +606,22 @@ class CodemodeSandboxBase:
         """
         Args:
             launch: Starts the sandbox of one execution.
+            language: The language of the scripts ``launch``'s sandbox runs. It decides the
+                identifiers tools get and the reserved global names.
             tools: Functions scripts call as ``await tools.<name>(...)``.
             globals: Functions exposed as top-level names instead of on ``tools``, for host
                 helpers such as attaching an image to the result. They behave like tools (JSON
                 round trip, awaitable result) but are not recorded in ``result.calls``. Names
                 must be identifiers, or ``namespace.member``, and may not shadow the built-in
-                globals (``tools``, ``ALL_TOOLS``, ``print``, ``text``, ``image``, ``exit``,
-                ``store``, ``load``).
+                globals (:data:`RESERVED_GLOBALS`).
             timeout_ms: Overall deadline per execution, including time spent in tools.
                 ``math.inf`` disables it; the execution then only ends when the script settles
                 or is aborted. Default: 300000.
             memory_limit_bytes: Maximum heap the sandbox may use. Allocations beyond it fail the
-                script with ``MemoryError``. Default: no limit.
+                script (``InternalError: out of memory`` in JavaScript, ``MemoryError`` in
+                Python). Default: no limit.
         """
+        self._language: CodemodeLanguage = check_codemode_language(language)
         self._tools_by_name: dict[str, CodemodeTool] = {}
         self._globals_by_name: dict[str, CodemodeTool] = {}
         self._timeout_ms = timeout_ms
@@ -610,9 +632,14 @@ class CodemodeSandboxBase:
         for tool in tools:
             self.register_tool(tool)
         globals = list(globals)
-        check_globals(globals)
+        check_globals(globals, self._language)
         for global_ in globals:
             self._globals_by_name[global_.name] = global_
+
+    @property
+    def language(self) -> CodemodeLanguage:
+        """The language of the scripts this sandbox runs."""
+        return self._language
 
     @property
     def memory_limit_bytes(self) -> int | None:
@@ -708,6 +735,7 @@ class CodemodeSandboxBase:
             deterministic=None,
             control=None,
             launch=self._launch,
+            language=self._language,
         )
         self._running.add(execution)
         try:
@@ -743,7 +771,8 @@ class CodemodeSandboxBase:
         the same arguments and produces the same output, on any sandbox with the same
         fingerprint. A host can therefore replay it after a restart. The sandbox runs in UTC,
         its clock reads ``started_at`` and then the ``now`` of the result being processed
-        (sleeps advance it without waiting), and its randomness comes from ``seed``.
+        (in Python, sleeps advance it without waiting), and its randomness comes from ``seed``;
+        JavaScript has no ``WeakRef`` or ``FinalizationRegistry`` in such a run.
 
         The sandbox's own tools and globals are not used: the run declares its own, and every
         call goes to ``on_call``. Never raises for script failures; abort through ``signal``
@@ -752,7 +781,8 @@ class CodemodeSandboxBase:
 
         Args:
             started_at: The clock's start, in ms since the epoch.
-            seed: Seeds ``random`` and ``os.urandom()``. A 32-bit unsigned integer.
+            seed: Seeds ``Math.random()`` (JavaScript) or ``random`` and ``os.urandom()`` (Python).
+                A 32-bit unsigned integer.
             on_call: The script made a call. Answer it with :meth:`CodemodeRun.deliver`, now or later.
             timeout_ms: Deadline of this run in ms. Default: none (not the sandbox's default).
             on_started: The sandbox's fingerprint, before the script runs and before any of its calls.
@@ -773,14 +803,14 @@ class CodemodeSandboxBase:
         tools = list(tools)
         if len({tool.name for tool in tools}) != len(tools):
             raise ValueError("Tool names must be unique")
-        script_names = [tool.js_name or to_codemode_identifier(tool.name) for tool in tools]
+        script_names = [tool.js_name or to_codemode_identifier(tool.name, self._language) for tool in tools]
         if len(set(script_names)) != len(tools):
             raise ValueError("Tool script names must be unique")
         for name in script_names:
-            if not is_codemode_identifier(name):
+            if not is_codemode_identifier(name, self._language):
                 raise ValueError(f'Invalid tool script name "{name}"')
         globals = list(globals)
-        check_globals(globals)
+        check_globals(globals, self._language)
         execution = _Execution(
             code=code,
             tools=tools,
@@ -793,6 +823,7 @@ class CodemodeSandboxBase:
             deterministic=(float(started_at), seed),
             control=_Control(on_call, on_started, on_idle),
             launch=self._launch,
+            language=self._language,
         )
         self._running.add(execution)
         execution.future.add_done_callback(lambda _future: self._running.discard(execution))

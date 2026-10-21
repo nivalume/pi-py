@@ -45,14 +45,15 @@
 ```bash
 pip install pi-ai-python    # 包含 pi_durable、pi_chord、pi_ai 和 pi_agent
 pip install "pi-ai-python[images]"    # 增加 Pillow，用于 read 工具的图像处理器
-pip install "pi-ai-python[codemode]"  # 增加 pydantic-monty，即代码模式的沙箱
+pip install "pi-ai-python[codemode]"         # 增加 wasmtime，用于代码模式的 JavaScript 沙箱（QuickJS）
+pip install "pi-ai-python[codemode-python]"  # 增加 pydantic-monty，用于代码模式的 Python 沙箱（Monty）
 ```
 
 要求 Python 3.11 或更高。一切都在 `asyncio` 上运行。
 
 ## 本移植包含的内容
 
-pi-durable 的核心：Session 及其存储（memory、SQLite、JSONL）、带内置生成/工具/压缩任务的 Harness、registry、扩展、你定义的工具、hooks、文档、子任务、任务图、视图、watch、agent 事件、本地执行环境，以及存储和环境一致性测试套件。还有 `pi_durable.tools` 的编码工具（`read`、`write`、`edit`、`bash`、`powershell` 和 `CodingTools` 扩展）、`pi_durable.tool_search` 的 `tool_search` 工具、位于 `pi_durable.images` 的基于 Pillow 的 `read` 图像处理器（`images` extra），以及 `pi_durable.codemode` 的代码模式扩展，其脚本是由 Monty 运行的 Python（`codemode` extra）。参见[工具](#工具)与[代码模式](#代码模式)。
+pi-durable 的核心：Session 及其存储（memory、SQLite、JSONL）、带内置生成/工具/压缩任务的 Harness、registry、扩展、你定义的工具、hooks、文档、子任务、任务图、视图、watch、agent 事件、本地执行环境，以及存储和环境一致性测试套件。还有 `pi_durable.tools` 的编码工具（`read`、`write`、`edit`、`bash`、`powershell` 和 `CodingTools` 扩展）、`pi_durable.tool_search` 的 `tool_search` 工具、位于 `pi_durable.images` 的基于 Pillow 的 `read` 图像处理器（`images` extra），以及 `pi_durable.codemode` 的代码模式扩展，其脚本默认是由 QuickJS 运行的 JavaScript，与上游一致（`codemode` extra），也可以改用由 Monty 运行的 Python（`codemode-python` extra）。参见[工具](#工具)与[代码模式](#代码模式)。
 
 尚未包含：Cloudflare 适配器（Durable Object SQLite 存储与 Workers 图像处理器）。
 
@@ -473,7 +474,12 @@ registry.install(create_tool_search_extension())
 
 ## 代码模式
 
-`pi_durable.codemode` 增加一个 `codemode` 工具：模型编写把会话的工具作为 `await tools.<name>(...)` 调用的 Python，运行在 Monty 沙箱（[`pi_codemode`](../codemode/README.md)）中。每次调用都是嵌套工具调用，只有脚本的输出到达模型。脚本在重启后存活：它从停下的地方恢复，而不会重新运行已完成的调用。这就是上游代码模式的 Python 脚本版而非 JavaScript；沙箱需要 `codemode` extra（`pip install "pi-ai-python[codemode]"`）。
+`pi_durable.codemode` 增加一个 `codemode` 工具：模型编写脚本，把会话的工具作为 `await tools.<name>(...)` 调用，脚本运行在 [`pi_codemode`](../codemode/README.md) 沙箱中。每次调用都是嵌套工具调用，只有脚本的输出到达模型。脚本在重启后存活：它从停下的地方恢复，而不会重新运行已完成的调用。
+
+沙箱决定脚本的语言，模型读到的一切都随之变化，因此一个会话只提供一种语言，不会两种都提供：
+
+- `CodemodeSandbox`（`codemode` extra）：在 QuickJS 中运行 JavaScript，即上游的代码模式本身：工具描述、提示段、TypeScript 声明、全局变量、错误信息和源码语法都与上游相同。
+- `MontyCodemodeSandbox`（`codemode-python` extra）：在 Monty 中运行 Python，环境相同，声明为 Python，全局变量为 snake_case。
 
 ```python
 from pi_codemode import CodemodeSandbox
@@ -481,26 +487,25 @@ from pi_durable.codemode import create_codemode_extension
 
 sandbox = CodemodeSandbox(memory_limit_bytes=256 * 1024 * 1024)
 registry.install(create_codemode_extension(sandbox=sandbox))
-# 一次带 {"code": 'return await tools.word_count(text="a b c")'} 的 codemode 调用回答 '{"words":3}'。
+# 一次带 {"code": 'return await tools.word_count({ text: "a b c" })'} 的 codemode 调用回答 '{"words":3}'。
 # 进程关闭时：await harness.close(context)，然后 await sandbox.close()。
 ```
 
 脚本是异步函数体，由模型作为工具的原始输入写出：
 
 ```text
-# @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
-import asyncio
-contents = await asyncio.gather(*[tools.read(path=path) for path in ["a.txt", "b.txt"]])
-print("read", len(contents), "files")
-found = await search_tools("github issues", limit=3)
-return [tool["name"] for tool in found]
+// @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
+const contents = await Promise.all(["a.txt", "b.txt"].map((path) => tools.read({ path })));
+console.log("read", contents.length, "files");
+const found = await searchTools("github issues", { limit: 3 });
+return found.map((tool) => tool.name);
 ```
 
-该扩展还增加一个 `codemode` 提示段，以 Python 声明（`async def read(self, *, path: str) -> str`）的形式在 token 预算内（`inline_budget=`，默认 3000）列出脚本可以调用的工具；脚本用 `search_tools()`、`describe_tool()` 和 `describe_namespace()` 找到其他工具。用 `namespaces=[{"name": ..., "description": ..., "prefix": ...}]` 按名字前缀分组工具，例如一个 MCP 服务器的 `mcp__github__`。结果读起来像编码 agent 的：一个头部、脚本的输出，失败时还有已经做过的调用；超过 `max_output_tokens` 的文本被截断，完整文本在一个临时文件中。脚本还获得 `models.*`：模型目录、`models.classify()` 和 `models.generate_images()`，它们作为内部工具的嵌套调用运行（`models=False` 关闭它们）。脚本运行期间关闭沙箱（例如关闭时）不是一种结果：脚本用下一个进程的沙箱恢复。失败的嵌套调用会在脚本中抛出带错误文本的 `Exception`，除非工具声明了 schema 并随错误返回了自己的值：`tools.bash` 对非零退出也返回 `{"output": ..., "exitCode": ..., ...}`，因此脚本检查 `exitCode`。`store(key, value)` 和 `load(key)` 按会话保留 JSON 值；分叉在进入时看到它们当时的值。`pi_durable.codemode` 不导入沙箱：任何 `pi_codemode.CodemodeSandboxBase` 都可以。
+该扩展还增加一个 `codemode` 提示段，以声明（`read(args: { path: string; }): Promise<string>;`）的形式在 token 预算内（`inline_budget=`，默认 3000）列出脚本可以调用的工具；脚本用 `searchTools()`、`describeTool()` 和 `describeNamespace()` 找到其他工具。用 `namespaces=[{"name": ..., "description": ..., "prefix": ...}]` 按名字前缀分组工具，例如一个 MCP 服务器的 `mcp__github__`。结果读起来像编码 agent 的：一个头部、脚本的输出，失败时还有已经做过的调用；超过 `max_output_tokens` 的文本被截断，完整文本在一个临时文件中。脚本还获得 `models.*`：模型目录、`models.classify()` 和 `models.generateImages()`，它们作为内部工具的嵌套调用运行（`models=False` 关闭它们）。脚本运行期间关闭沙箱（例如关闭时）不是一种结果：脚本用下一个进程的沙箱恢复。失败的嵌套调用会以带错误文本和 `structuredOutput` 的 `Error` 拒绝，除非工具声明了 schema 并随错误返回了自己的值：`tools.bash` 对非零退出也返回 `{ output, exitCode, ... }`，因此脚本检查 `exitCode`。`store(key, value)` 和 `load(key)` 按会话保留 JSON 值；分叉在进入时看到它们当时的值。`pi_durable.codemode` 不导入沙箱：任何 `pi_codemode.CodemodeSandboxBase` 都可以。
 
-脚本全局变量是 snake_case，而上游是 camelCase；工具名不变（`tools.mcp__github__list_issues`，以及内部工具 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`）：
+使用 `MontyCodemodeSandbox` 时，同样的脚本写成 Python，全局变量是 snake_case；工具名不变（`tools.mcp__github__list_issues`，以及内部工具 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`）：
 
-| 上游（JavaScript） | 这里（Python） |
+| JavaScript（`CodemodeSandbox`，上游） | Python（`MontyCodemodeSandbox`） |
 | --- | --- |
 | `// @options: {...}` | `# @options: {...}` |
 | `await tools.read({ path })` | `await tools.read(path=...)` 或 `await tools.read({"path": ...})` |
@@ -514,10 +519,11 @@ return [tool["name"] for tool in found]
 | `models.classify(model, context)` | `models.classify(model, context)` |
 | `models.generateImages(model, context)` | `models.generate_images(model, context)` |
 | `undefined`（缺失值） | `None` |
+| 失败调用的 `error.structuredOutput` | 不可见：Monty 的异常只携带消息 |
 
-目录项、分类器和图像上下文以及模型结果都是 pi-ai 的 JSON，键为 camelCase（`result["stopReason"]`、`{"type": "image", "data": ..., "mimeType": ...}`）。Monty 中的异常只携带消息，因此上游附加到失败调用错误上的 `structuredOutput` 对脚本不可见。返回 `None` 的脚本不会给输出增加任何值，因为 Python 无法区分 `return None` 和没有 `return`。
+在两种语言中，目录项、分类器和图像上下文以及模型结果都是 pi-ai 的 JSON，键为 camelCase（`result.stopReason`、`{ type: "image", data, mimeType }`）。返回 `null` 或 `undefined`（`None`）的脚本不会给输出增加任何值。
 
-它如何在重启后存活：沙箱确定性运行脚本（虚拟时钟、带种子的随机数、UTC），工具在把每个结果交给脚本之前把它写入日志（journal）。重启后，工具再次运行脚本，并按相同顺序把日志化的结果交给它，因此它用相同参数做相同调用；这些按 key 重新挂到它们的嵌套调用上，然后脚本继续。当脚本走了与之前不同的路径、沙箱指纹或代码模式版本变化、或它的 `timeout_ms` 期间已过时，重跑会以错误结束调用。重启时正在运行的嵌套调用遵循它自己的重放策略。run 和 journal 文档保持上游的格式，但一个 run 不能在语言间移动：在这里恢复的 TypeScript run（或反之）以“the sandbox changed since it started”结束，因为脚本、全局变量名和沙箱指纹都不同。
+它如何在重启后存活：沙箱确定性运行脚本（虚拟时钟、带种子的随机数、UTC），工具在把每个结果交给脚本之前把它写入日志（journal）。重启后，工具再次运行脚本，并按相同顺序把日志化的结果交给它，因此它用相同参数做相同调用；这些按 key 重新挂到它们的嵌套调用上，然后脚本继续。当脚本走了与之前不同的路径、沙箱指纹或代码模式版本变化、或它的 `timeout_ms` 期间已过时，重跑会以错误结束调用。重启时正在运行的嵌套调用遵循它自己的重放策略。run 和 journal 文档保持上游的格式。一个 run 不能在语言间移动：用 `CodemodeSandbox` 开始、用 `MontyCodemodeSandbox` 恢复的 run（或反之）以“the sandbox changed since it started”结束，因为脚本、全局变量名和沙箱指纹都不同。JavaScript run 报告的指纹与上游沙箱相同。
 
 ## 系统提示
 
@@ -1104,7 +1110,7 @@ print(sorted({span.name for span in telemetry.get_spans()}))
 - **存储和环境模块**：`openNodeSqliteStorage` 是 `open_sqlite_storage`（在 `sqlite3` 上），`openNodeJsonlStorage` 是 `open_local_jsonl_storage`，`NodeExecutionEnv` 是 `LocalExecutionEnv`（id `"local"`），`Storage.entry(conversationId, id)` 是 `visible_entry()`，`FileSystem.list_files()` 是可能返回 `not_supported` 的必需方法。一致性套件用 pytest 注册。
 - **二进制数据**是 `bytes`；ID 是普通 `int`（`TaskId`、`EntryId` 等是类型检查器品牌）。
 - **工具与图像**：`createCodingTools({ images })` 是 `create_coding_tools(images=...)`，`createBashTool({ commandPrefix, prepare })` 是 `create_bash_tool(command_prefix=..., prepare=...)`（`prepare` 改变 `BashExecution` dict 的 `command`、`cwd`、`env` 和 `inheritEnv`），`createNodePhotonImages()` 是 `create_pillow_images()`，用 Pillow 而非 Photon，在无空闲超时的工作线程中。`read` 对 `offset` 和 `limit` 保留 JavaScript 的数字语义，因此分数、负数和巨大的值会选择并打印相同的行。
-- **代码模式**在 Monty 中运行 Python 脚本而非 QuickJS 中的 JavaScript：`createCodemodeExtension({ sandbox })` 是 `create_codemode_extension(sandbox=...)`，脚本全局变量是 snake_case（`search_tools()`、`models.generate_images()`），一种语言日志化的 run 不会在另一种中恢复（见[代码模式](#代码模式)）。
+- **代码模式**像上游一样在 QuickJS 中运行 JavaScript，只是跑在 wasmtime 上而不是 worker 线程里；`createCodemodeExtension({ sandbox })` 是 `create_codemode_extension(sandbox=...)`。在 Monty 中运行 Python 脚本是新增的：使用 `MontyCodemodeSandbox` 时脚本全局变量是 snake_case（`search_tools()`、`models.generate_images()`），一种语言日志化的 run 不会在另一种中恢复（见[代码模式](#代码模式)）。
 - **尚未移植**：Cloudflare 适配器（见[本移植包含的内容](#本移植包含的内容)）。
 
 ## 设计说明
