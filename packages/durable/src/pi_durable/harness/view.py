@@ -16,6 +16,7 @@ from pi_chord.delta import Op, apply_immutable
 from pi_chord.json import JsonObject
 from pi_chord.state import AttachedReplicatedState, ReplicatedStateSourceOptions, replicated_state
 
+from ..approval import ApprovalsDoc, PermissionsDoc
 from ..session import CommittedStateSource, CommittedWatch, contained
 from ..types import (
     CommitPublication,
@@ -56,7 +57,15 @@ class ViewObserver(Protocol):
     def close_session(self, failure: Any) -> None: ...
 
 
-_MOUNTED: tuple[ConversationDocToken[Any], ...] = (AgentDoc, LiveDoc, InboxDoc, ProviderDoc, UsageDoc)
+_MOUNTED: tuple[ConversationDocToken[Any], ...] = (
+    AgentDoc,
+    LiveDoc,
+    InboxDoc,
+    ProviderDoc,
+    UsageDoc,
+    ApprovalsDoc,
+    PermissionsDoc,
+)
 _MOUNTED_KINDS = frozenset(token.definition.kind for token in _MOUNTED)
 
 

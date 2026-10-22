@@ -1,6 +1,7 @@
 """Port of ``test/codemode.test.ts``: durable code mode, its journal and replay, and its output.
 
-Scripts are Python run by Monty (pi_codemode) instead of JavaScript in QuickJS. Adaptations:
+Scripts here are Python run by Monty (``MontyCodemodeSandbox``); ``test_codemode_javascript.py`` runs upstream's
+JavaScript cases on QuickJS. Adaptations for Python:
 
 - Every restart case runs on MemoryStorage (reopened as a process would reopen a database) and on SQLite; upstream's
   run on SQLite only. Waits on storage poll in real time (``wait_for``), since SQLite runs on executor threads here.
@@ -49,7 +50,7 @@ from durable_session_support import STORAGE_BACKENDS, ControlledStorage, context
 
 from pi_ai import ImageContent, TextContent, Type, faux_assistant_message, faux_text, faux_tool_call
 from pi_ai.types import AssistantMessage
-from pi_codemode import CodemodeRun, CodemodeSandbox
+from pi_codemode import CodemodeRun, MontyCodemodeSandbox
 from pi_durable import Harness, MemoryStorage, ToolResultEntry, ToolTask, define_tool
 from pi_durable.codemode.codemode import (
     CodemodeGlobal,
@@ -89,7 +90,7 @@ def script(code: str) -> AssistantMessage:
     )
 
 
-_sandboxes: list[CodemodeSandbox] = []
+_sandboxes: list[MontyCodemodeSandbox] = []
 _directories: list[str] = []
 
 
@@ -110,8 +111,8 @@ def temp_dir(prefix: str) -> str:
     return directory
 
 
-def new_sandbox() -> CodemodeSandbox:
-    sandbox = CodemodeSandbox(memory_limit_bytes=64 * 1024 * 1024)
+def new_sandbox() -> MontyCodemodeSandbox:
+    sandbox = MontyCodemodeSandbox(memory_limit_bytes=64 * 1024 * 1024)
     _sandboxes.append(sandbox)
     return sandbox
 
@@ -180,7 +181,7 @@ class Slows:
 @dataclass
 class Chat:
     setup: ChatSetup
-    sandbox: CodemodeSandbox
+    sandbox: MontyCodemodeSandbox
     vm: Vm
     echo: dict[str, int]
     holds: Holds

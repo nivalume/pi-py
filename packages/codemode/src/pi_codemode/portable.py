@@ -2,14 +2,16 @@
 
 Hosts that bring their own sandbox (a launcher for :class:`CodemodeSandboxBase`), or that only
 consume results and run deterministic runs through a sandbox they are handed, import from here;
-nothing here imports Monty.
+nothing here imports wasmtime or Monty.
 """
 
 from __future__ import annotations
 
 from .identifier import is_codemode_identifier, to_codemode_identifier
+from .language import CODEMODE_LANGUAGES, DEFAULT_CODEMODE_LANGUAGE, CodemodeLanguage, check_codemode_language
 from .runtime.execution import (
     DEFAULT_TIMEOUT_MS,
+    RESERVED_GLOBALS,
     CodemodeRun,
     CodemodeSandboxBase,
     VmChannel,
@@ -54,7 +56,10 @@ from .types import (
 )
 
 __all__ = [
+    "CODEMODE_LANGUAGES",
+    "DEFAULT_CODEMODE_LANGUAGE",
     "DEFAULT_TIMEOUT_MS",
+    "RESERVED_GLOBALS",
     "MAX_OUTPUT_CHARS",
     "MAX_OUTPUT_ITEMS",
     "MAX_STORE_TOTAL_CHARS",
@@ -72,6 +77,7 @@ __all__ = [
     "CodemodeHostCall",
     "CodemodeImageOutput",
     "CodemodeJsonSchema",
+    "CodemodeLanguage",
     "CodemodeOkOutcome",
     "CodemodeOutcome",
     "CodemodeOutputItem",
@@ -95,6 +101,7 @@ __all__ = [
     "VmLauncher",
     "VmStartData",
     "VmToHostMessage",
+    "check_codemode_language",
     "is_codemode_identifier",
     "to_codemode_identifier",
 ]

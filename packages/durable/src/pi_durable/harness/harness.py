@@ -15,6 +15,15 @@ from typing import Any, Final, Literal, TypeVar, cast
 from pi_chord.context import Context, with_abort_signal, without_abort_signal
 from pi_chord.state import AttachedReplicatedState
 
+from ..approval import ApprovalRequest as ApprovalRequestRecord
+from ..approval import (
+    PermissionMode,
+    PermissionRules,
+    PermissionsChange,
+    PermissionsState,
+    ReviewDecision,
+    copy_owner_permissions,
+)
 from ..entries import ResetEntry
 from ..session import SessionImpl, Transaction, contained, date_now
 from ..session._futures import rejected
@@ -35,7 +44,9 @@ from ..types import (
     TaskRecord,
     Tx,
 )
+from . import approvals as approval_surface
 from .agent import AgentDoc, configure, create_agent, resolve_agent, resolve_settings
+from .approvals import HarnessApprovals
 from .compaction import create_compaction
 from .context import read_context
 from .inbox import InboxDoc, withdraw_queued_inputs
@@ -183,6 +194,34 @@ class ConversationImpl:
         """The structural view as a serialized exact-frame watch with bounded pending frames."""
         return asyncio.ensure_future(self._harness.views.watch(self.id, context))
 
+    def decide(self, id: TaskId[Any], decision: ReviewDecision, context: Context) -> asyncio.Future[None]:
+        """Decide the pending approval request ``id`` (its tool task's id) of this conversation.
+
+        One commit writes the decision (and the display-only ``pi.approval`` entry, a session grant for
+        ``approvedForSession``, the rule of ``approvedWithRule``), then the waiting tool task is notified. Raises
+        ``ApprovalNotPending`` for a request that is not waiting for a decision, ``UnknownApproval`` for an id that is
+        no tool task of this conversation, ``InvalidDecision`` for ``timedOut`` (the harness's own), and ``RuleError``
+        for a rule that does not parse.
+        """
+        return asyncio.ensure_future(approval_surface.decide(self._harness, self.id, id, decision, context))
+
+    def pending_approvals(self, context: Context) -> asyncio.Future[list[ApprovalRequestRecord]]:
+        """The conversation's approval requests waiting for a decision, in id order."""
+        return asyncio.ensure_future(approval_surface.pending_approvals(self._harness, self.id, context))
+
+    def permissions(self, context: Context) -> asyncio.Future[PermissionsState]:
+        """The conversation's ``pi.permissions``; ``{}`` when none were set."""
+        return asyncio.ensure_future(approval_surface.permissions(self._harness, self.id, context))
+
+    def update_permissions(self, change: PermissionsChange, context: Context) -> asyncio.Future[PermissionsState]:
+        """Change the conversation's mode, rules or directories in one commit; returns the new state. An added rule
+        that does not parse raises ``RuleError``."""
+        return asyncio.ensure_future(approval_surface.update_permissions(self._harness, self.id, change, context))
+
+    def set_permission_mode(self, mode: PermissionMode | None, context: Context) -> asyncio.Future[PermissionsState]:
+        """Set the conversation's permission mode; ``None`` returns it to the policy's default."""
+        return asyncio.ensure_future(approval_surface.set_permission_mode(self._harness, self.id, mode, context))
+
 
 def _current_models(models: Any) -> Callable[[], Any]:
     """``HarnessOptions.models`` as a function: a plain ``Models`` is returned at every call."""
@@ -223,6 +262,11 @@ class Harness(SessionImpl):
         def settings() -> Any:
             return resolve_settings(host_settings())
 
+        #: Resolved settings, read at each call.
+        self.resolved_settings: Callable[[], Any] = settings
+        scheduler_context = without_abort_signal(context)
+        self.approvals = HarnessApprovals(options.get("approval"), lambda id: self.tasks.abort(id, scheduler_context))
+
         async def conversation(id: ConversationId, binding: InvocationBinding, call_context: Context) -> Any:
             record = await self.read_on_line(lambda: storage.conversation(id, call_context))
             return None if record is None else BoundConversation(id, binding, self.submissions, self.tasks)
@@ -247,8 +291,9 @@ class Harness(SessionImpl):
                 settle_outcome=settle_scheduler_outcome,
                 withdraw_inputs=withdraw_queued_inputs,
                 conversation=conversation,
-                context=without_abort_signal(context),
+                context=scheduler_context,
                 telemetry_context=telemetry,
+                approvals=self.approvals,
             )
         )
         self.submissions = Submissions(self, storage, now, settings, self.tasks.resume)
@@ -261,7 +306,7 @@ class Harness(SessionImpl):
     async def open(cls, storage: Storage, options: HarnessOptions, context: Context) -> Harness:
         """Open a Harness over ``storage``. The registry may keep changing while the Harness runs.
 
-        ``options`` is the ``HarnessOptions`` dict (``models``, ``registry``, ``settings``, ``env``,
+        ``options`` is the ``HarnessOptions`` dict (``models``, ``registry``, ``settings``, ``env``, ``approval``,
         ``conversationCreated``, ``now``, ``setTimer``, ``onWake``, ``onReport``, ``telemetryContext``).
         """
         context.throw_if_aborted()
@@ -391,6 +436,32 @@ class Harness(SessionImpl):
                 add_usage_state(total, state)
         return total
 
+    def decide(self, id: TaskId[Any], decision: ReviewDecision, context: Context) -> asyncio.Future[None]:
+        """Decide the approval request ``id`` in whichever conversation its tool task runs; see
+        ``Conversation.decide()``."""
+        return asyncio.ensure_future(approval_surface.decide_anywhere(self, id, decision, context))
+
+    def pending_approvals(self, context: Context) -> asyncio.Future[list[tuple[ConversationId, ApprovalRequestRecord]]]:
+        """Every conversation's approval requests waiting for a decision, for a UI that shows one queue."""
+        storage = self.storage
+
+        async def job() -> list[tuple[ConversationId, ApprovalRequestRecord]]:
+            conversations = await self.read_on_line(
+                lambda: scan_all(lambda cursor: storage.scan_conversations({}, _SCAN_PAGE_SIZE, cursor, context))
+            )
+            ids = [conversation["id"] for conversation in conversations]
+            return await approval_surface.all_pending_approvals(self, ids, context)
+
+        return asyncio.ensure_future(job())
+
+    def permission_rules(self, context: Context) -> asyncio.Future[PermissionRules]:
+        """The allow rules approvals added (``approvedWithRule``), for every conversation."""
+        return asyncio.ensure_future(approval_surface.permission_rules(self, context))
+
+    def remove_permission_rule(self, rule: str, context: Context) -> asyncio.Future[bool]:
+        """Remove ``rule`` from the rules approvals added; whether it was there."""
+        return asyncio.ensure_future(approval_surface.remove_permission_rule(self, rule, context))
+
     def task_graph(self, context: Context) -> asyncio.Future[AttachedReplicatedState[TaskGraph]]:
         return asyncio.ensure_future(self._task_graph.state(context))
 
@@ -462,13 +533,17 @@ class Harness(SessionImpl):
         """The built-in creation hook, in every commit that creates or forks a conversation.
 
         Empty ``pi.live``, ``pi.inbox``, and ``pi.usage``, a fresh ``pi.provider``, the conversation's ``pi.agent``
-        (see ``create_agent()``), then ``HarnessOptions.conversationCreated``.
+        (see ``create_agent()``), its owner conversation's ``pi.permissions`` when the Harness has an approval policy
+        (see ``copy_owner_permissions()``), then ``HarnessOptions.conversationCreated``.
         """
         await tx.doc(LiveDoc, record["id"])
         await tx.doc(InboxDoc, record["id"])
         await tx.doc(UsageDoc, record["id"])
         await tx.doc(ProviderDoc, record["id"])
         await create_agent(tx, record)
+        # Only a Harness with a policy reads ``pi.permissions``; without one, conversations get none.
+        if self.approvals.policy is not None:
+            await copy_owner_permissions(tx, record)
         created = self._options.get("conversationCreated")
         if created is not None:
             result = created(tx, record)

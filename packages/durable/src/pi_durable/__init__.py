@@ -13,11 +13,37 @@ from their own modules, so importing the root loads none of them.
 
 from __future__ import annotations
 
+from .approval import (
+    AllowAll,
+    ApprovalCall,
+    ApprovalError,
+    ApprovalNotPending,
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalsDoc,
+    AskAll,
+    DenyAll,
+    InvalidDecision,
+    PermissionDefaults,
+    PermissionMode,
+    PermissionRules,
+    PermissionRulesDoc,
+    PermissionsChange,
+    PermissionsDoc,
+    PermissionsState,
+    PermissionSubject,
+    PolicyDecision,
+    ReviewDecision,
+    RuleError,
+    RulesPolicy,
+    UnknownApproval,
+)
 from .documents import define_doc, define_doc_family
 from .entries import (
     AssistantEntry,
     CompactionEntry,
     CompactionEntryData,
+    ContextEntry,
     ResetEntry,
     SystemEntry,
     ToolResultEntry,
@@ -27,6 +53,7 @@ from .entries import (
 )
 from .errors import ConversationBusy, ReadAfterWrite, SessionFailed, StorageRequestError, error_message
 from .harness.agent import (
+    DEFAULT_APPROVAL_TIMEOUT_MS,
     DEFAULT_COMPACTION_POLICY,
     DEFAULT_PROGRESS_POLICY,
     DEFAULT_RESTART_LIMIT,
@@ -230,6 +257,7 @@ __all__ = [
     # built-in entries
     "AssistantEntry",
     "CompactionEntry",
+    "ContextEntry",
     "CompactionEntryData",
     "ResetEntry",
     "SystemEntry",
@@ -297,6 +325,31 @@ __all__ = [
     "ToolTaskInput",
     "ToolTaskResult",
     "UsageState",
+    "DEFAULT_APPROVAL_TIMEOUT_MS",
+    # approvals and permissions (pi_durable.approval has the rest)
+    "AllowAll",
+    "ApprovalCall",
+    "ApprovalError",
+    "ApprovalNotPending",
+    "ApprovalPolicy",
+    "ApprovalRequest",
+    "ApprovalsDoc",
+    "AskAll",
+    "DenyAll",
+    "InvalidDecision",
+    "PermissionDefaults",
+    "PermissionMode",
+    "PermissionRules",
+    "PermissionRulesDoc",
+    "PermissionsChange",
+    "PermissionsDoc",
+    "PermissionsState",
+    "PermissionSubject",
+    "PolicyDecision",
+    "ReviewDecision",
+    "RuleError",
+    "RulesPolicy",
+    "UnknownApproval",
     # harness types
     "AfterFailedRun",
     "Agent",

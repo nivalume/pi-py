@@ -1,7 +1,7 @@
 """Port of upstream ``test/sandbox.test.ts``.
 
 Upstream runs every behavior test against three backends (worker thread, in-thread QuickJS,
-Cloudflare remote); here there is one, :class:`CodemodeSandbox` on a Monty pool, and the
+Cloudflare remote); here there is one, :class:`MontyCodemodeSandbox` on a Monty pool, and the
 scripts are Python. Each test keeps upstream's assertions on the Python equivalent of its
 script; differences are noted where they are made.
 """
@@ -23,16 +23,16 @@ from pi_codemode import (
     MAX_OUTPUT_ITEMS,
     CodemodeFailure,
     CodemodeImageOutput,
-    CodemodeSandbox,
     CodemodeStoreWrites,
     CodemodeSuccess,
     CodemodeTextOutput,
     CodemodeTool,
     CodemodeToolContext,
+    MontyCodemodeSandbox,
 )
 from pi_codemode.runtime.prelude import PRELUDE_SOURCE
 
-CreateSandbox = Callable[..., CodemodeSandbox]
+CreateSandbox = Callable[..., MontyCodemodeSandbox]
 
 
 def success(result: Any) -> CodemodeSuccess:
@@ -53,9 +53,9 @@ def test_embedded_prelude_parses_as_python() -> None:
 
 class TestScriptExecution:
     async def test_returns_the_scripts_return_value_after_a_json_round_trip(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         result = success(await sandbox.execute("return {'a': 1, 'b': [True, 'x']}"))
         assert (result.value, result.output, result.calls) == ({"a": 1, "b": [True, "x"]}, [], [])
         assert success(await sandbox.execute("return 'plain'")).value == "plain"
@@ -65,9 +65,9 @@ class TestScriptExecution:
         assert success(await sandbox.execute("1 + 1")).value is None
         assert success(await sandbox.execute("x = 2\nif x > 1:\n    return 'big'\nreturn 'small'")).value == "big"
 
-    async def test_comprehension_variables_may_shadow_builtins(self, create_sandbox: CreateSandbox) -> None:
+    async def test_comprehension_variables_may_shadow_builtins(self, create_monty_sandbox: CreateSandbox) -> None:
         # Monty 1.2 resolves such top-level comprehension variables to the builtin; the sandbox renames them.
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         script = """
 pairs = [("a", 1), ("b", 2)]
 ids = [id for id in [1, 2, 3]]
@@ -94,13 +94,13 @@ return [ids, by_type, nested, lambdas, first, sums, len(ids), max(ids), type(ids
         assert not failure.ok
         assert 'codemode.py", line 2' in (failure.error.stack or "")
 
-    async def test_supports_top_level_await(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_supports_top_level_await(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         result = await sandbox.execute("async def f():\n    return 41\nx = await f()\nreturn x + 1")
         assert success(result).value == 42
 
-    async def test_collects_text_image_and_print_output_in_order(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_collects_text_image_and_print_output_in_order(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 f"""
@@ -137,8 +137,8 @@ return None
             CodemodeTextOutput("a-b!", console=True),
         ]
 
-    async def test_rejects_invalid_text_and_image_arguments(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_rejects_invalid_text_and_image_arguments(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 """
@@ -193,8 +193,8 @@ return errors
         ]
 
     # https://github.com/earendil-works/pi/issues/10215
-    async def test_accepts_wrapped_and_large_base64_image_data(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_accepts_wrapped_and_large_base64_image_data(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         large = "iVBORw0KGgoA" + "QUJD" * (256 * 1024)
         result = success(
             await sandbox.execute(
@@ -204,9 +204,9 @@ return errors
         assert result.output == [CodemodeImageOutput(PNG, "image/png"), CodemodeImageOutput(large, "image/png")]
 
     async def test_ends_the_script_successfully_on_exit_keeping_output_and_store_writes(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox([echo_tool()])
+        sandbox = create_monty_sandbox([echo_tool()])
         result = success(
             await sandbox.execute(
                 """
@@ -226,25 +226,31 @@ return "unreachable"
         assert result.output == [CodemodeTextOutput("before")]
         assert result.store_writes == CodemodeStoreWrites({"k": 1}, [])
 
-    async def test_keeps_output_produced_before_a_failure(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_keeps_output_produced_before_a_failure(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         result = failure(await sandbox.execute('text("partial")\nraise RuntimeError("boom")'))
         assert result.output == [CodemodeTextOutput("partial")]
 
-    async def test_reports_syntax_errors_with_the_scripts_line_number(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_reports_syntax_errors_with_the_scripts_line_number(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute("a = 1\nb = \nreturn a")).error
         assert (error.kind, error.name) == ("script", "SyntaxError")
         assert error.stack is not None and 'File "codemode.py", line 2' in error.stack
 
-    async def test_reports_raised_errors_with_the_scripts_line_number(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_reports_raised_errors_with_the_scripts_line_number(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute("a = 1\nraise TypeError('boom ' + str(a))")).error
         assert (error.kind, error.name, error.message) == ("script", "TypeError", "boom 1")
         assert error.stack is not None and 'File "codemode.py", line 2' in error.stack
 
-    async def test_formats_stacks_like_cpython_without_prelude_frames(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_formats_stacks_like_cpython_without_prelude_frames(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         result = failure(await sandbox.execute("print(ValueError('inner'))\nraise ValueError('outer')"))
         assert result.error.stack == "\n".join(
             [
@@ -266,31 +272,33 @@ return "unreachable"
         ]
         assert "python-input" not in nested.stack and "__codemode" not in nested.stack
 
-    async def test_reports_non_exception_raises(self, create_sandbox: CreateSandbox) -> None:
+    async def test_reports_non_exception_raises(self, create_monty_sandbox: CreateSandbox) -> None:
         # Upstream throws a plain object; Python only raises exceptions.
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute("raise {'code': 7}")).error
         assert (error.kind, error.name) == ("script", "TypeError")
         assert "exceptions must derive from BaseException" in error.message
 
     async def test_reports_a_non_serializable_return_value_as_a_script_error(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         for code in ("return {1, 2}", "return b'x'"):
             error = failure(await sandbox.execute(code)).error
             assert (error.kind, error.name) == ("script", "TypeError")
 
 
 class TestTools:
-    async def test_exposes_tools_as_async_functions_and_records_calls(self, create_sandbox: CreateSandbox) -> None:
+    async def test_exposes_tools_as_async_functions_and_records_calls(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
         seen: list[Any] = []
 
         def add(args: Any, _context: CodemodeToolContext) -> Any:
             seen.append(args)
             return {"sum": args["a"] + args["b"]}
 
-        sandbox = create_sandbox([CodemodeTool("add", add)])
+        sandbox = create_monty_sandbox([CodemodeTool("add", add)])
         result = success(
             await sandbox.execute(
                 "first = await tools.add({'a': 1, 'b': 2})\n"
@@ -303,8 +311,8 @@ class TestTools:
         assert [(call.name, call.status) for call in result.calls] == [("add", "ok"), ("add", "ok")]
         assert all(call.duration_ms >= 0 for call in result.calls)
 
-    async def test_rejects_positional_and_keyword_arguments_together(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox([echo_tool()])
+    async def test_rejects_positional_and_keyword_arguments_together(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox([echo_tool()])
         result = success(
             await sandbox.execute(
                 "try:\n    tools.echo({'a': 1}, b=2)\nexcept TypeError as error:\n    return str(error)"
@@ -313,7 +321,7 @@ class TestTools:
         assert result.value == "pass the arguments as one positional value or as keyword arguments, not both"
         assert result.calls == []
 
-    async def test_runs_concurrent_calls_and_lists_tool_names(self, create_sandbox: CreateSandbox) -> None:
+    async def test_runs_concurrent_calls_and_lists_tool_names(self, create_monty_sandbox: CreateSandbox) -> None:
         running = 0
         most = 0
 
@@ -325,7 +333,7 @@ class TestTools:
             running -= 1
             return args
 
-        sandbox = create_sandbox([echo_tool(), CodemodeTool("delay", delay)])
+        sandbox = create_monty_sandbox([echo_tool(), CodemodeTool("delay", delay)])
         result = success(
             await sandbox.execute(
                 "import asyncio\n"
@@ -338,9 +346,9 @@ class TestTools:
         assert most == 2
 
     async def test_exposes_tools_under_normalized_identifiers_and_lists_them_in_all_tools(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox(
+        sandbox = create_monty_sandbox(
             [
                 CodemodeTool("my-tool", lambda _a, _c: "dash", description="Dashes"),
                 CodemodeTool("my_tool", lambda _a, _c: "underscore", description="Shadowed"),
@@ -371,20 +379,22 @@ return {
             "calls": ["dash", "dash", "dash", "mcp", "keyword"],
         }
 
-    async def test_passes_missing_arguments_and_results_through_as_none(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox([CodemodeTool("noop", lambda args, _context: args)])
+    async def test_passes_missing_arguments_and_results_through_as_none(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox([CodemodeTool("noop", lambda args, _context: args)])
         assert success(await sandbox.execute("return [await tools.noop(), await tools.noop(None)]")).value == [
             None,
             None,
         ]
 
     async def test_turns_tool_errors_into_catchable_exceptions_in_the_script(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
         def fail(_args: Any, _context: CodemodeToolContext) -> Any:
             raise RuntimeError("tool exploded")
 
-        sandbox = create_sandbox([CodemodeTool("fail", fail)])
+        sandbox = create_monty_sandbox([CodemodeTool("fail", fail)])
         result = success(
             await sandbox.execute(
                 """
@@ -399,20 +409,22 @@ except Exception as error:
         assert result.value == {"is_error": True, "message": "tool exploded", "name": "Exception"}
         assert [(call.name, call.status) for call in result.calls] == [("fail", "error")]
 
-    async def test_reports_a_tool_result_json_cannot_hold_as_a_failed_call(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox([CodemodeTool("odd", lambda _a, _c: {1, 2})])
+    async def test_reports_a_tool_result_json_cannot_hold_as_a_failed_call(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox([CodemodeTool("odd", lambda _a, _c: {1, 2})])
         result = success(
             await sandbox.execute("try:\n    await tools.odd()\nexcept Exception as error:\n    return str(error)")
         )
         assert result.value == "Object of type set is not JSON serializable"
         assert result.calls[0].status == "error"
 
-    async def test_rejects_calls_to_unknown_tools(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_rejects_calls_to_unknown_tools(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute("return await tools.missing()")).error
         assert (error.kind, error.name) == ("script", "AttributeError")
 
-    async def test_aborts_unawaited_calls_when_the_script_returns(self, create_sandbox: CreateSandbox) -> None:
+    async def test_aborts_unawaited_calls_when_the_script_returns(self, create_monty_sandbox: CreateSandbox) -> None:
         aborted: list[bool] = []
 
         async def slow(_args: Any, context: CodemodeToolContext) -> Any:
@@ -420,7 +432,7 @@ except Exception as error:
             aborted.append(True)
             raise RuntimeError("aborted")
 
-        sandbox = create_sandbox([CodemodeTool("slow", slow)])
+        sandbox = create_monty_sandbox([CodemodeTool("slow", slow)])
         result = success(await sandbox.execute("tools.slow()\nreturn 'early'"))
         assert result.value == "early"
         assert [(call.name, call.status) for call in result.calls] == [("slow", "cancelled")]
@@ -428,9 +440,9 @@ except Exception as error:
         assert aborted == [True]
 
     async def test_names_close_matches_when_a_script_reads_a_tool_that_does_not_exist(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox([echo_tool(), CodemodeTool("web-search", lambda _a, _c: "")])
+        sandbox = create_monty_sandbox([echo_tool(), CodemodeTool("web-search", lambda _a, _c: "")])
 
         async def attempt(expression: str) -> Any:
             return value_of(await sandbox.execute(f"return {expression}"))
@@ -456,8 +468,10 @@ except Exception as error:
             False,
         ]
 
-    async def test_supports_register_and_unregister_between_executions(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_supports_register_and_unregister_between_executions(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         echo = echo_tool()
         sandbox.register_tool(echo)
         with pytest.raises(ValueError, match="already registered"):
@@ -469,8 +483,8 @@ except Exception as error:
 
 
 class TestStoreAndLoad:
-    async def test_reads_the_snapshot_and_reports_writes(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_reads_the_snapshot_and_reports_writes(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 """
@@ -488,9 +502,9 @@ return [seen, load("counter"), load("missing"), load("old")]
         assert result.store_writes == CodemodeStoreWrites({"counter": 42, "list": [1, {"a": None}]}, ["old"])
 
     async def test_returns_copies_so_mutating_a_loaded_value_does_not_change_the_store(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 'value = load("obj")\nvalue["a"] = 2\nkept = {"b": 1}\nstore("kept", kept)\nkept["b"] = 2\n'
@@ -502,9 +516,9 @@ return [seen, load("counter"), load("missing"), load("old")]
         assert result.store_writes.set == {"kept": {"b": 1}}
 
     async def test_rejects_invalid_keys_values_and_oversized_writes_inside_the_script(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 """
@@ -533,8 +547,8 @@ return [
         # RangeError upstream is ValueError here.
         assert result.value == ["TypeError", "TypeError", "TypeError", "ValueError", "ValueError", "TypeError"]
 
-    async def test_explains_oversized_writes(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_explains_oversized_writes(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute('store("img", "x" * (300 * 1024))')).error
         assert 'store("img") value has 307202 characters of JSON' in error.message
         assert "Show images with image()" in error.message
@@ -542,17 +556,19 @@ return [
     def test_reserves_the_store_and_load_names(self) -> None:
         execute = lambda _a, _c: None  # noqa: E731
         with pytest.raises(ValueError, match="Invalid global"):
-            CodemodeSandbox(globals=[CodemodeTool("store", execute)])
+            MontyCodemodeSandbox(globals=[CodemodeTool("store", execute)])
         with pytest.raises(ValueError, match="Invalid global"):
-            CodemodeSandbox(globals=[CodemodeTool("load", execute)])
+            MontyCodemodeSandbox(globals=[CodemodeTool("load", execute)])
 
 
 class TestGlobals:
     async def test_exposes_globals_as_top_level_functions_without_recording_them_as_calls(
-        self, new_sandbox: Callable[..., CodemodeSandbox]
+        self, new_monty_sandbox: Callable[..., MontyCodemodeSandbox]
     ) -> None:
         seen: list[Any] = []
-        sandbox = new_sandbox(tools=[echo_tool()], globals=[CodemodeTool("attach", lambda args, _c: seen.append(args))])
+        sandbox = new_monty_sandbox(
+            tools=[echo_tool()], globals=[CodemodeTool("attach", lambda args, _c: seen.append(args))]
+        )
         result = success(
             await sandbox.execute(
                 """
@@ -568,10 +584,10 @@ return [type(attach).__name__, await tools.echo(2)]
         assert seen == [{"ref": 1}, "not awaited"]
 
     async def test_groups_namespaced_globals_and_spreads_arguments_on_request(
-        self, new_sandbox: Callable[..., CodemodeSandbox]
+        self, new_monty_sandbox: Callable[..., MontyCodemodeSandbox]
     ) -> None:
         seen: list[Any] = []
-        sandbox = new_sandbox(
+        sandbox = new_monty_sandbox(
             globals=[
                 CodemodeTool("models.list", lambda args, _c: seen.append(args), spread=True),
                 CodemodeTool("models.first", lambda args, _c: args),
@@ -596,10 +612,10 @@ return ["list" in models, "first" in models, await models.first("a"), "extra" in
         assert seen == [["classifier", None, 3], [], ["x", {"limit": 2}]]
 
     async def test_names_the_members_of_a_namespace_when_a_script_reads_one_that_does_not_exist(
-        self, new_sandbox: Callable[..., CodemodeSandbox]
+        self, new_monty_sandbox: Callable[..., MontyCodemodeSandbox]
     ) -> None:
         execute = lambda _a, _c: None  # noqa: E731
-        sandbox = new_sandbox(
+        sandbox = new_monty_sandbox(
             globals=[CodemodeTool("models.classify", execute), CodemodeTool("models.generateImages", execute)]
         )
         error = failure(await sandbox.execute("await models.generateImage()")).error
@@ -627,19 +643,19 @@ return ["list" in models, "first" in models, await models.first("a"), "extra" in
     )
     def test_rejects_invalid_and_reserved_global_names(self, name: str) -> None:
         with pytest.raises(ValueError, match="Invalid global"):
-            CodemodeSandbox(globals=[CodemodeTool(name, lambda _a, _c: None)])
+            MontyCodemodeSandbox(globals=[CodemodeTool(name, lambda _a, _c: None)])
 
     def test_rejects_a_global_that_conflicts_with_a_namespace(self) -> None:
         execute = lambda _a, _c: None  # noqa: E731
         with pytest.raises(ValueError, match="conflicts with the namespace"):
-            CodemodeSandbox(globals=[CodemodeTool("models", execute), CodemodeTool("models.list", execute)])
+            MontyCodemodeSandbox(globals=[CodemodeTool("models", execute), CodemodeTool("models.list", execute)])
         with pytest.raises(ValueError, match="already registered"):
-            CodemodeSandbox(globals=[CodemodeTool("a", execute), CodemodeTool("a", execute)])
+            MontyCodemodeSandbox(globals=[CodemodeTool("a", execute), CodemodeTool("a", execute)])
 
 
 class TestLimitsAndLifetime:
-    async def test_terminates_a_synchronous_infinite_loop_on_timeout(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_terminates_a_synchronous_infinite_loop_on_timeout(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         started = time.perf_counter()
         error = failure(await sandbox.execute("while True:\n    pass", timeout_ms=200)).error
         assert error.kind == "timeout"
@@ -647,21 +663,23 @@ class TestLimitsAndLifetime:
         # The pool replaces the killed worker.
         assert success(await sandbox.execute("return 1")).value == 1
 
-    async def test_runs_without_a_deadline_when_timeout_ms_is_infinite(self, create_sandbox: CreateSandbox) -> None:
+    async def test_runs_without_a_deadline_when_timeout_ms_is_infinite(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
         async def wait(_args: Any, _context: CodemodeToolContext) -> Any:
             await asyncio.sleep(0.05)
             return "late"
 
-        sandbox = create_sandbox([CodemodeTool("wait", wait)])
+        sandbox = create_monty_sandbox([CodemodeTool("wait", wait)])
         result = await sandbox.execute("return await tools.wait()", timeout_ms=float("inf"))
         assert success(result).value == "late"
 
     async def test_fails_a_script_whose_wait_nothing_can_end_instead_of_hanging(
-        self, create_sandbox: CreateSandbox
+        self, create_monty_sandbox: CreateSandbox
     ) -> None:
         # JavaScript can await a promise nothing settles; Monty's awaitables are calls, sleeps and
         # coroutines, and it rejects a coroutine awaited twice itself. Either way the script fails at once.
-        sandbox = create_sandbox([echo_tool()])
+        sandbox = create_monty_sandbox([echo_tool()])
         started = time.perf_counter()
         result = await sandbox.execute(
             "await tools.echo(1)\nasync def f():\n    return 1\nc = f()\nawait c\nawait c\nreturn 'never'",
@@ -675,17 +693,17 @@ class TestLimitsAndLifetime:
         returned = await sandbox.execute("tools.echo(2)\nreturn 'early'", timeout_ms=float("inf"))
         assert success(returned).value == "early"
 
-    async def test_terminates_an_await_spinning_loop_on_timeout(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_terminates_an_await_spinning_loop_on_timeout(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         for code in (
             "import asyncio\nwhile True:\n    await asyncio.sleep(0)",
             "async def f():\n    pass\nwhile True:\n    await f()",
         ):
             assert failure(await sandbox.execute(code, timeout_ms=200)).error.kind == "timeout"
 
-    async def test_sleeps_for_real_in_execute(self, create_sandbox: CreateSandbox) -> None:
+    async def test_sleeps_for_real_in_execute(self, create_monty_sandbox: CreateSandbox) -> None:
         # Not upstream: QuickJS has no timers; Monty's sleeps wait on the host and gathered ones overlap.
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         started = time.perf_counter()
         result = await sandbox.execute(
             "import asyncio, time\nstart = time.monotonic()\n"
@@ -696,7 +714,7 @@ class TestLimitsAndLifetime:
         assert isinstance(elapsed, float) and 0.14 <= elapsed < 1
         assert time.perf_counter() - started < 2
 
-    async def test_aborts_via_signal_and_cancels_in_flight_calls(self, create_sandbox: CreateSandbox) -> None:
+    async def test_aborts_via_signal_and_cancels_in_flight_calls(self, create_monty_sandbox: CreateSandbox) -> None:
         controller = AbortController()
         tool_signal: list[AbortSignal] = []
         called = asyncio.Event()
@@ -706,7 +724,7 @@ class TestLimitsAndLifetime:
             called.set()
             await asyncio.Event().wait()
 
-        sandbox = create_sandbox([CodemodeTool("hang", hang)])
+        sandbox = create_monty_sandbox([CodemodeTool("hang", hang)])
         first = asyncio.ensure_future(sandbox.execute("await tools.hang()\nreturn 'never'"))
         await called.wait()
         called.clear()
@@ -732,9 +750,9 @@ class TestLimitsAndLifetime:
     # #10283: the host keeps all output, so a script that prints in a loop must not grow it without bound.
     @pytest.mark.parametrize("emit", ["text(s)", "print(s)", 'image("data:image/png;base64," + p)'])
     async def test_fails_a_script_whose_output_passes_the_limits_even_if_it_catches_the_error(
-        self, create_sandbox: CreateSandbox, emit: str
+        self, create_monty_sandbox: CreateSandbox, emit: str
     ) -> None:
-        sandbox = create_sandbox(timeout_ms=60_000)
+        sandbox = create_monty_sandbox(timeout_ms=60_000)
         result = failure(
             await sandbox.execute(
                 f"""
@@ -755,20 +773,20 @@ while True:
         )
         assert MAX_OUTPUT_CHARS - (2 << 20) < chars <= MAX_OUTPUT_CHARS
 
-    async def test_limits_output_items(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox(timeout_ms=60_000)
+    async def test_limits_output_items(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox(timeout_ms=60_000)
         empty = failure(await sandbox.execute('while True:\n    text("")'))
         assert empty.error.name == "ValueError"
         assert len(empty.output) == MAX_OUTPUT_ITEMS
 
-    async def test_rejects_execute_after_close(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_rejects_execute_after_close(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         await sandbox.close()
         with pytest.raises(RuntimeError, match="closed"):
             await sandbox.execute("return 1")
 
-    async def test_runs_executions_in_parallel_without_sharing_state(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_runs_executions_in_parallel_without_sharing_state(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox()
         results = await asyncio.gather(
             sandbox.execute("import asyncio\nshared = 'a'\nawait asyncio.sleep(0.01)\nreturn shared"),
             sandbox.execute("import asyncio\nshared = 'b'\nawait asyncio.sleep(0.01)\nreturn shared"),
@@ -776,8 +794,10 @@ while True:
         )
         assert [value_of(result) for result in results] == ["a", "b", "undefined"]
 
-    async def test_turns_deep_recursion_into_a_catchable_recursion_error(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_turns_deep_recursion_into_a_catchable_recursion_error(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         result = await sandbox.execute(
             """
 depth = 0
@@ -793,8 +813,8 @@ except RecursionError as error:
         )
         assert success(result).value == ["RecursionError", True]
 
-    async def test_caps_memory(self, new_sandbox: Callable[..., CodemodeSandbox]) -> None:
-        sandbox = new_sandbox(memory_limit_bytes=8 * 1024 * 1024)
+    async def test_caps_memory(self, new_monty_sandbox: Callable[..., MontyCodemodeSandbox]) -> None:
+        sandbox = new_monty_sandbox(memory_limit_bytes=8 * 1024 * 1024)
         result = failure(
             await sandbox.execute("parts = []\nwhile True:\n    parts.append('x' * (1 << 20) + str(len(parts)))")
         )
@@ -803,8 +823,10 @@ except RecursionError as error:
 
 
 class TestEscapeHatches:
-    async def test_has_no_filesystem_network_subprocess_or_host_modules(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox()
+    async def test_has_no_filesystem_network_subprocess_or_host_modules(
+        self, create_monty_sandbox: CreateSandbox
+    ) -> None:
+        sandbox = create_monty_sandbox()
         result = success(
             await sandbox.execute(
                 """
@@ -845,9 +867,9 @@ return outcomes
         assert outcomes["open"] == outcomes["listdir"] == outcomes["path"] == "PermissionError"
         assert outcomes["subprocess"] == outcomes["socket"] == "ModuleNotFoundError"
 
-    async def test_keeps_eval_and_exec_inside_the_sandbox(self, create_sandbox: CreateSandbox) -> None:
+    async def test_keeps_eval_and_exec_inside_the_sandbox(self, create_monty_sandbox: CreateSandbox) -> None:
         # Code generation is allowed: it can only produce more code in the same sandbox.
-        sandbox = create_sandbox([echo_tool()])
+        sandbox = create_monty_sandbox([echo_tool()])
         result = success(
             await sandbox.execute(
                 """
@@ -864,8 +886,8 @@ return [eval("1 + 1"), outcome("import subprocess"), outcome("open('/etc/passwd'
         assert result.value == [2, "ModuleNotFoundError", "PermissionError", 3]
 
     # #10444: the prelude shares globals with the script, so rebinding them must not corrupt what reaches the host.
-    async def test_ignores_rebound_builtins_and_patched_modules(self, create_sandbox: CreateSandbox) -> None:
-        sandbox = create_sandbox([echo_tool()])
+    async def test_ignores_rebound_builtins_and_patched_modules(self, create_monty_sandbox: CreateSandbox) -> None:
+        sandbox = create_monty_sandbox([echo_tool()])
         result = success(
             await sandbox.execute(
                 """
@@ -889,10 +911,10 @@ return [await tools.echo([2]), json.loads('{"a": 1}'), patched]
         assert result.output == [CodemodeTextOutput("still")]
         assert result.store_writes.set == {"k": [1]}
 
-    async def test_reports_forged_host_calls_as_a_broken_bridge(self, create_sandbox: CreateSandbox) -> None:
+    async def test_reports_forged_host_calls_as_a_broken_bridge(self, create_monty_sandbox: CreateSandbox) -> None:
         # The prelude keeps the raw print to itself, so a script reaches the host only through calls; calls the
         # prelude never makes fail the run as a sandbox error.
-        sandbox = create_sandbox([echo_tool()])
+        sandbox = create_monty_sandbox([echo_tool()])
         for code, reason in (
             ("__codemode_fail__(1, 2)", "malformed failure"),
             ("await __codemode_call__(7, None, {})", "malformed tool call"),
@@ -904,9 +926,9 @@ return [await tools.echo([2]), json.loads('{"a": 1}'), patched]
         unknown = failure(await sandbox.execute("not_defined_anywhere()")).error
         assert (unknown.kind, unknown.name) == ("script", "NameError")
 
-    async def test_tampering_with_tools_only_affects_the_script(self, create_sandbox: CreateSandbox) -> None:
+    async def test_tampering_with_tools_only_affects_the_script(self, create_monty_sandbox: CreateSandbox) -> None:
         # Upstream freezes `tools`; Monty has no read-only attributes, so a script can rebind its own view.
-        sandbox = create_sandbox([echo_tool()])
+        sandbox = create_monty_sandbox([echo_tool()])
         result = success(
             await sandbox.execute(
                 """
@@ -920,9 +942,9 @@ return ["extra" in tools, tools.echo(), await tools["echo"]("still"), await orig
         assert result.value == [False, "nope", "still", "also"]
         assert [call.name for call in result.calls] == ["echo", "echo"]
 
-    async def test_reports_errors_whose_message_is_not_a_string(self, create_sandbox: CreateSandbox) -> None:
+    async def test_reports_errors_whose_message_is_not_a_string(self, create_monty_sandbox: CreateSandbox) -> None:
         # Monty's exceptions take at most one string argument; anything else fails where it is raised.
-        sandbox = create_sandbox()
+        sandbox = create_monty_sandbox()
         error = failure(await sandbox.execute("raise ValueError(42)")).error
         assert error.kind == "script"
         assert isinstance(error.name, str) and isinstance(error.message, str)

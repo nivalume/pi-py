@@ -335,11 +335,11 @@ async def test_sessions_take_a_telemetry_context_and_storage_kinds() -> None:
 
 async def test_durable_code_mode_records_run_spans_and_replays_after_a_restart(tmp_path: Path) -> None:
     pytest.importorskip("pydantic_monty")
-    from pi_codemode import CodemodeSandbox
+    from pi_codemode import MontyCodemodeSandbox
     from pi_durable.codemode.codemode import create_codemode_tool
 
     setup = chat_setup()
-    sandbox = CodemodeSandbox(memory_limit_bytes=64 * 1024 * 1024)
+    sandbox = MontyCodemodeSandbox(memory_limit_bytes=64 * 1024 * 1024)
     add_tool(setup.registry, create_codemode_tool(sandbox=sandbox))
     add_tool(setup.registry, tool("echo", secret_echo))
     reached = deferred()

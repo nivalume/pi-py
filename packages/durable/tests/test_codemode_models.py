@@ -44,7 +44,7 @@ from pi_ai import (
     faux_tool_call,
 )
 from pi_ai.auth.types import ApiKeyAuth
-from pi_codemode import CodemodeSandbox
+from pi_codemode import MontyCodemodeSandbox
 from pi_durable import MemoryStorage, ToolResultEntry, UsageDoc
 from pi_durable.codemode import create_codemode_extension
 from pi_durable.env.local import LocalExecutionEnv
@@ -75,10 +75,10 @@ class ModelsChat:
     setup: ChatSetup
     calls: Calls
     gate: Gate
-    sandbox: CodemodeSandbox
+    sandbox: MontyCodemodeSandbox
 
 
-_sandboxes: list[CodemodeSandbox] = []
+_sandboxes: list[MontyCodemodeSandbox] = []
 
 
 @pytest.fixture(autouse=True)
@@ -171,7 +171,7 @@ def models_chat() -> ModelsChat:
             images={"test-images": Images()},
         )
     )
-    sandbox = CodemodeSandbox()
+    sandbox = MontyCodemodeSandbox()
     _sandboxes.append(sandbox)
     setup.registry.install(create_codemode_extension(sandbox=sandbox))
     return ModelsChat(setup, calls, gate, sandbox)

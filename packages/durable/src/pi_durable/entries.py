@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AssistantEntry",
     "CompactionEntry",
+    "ContextEntry",
     "CompactionEntryData",
     "ResetEntry",
     "SystemEntry",
@@ -61,3 +62,6 @@ ToolResultEntry: Entry[ToolResultEntryData] = define_entry("pi.tool-result")
 ResetEntry: Entry[Any] = define_entry("pi.reset")
 #: Compaction summary: ``model`` is ``[UserMessage]`` with the wrapped summary, ``head`` the first kept entry.
 CompactionEntry: Entry[CompactionEntryData] = define_entry("pi.compaction")
+#: Context an ``on_input`` hook added for the model: ``model`` is ``[SystemMessage]`` whose ``content`` is the text.
+#: Written by generation before the run's first request.
+ContextEntry: Entry[Any] = define_entry("pi.context")

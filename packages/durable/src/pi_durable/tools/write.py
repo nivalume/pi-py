@@ -10,7 +10,7 @@ from ..env.types import get_or_throw
 from ..harness.define import define_tool
 from .env import require_env
 from .file_mutation_queue import with_file_mutation_queue
-from .path_utils import resolve_tool_path
+from .path_utils import path_subject, resolve_tool_path
 
 if TYPE_CHECKING:
     from pi_chord.context import Context
@@ -63,4 +63,5 @@ def create_write_tool() -> ToolRegistration:
         ),
         parameters=_WRITE_SCHEMA,
         execute=execute,
+        permission_subject=path_subject("write"),
     )

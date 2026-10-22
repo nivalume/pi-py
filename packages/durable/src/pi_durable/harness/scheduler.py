@@ -261,6 +261,8 @@ class TaskSchedulerOptions:
     context: Context
     #: ``HarnessOptions.telemetryContext``: parent of phase spans. Process-local, never persisted.
     telemetry_context: TelemetryContext | None = None
+    #: The Harness's approval services (``pi.tool``'s policy and waiters); process-local.
+    approvals: Any = None
 
 
 _REGISTRY: Final[ReportInfo] = {"type": "host_error", "callback": "registry"}
@@ -311,6 +313,12 @@ class TaskScheduler:
         self._withdraw_inputs = options.withdraw_inputs
         self._conversation = options.conversation
         self._context = options.context
+        if options.approvals is not None:
+            self._approvals = options.approvals
+        else:
+            from .approvals import HarnessApprovals
+
+            self._approvals = HarnessApprovals(None, lambda id: self.abort(id, self._context))
         telemetry = options.telemetry_context
         self._telemetry: TelemetryContext | None = telemetry if is_telemetry_enabled(telemetry) else None
         #: Open ``pi.harness.tool`` spans by task, so a nested call's span becomes a child of its caller's. Memory only.
@@ -2144,6 +2152,11 @@ class _Runtime:
         """The running phase's telemetry parent: its span, or ``NOOP_TELEMETRY_CONTEXT``."""
         return self._phase.telemetry
 
+    @property
+    def approvals(self) -> Any:
+        """Internal (``pi.tool``): the Harness's approval services."""
+        return self._scheduler._approvals
+
     def bind_tool_span(self, span: Any) -> Callable[[], None]:
         """Internal (``pi.tool``): make ``span`` the parent of this call's nested calls until the returned
         function runs."""
@@ -2174,6 +2187,21 @@ class _Runtime:
         if self._invocation.ended:
             raise self._ended()
         return await self._scheduler._env(self._invocation.conversation_id, context)
+
+    async def cwd(self, context: Context) -> str | None:
+        """The conversation's working directory: its environment's, else the agent's ``cwd``."""
+        env = await self.env(context)
+        if env is not None:
+            return env.cwd
+        return (await self.agent(context)).get("cwd")
+
+    async def conversation_record(self, context: Context) -> Any:
+        """The committed record of the task's conversation."""
+        if self._invocation.ended:
+            raise self._ended()
+        scheduler = self._scheduler
+        id = self._invocation.conversation_id
+        return await scheduler._session.read_on_line(lambda: scheduler._storage.conversation(id, context))
 
     def commit(self, change: Callable[[Any, Any], Any], context: Context) -> asyncio.Future[None]:
         scheduler = self._scheduler
@@ -2318,6 +2346,13 @@ class _Runtime:
 
         binding = InvocationBinding(invocation.controller.signal, check)
         return await self._scheduler._conversation(id, binding, context)
+
+    async def submission(self, id: Any, context: Context) -> Any:
+        """Internal (``pi.generation``): the committed record of submission ``id``."""
+        if self._invocation.ended:
+            raise self._ended()
+        scheduler = self._scheduler
+        return await scheduler._session.read_on_line(lambda: scheduler._storage.submission(id, context))
 
     async def entry(self, *args: Any) -> Any:
         if len(args) == 2:

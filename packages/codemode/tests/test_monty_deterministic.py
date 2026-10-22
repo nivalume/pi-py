@@ -2,7 +2,7 @@
 
 ``start()`` runs a script deterministically with the caller answering its calls, so a durable host
 can replay it after a restart. Upstream runs every test on the worker and the Cloudflare remote
-sandbox; here on :class:`CodemodeSandbox`. The remote-transport reordering test is dropped (no
+sandbox; here on :class:`MontyCodemodeSandbox`. The remote-transport reordering test is dropped (no
 transport reorders here; ``test_applies_results_in_seq_order`` covers the VM side).
 """
 
@@ -31,10 +31,10 @@ from pi_codemode import (
     CodemodeOutcome,
     CodemodeResult,
     CodemodeRun,
-    CodemodeSandbox,
     CodemodeSandboxBase,
     CodemodeSuccess,
     CodemodeTextOutput,
+    MontyCodemodeSandbox,
 )
 
 STARTED_AT = dt.datetime(2026, 1, 15, 10, 0, 0, tzinfo=dt.UTC).timestamp() * 1000
@@ -100,8 +100,8 @@ def start(
 
 
 @pytest.fixture
-async def sandbox(new_sandbox: Callable[..., CodemodeSandbox]) -> CodemodeSandbox:
-    return new_sandbox()
+async def sandbox(new_monty_sandbox: Callable[..., MontyCodemodeSandbox]) -> MontyCodemodeSandbox:
+    return new_monty_sandbox()
 
 
 def timeless(result: CodemodeResult) -> CodemodeResult:
@@ -109,7 +109,9 @@ def timeless(result: CodemodeResult) -> CodemodeResult:
     return replace(result, calls=[replace(call, duration_ms=0) for call in result.calls])
 
 
-async def test_makes_the_same_calls_and_output_for_the_same_start_seed_and_results(sandbox: CodemodeSandbox) -> None:
+async def test_makes_the_same_calls_and_output_for_the_same_start_seed_and_results(
+    sandbox: MontyCodemodeSandbox,
+) -> None:
     code = """
 import datetime, json, random, time
 values = [time.time(), time.monotonic(), random.random(), random.random(), datetime.datetime.now(datetime.timezone.utc).isoformat()]
@@ -147,7 +149,7 @@ return await tools.echo(first + [random.random()])
 
 
 async def test_runs_in_utc_whatever_the_host_timezone(
-    sandbox: CodemodeSandbox, monkeypatch: pytest.MonkeyPatch
+    sandbox: MontyCodemodeSandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("TZ", "Asia/Kolkata")
     time.tzset()
@@ -174,7 +176,7 @@ return [time.localtime().tm_hour - time.gmtime().tm_hour, time.timezone, time.tz
         time.tzset()
 
 
-async def test_applies_results_in_seq_order_whatever_order_they_are_delivered_in(sandbox: CodemodeSandbox) -> None:
+async def test_applies_results_in_seq_order_whatever_order_they_are_delivered_in(sandbox: MontyCodemodeSandbox) -> None:
     recorded = start(
         sandbox,
         """
@@ -199,9 +201,9 @@ return order
 
 
 async def test_reports_the_fingerprint_before_any_call_and_the_calls_issued_after_each_result(
-    new_sandbox: Callable[..., CodemodeSandbox],
+    new_monty_sandbox: Callable[..., MontyCodemodeSandbox],
 ) -> None:
-    sandbox = new_sandbox(memory_limit_bytes=64 * 1024 * 1024)
+    sandbox = new_monty_sandbox(memory_limit_bytes=64 * 1024 * 1024)
     recorded = start(sandbox, "await tools.echo(1)\nimport asyncio\nawait asyncio.gather(tools.echo(2), tools.echo(3))")
     assert (await recorded.run.result).ok
     assert recorded.events[:3] == ["started", "call 1", "idle 0"]
@@ -219,13 +221,15 @@ async def test_reports_the_fingerprint_before_any_call_and_the_calls_issued_afte
     )
 
     same = start(sandbox, "return 1")
-    other = start(new_sandbox(memory_limit_bytes=32 * 1024 * 1024), "return 1")
+    other = start(new_monty_sandbox(memory_limit_bytes=32 * 1024 * 1024), "return 1")
     await asyncio.gather(same.run.result, other.run.result)
     assert same.fingerprint == fingerprint
     assert other.fingerprint != fingerprint
 
 
-async def test_numbers_calls_to_globals_with_tools_and_answers_errors_as_exceptions(sandbox: CodemodeSandbox) -> None:
+async def test_numbers_calls_to_globals_with_tools_and_answers_errors_as_exceptions(
+    sandbox: MontyCodemodeSandbox,
+) -> None:
     def answer(call: CodemodeHostCall) -> CodemodeOutcome:
         if call.args == "fail":
             return {"ok": False, "message": "no"}
@@ -254,7 +258,9 @@ return found
     assert [(call.name, call.status) for call in result.calls] == [("echo", "error")]
 
 
-async def test_keeps_the_clock_monotonic_and_rejects_a_clock_value_that_is_not_finite(sandbox: CodemodeSandbox) -> None:
+async def test_keeps_the_clock_monotonic_and_rejects_a_clock_value_that_is_not_finite(
+    sandbox: MontyCodemodeSandbox,
+) -> None:
     recorded = start(
         sandbox,
         "import time\nbefore = time.time()\nawait tools.wait(1)\nreturn [before, time.time(), time.monotonic()]",
@@ -269,7 +275,7 @@ async def test_keeps_the_clock_monotonic_and_rejects_a_clock_value_that_is_not_f
     assert result.value == [STARTED_AT / 1000, STARTED_AT / 1000, 0]
 
 
-async def test_advances_the_clock_on_sleeps_without_waiting(sandbox: CodemodeSandbox) -> None:
+async def test_advances_the_clock_on_sleeps_without_waiting(sandbox: MontyCodemodeSandbox) -> None:
     # Not upstream (QuickJS has no timers): sleeps return at once and move the virtual clock.
     started = time.perf_counter()
     recorded = start(
@@ -284,7 +290,7 @@ async def test_advances_the_clock_on_sleeps_without_waiting(sandbox: CodemodeSan
     assert time.perf_counter() - started < 3
 
 
-async def test_derives_os_urandom_from_the_seed(sandbox: CodemodeSandbox) -> None:
+async def test_derives_os_urandom_from_the_seed(sandbox: MontyCodemodeSandbox) -> None:
     code = "import os\nreturn list(os.urandom(8))"
     one, two, other = await asyncio.gather(
         start(sandbox, code).run.result, start(sandbox, code).run.result, start(sandbox, code, seed=9).run.result
@@ -293,7 +299,9 @@ async def test_derives_os_urandom_from_the_seed(sandbox: CodemodeSandbox) -> Non
     assert one.value == two.value != other.value
 
 
-async def test_reports_the_result_the_sandbox_was_processing_when_the_script_ended(sandbox: CodemodeSandbox) -> None:
+async def test_reports_the_result_the_sandbox_was_processing_when_the_script_ended(
+    sandbox: MontyCodemodeSandbox,
+) -> None:
     returned = start(sandbox, "await tools.echo(1)\nreturn await tools.echo(2)")
     thrown = start(
         sandbox,
@@ -310,7 +318,7 @@ async def test_reports_the_result_the_sandbox_was_processing_when_the_script_end
     assert (await sandbox.execute("return 1")).during is None
 
 
-async def test_leaves_a_call_waiting_when_its_answer_cannot_be_serialized(sandbox: CodemodeSandbox) -> None:
+async def test_leaves_a_call_waiting_when_its_answer_cannot_be_serialized(sandbox: MontyCodemodeSandbox) -> None:
     recorded = start(sandbox, "return await tools.wait(1)")
     await wait_for(lambda: len(recorded.calls) == 1)
     with pytest.raises(TypeError):
@@ -322,7 +330,7 @@ async def test_leaves_a_call_waiting_when_its_answer_cannot_be_serialized(sandbo
     assert isinstance(result, CodemodeSuccess) and result.value == "fine"
 
 
-async def test_rejects_with_an_exception_carrying_the_answers_message(sandbox: CodemodeSandbox) -> None:
+async def test_rejects_with_an_exception_carrying_the_answers_message(sandbox: MontyCodemodeSandbox) -> None:
     # Upstream's Error carries the answer's properties; Monty exceptions hold only a message, so
     # `properties` are validated and accepted but not visible to the script.
     recorded = start(
@@ -340,7 +348,7 @@ async def test_rejects_with_an_exception_carrying_the_answers_message(sandbox: C
 
 
 async def test_rejects_rejection_properties_that_are_not_an_object_and_tools_sharing_a_script_name(
-    sandbox: CodemodeSandbox,
+    sandbox: MontyCodemodeSandbox,
 ) -> None:
     recorded = start(sandbox, "return await tools.wait(1)")
     await wait_for(lambda: len(recorded.calls) == 1)
@@ -360,7 +368,7 @@ async def test_rejects_rejection_properties_that_are_not_an_object_and_tools_sha
         )
 
 
-def test_validates_the_start_data(sandbox: CodemodeSandbox) -> None:
+def test_validates_the_start_data(sandbox: MontyCodemodeSandbox) -> None:
     for started_at in (-1, math.inf, math.nan):
         with pytest.raises(ValueError, match="started_at"):
             sandbox.start("", started_at=started_at, seed=1, on_call=lambda _call: None)
@@ -371,7 +379,7 @@ def test_validates_the_start_data(sandbox: CodemodeSandbox) -> None:
         sandbox.start("", started_at=0, seed=0, tools=[CodemodeDeclaredTool("a")] * 2, on_call=lambda _call: None)
 
 
-async def test_uses_the_script_names_the_run_passes(sandbox: CodemodeSandbox) -> None:
+async def test_uses_the_script_names_the_run_passes(sandbox: MontyCodemodeSandbox) -> None:
     recorded = start(
         sandbox,
         "return [type(tools.renamed).__name__, 'renamed' in tools, 'my-tool' in tools, [tool['name'] for tool in ALL_TOOLS]]",
@@ -382,7 +390,7 @@ async def test_uses_the_script_names_the_run_passes(sandbox: CodemodeSandbox) ->
     assert result.value == ["function", True, True, ["renamed"]]
 
 
-async def test_ends_with_an_error_the_script_cannot_catch_when_the_caller_aborts(sandbox: CodemodeSandbox) -> None:
+async def test_ends_with_an_error_the_script_cannot_catch_when_the_caller_aborts(sandbox: MontyCodemodeSandbox) -> None:
     controller = AbortController()
     recorded = start(
         sandbox,
@@ -397,7 +405,7 @@ async def test_ends_with_an_error_the_script_cannot_catch_when_the_caller_aborts
     recorded.run.deliver(1, STARTED_AT, 1, {"ok": True, "value": None})
 
 
-async def test_is_finished_once_it_has_its_outcome(sandbox: CodemodeSandbox) -> None:
+async def test_is_finished_once_it_has_its_outcome(sandbox: MontyCodemodeSandbox) -> None:
     recorded = start(sandbox, "await tools.wait(1)\nreturn 2")
     await wait_for(lambda: len(recorded.calls) == 1)
     assert recorded.run.finished is False
@@ -406,7 +414,7 @@ async def test_is_finished_once_it_has_its_outcome(sandbox: CodemodeSandbox) -> 
     assert recorded.run.finished is True
 
 
-async def test_rejects_a_call_that_is_not_waiting_and_a_result_number_used_twice(sandbox: CodemodeSandbox) -> None:
+async def test_rejects_a_call_that_is_not_waiting_and_a_result_number_used_twice(sandbox: MontyCodemodeSandbox) -> None:
     recorded = start(sandbox, "import asyncio\nawait asyncio.gather(tools.wait(1), tools.wait(2))")
     await wait_for(lambda: len(recorded.calls) == 2)
     run = recorded.run
@@ -421,7 +429,7 @@ async def test_rejects_a_call_that_is_not_waiting_and_a_result_number_used_twice
     assert (await run.result).ok
 
 
-async def test_execute_reads_the_real_clock_and_real_randomness(sandbox: CodemodeSandbox) -> None:
+async def test_execute_reads_the_real_clock_and_real_randomness(sandbox: MontyCodemodeSandbox) -> None:
     before = time.time()
     first = await sandbox.execute("import time, random\nreturn [time.time(), random.random()]")
     second = await sandbox.execute("import time, random\nreturn [time.time(), random.random()]")
@@ -548,7 +556,7 @@ return pick
 """
 
 
-async def test_replays_a_journal_to_the_same_calls_and_continues_live(sandbox: CodemodeSandbox) -> None:
+async def test_replays_a_journal_to_the_same_calls_and_continues_live(sandbox: MontyCodemodeSandbox) -> None:
     reads: list[Any] = []
 
     async def answer(call: CodemodeHostCall) -> Any:
@@ -572,7 +580,7 @@ async def test_replays_a_journal_to_the_same_calls_and_continues_live(sandbox: C
     assert reads == [{"name": first.value}]
 
 
-async def test_ends_a_replay_that_takes_another_path(sandbox: CodemodeSandbox) -> None:
+async def test_ends_a_replay_that_takes_another_path(sandbox: MontyCodemodeSandbox) -> None:
     async def answer(call: CodemodeHostCall) -> Any:
         return f"file-{call.args}" if call.name == "read" else "ok"
 

@@ -1,8 +1,9 @@
 """A ``codemode`` tool for pi_agent (the README's "Using with pi-agent-core", as code).
 
 The agent's other tools become the sandbox's tools; the model calls one ``codemode`` tool
-with a Python script that calls them as ``await tools.<name>(...)``. Nested calls never
-enter the model's context, only the script's output and return value do::
+with a script that calls them as ``await tools.<name>(...)``: JavaScript by default, or Python
+with ``language="python"``. Nested calls never enter the model's context, only the script's
+output and return value do::
 
     agent = Agent(
         initial_state={"model": model, "tools": [create_codemode_tool(tools)]},
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Final
 
 from pi_agent import AgentTool, AgentToolResult
 from pi_ai import ImageContent, TextContent, ToolCall, Type
@@ -28,6 +29,7 @@ from pi_chord.json import JsonValue
 from pi_telemetry import TelemetryContext
 
 from .declarations import render_declarations
+from .language import CodemodeLanguage, check_codemode_language
 from .runtime.execution import CodemodeSandboxBase
 from .source import CodemodeSourceError, parse_codemode_source
 from .types import CodemodeFailure, CodemodeTool, CodemodeToolContext
@@ -40,17 +42,22 @@ _TEXT_OUTPUT_SCHEMA = {"type": "string"}
 SandboxFactory = Callable[[list[CodemodeTool]], CodemodeSandboxBase]
 
 
-def codemode_tool_of(tool: AgentTool) -> CodemodeTool:
-    """An agent tool as a sandbox tool.
+def codemode_tool_of(tool: AgentTool, language: CodemodeLanguage = "javascript") -> CodemodeTool:
+    """An agent tool as a sandbox tool for scripts in ``language``.
 
     A tool with an ``output_schema`` resolves to its ``structured_content``; any other tool to
     its text content joined by newlines. A result with ``is_error`` raises in the script.
     """
+    takes = (
+        "one object of arguments"
+        if check_codemode_language(language) == "javascript"
+        else "keyword arguments or one dict"
+    )
 
     async def execute(args: JsonValue, context: CodemodeToolContext) -> Any:
         arguments = {} if args is None else args
         if not isinstance(arguments, dict):
-            raise TypeError(f"tools.{tool.name}() takes keyword arguments or one dict, not {type(arguments).__name__}")
+            raise TypeError(f"tools.{tool.name}() takes {takes}, not {_kind_of(arguments, language)}")
         validated = validate_tool_arguments(tool, ToolCall("nested", tool.name, arguments))
         result = await tool.execute("nested", validated, context.signal)
         text = "\n".join(block.text for block in result.content if isinstance(block, TextContent))
@@ -69,43 +76,78 @@ def codemode_tool_of(tool: AgentTool) -> CodemodeTool:
     )
 
 
-def _default_sandbox(tools: list[CodemodeTool]) -> CodemodeSandboxBase:
-    from .sandbox import CodemodeSandbox
+def _kind_of(value: Any, language: CodemodeLanguage) -> str:
+    if language == "python":
+        return type(value).__name__
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, bool):
+        return "a boolean"
+    return "a number"
 
-    return CodemodeSandbox(tools=tools)
+
+def _default_sandbox(language: CodemodeLanguage) -> SandboxFactory:
+    if language == "javascript":
+        from .sandbox import CodemodeSandbox
+
+        return lambda tools: CodemodeSandbox(tools=tools)
+    from .monty import MontyCodemodeSandbox
+
+    return lambda tools: MontyCodemodeSandbox(tools=tools)
+
+
+#: The tool's first line and its ``code`` parameter, by language.
+_INTRO: Final = {
+    "javascript": (
+        "Run JavaScript that calls tools as `await tools.<name>(args)`. Output with text() or return.",
+        "JavaScript source.",
+    ),
+    "python": (
+        "Run Python that calls tools as `await tools.<name>(...)`. Output with text() or return.",
+        "Python source.",
+    ),
+}
 
 
 def create_codemode_tool(
     tools: Sequence[AgentTool],
     *,
+    language: CodemodeLanguage = "javascript",
     sandbox: SandboxFactory | None = None,
     name: str = "codemode",
     label: str = "Codemode",
     telemetry_context: TelemetryContext | None = None,
 ) -> AgentTool:
-    """A ``codemode`` agent tool whose scripts call ``tools``.
+    """A ``codemode`` agent tool whose scripts, in ``language``, call ``tools``.
 
-    Each call runs in a fresh sandbox from ``sandbox(tools)`` (default: a
-    :class:`~pi_codemode.CodemodeSandbox`), closed when the script ends; pass a factory that
-    shares an ``AsyncMonty`` pool (``CodemodeSandbox(tools=tools, pool=pool)``) to avoid starting
-    one per call. The script may start with ``# @options: {"timeout_ms": ...}``.
+    Each call runs in a fresh sandbox from ``sandbox(tools)``, closed when the script ends. The
+    default is a :class:`~pi_codemode.CodemodeSandbox` for JavaScript and a
+    :class:`~pi_codemode.MontyCodemodeSandbox` for Python; for Python, pass a factory that shares
+    an ``AsyncMonty`` pool (``MontyCodemodeSandbox(tools=tools, pool=pool)``) to avoid starting
+    one per call. A factory must make sandboxes of ``language``. The script may start with an
+    options line (``// @options: {"timeout_ms": ...}``, in Python ``# @options: ...``).
     ``telemetry_context`` is the parent of each script's ``pi.codemode.run`` span.
     """
-    sandbox_tools = [codemode_tool_of(tool) for tool in tools]
-    factory = sandbox or _default_sandbox
-    description = (
-        "Run Python that calls tools as `await tools.<name>(...)`. Output with text() or return.\n\n"
-        + render_declarations(tools=sandbox_tools)
-    )
+    language = check_codemode_language(language)
+    sandbox_tools = [codemode_tool_of(tool, language) for tool in tools]
+    factory = sandbox or _default_sandbox(language)
+    intro, code_description = _INTRO[language]
+    description = intro + "\n\n" + render_declarations(tools=sandbox_tools, language=language)
+    separators = (",", ":") if language == "javascript" else None
 
     async def execute(
         tool_call_id: str, params: Any, signal: AbortSignal | None = None, on_update: Any = None
     ) -> AgentToolResult:
         try:
-            source = parse_codemode_source(params["code"])
+            source = parse_codemode_source(params["code"], language)
         except CodemodeSourceError as error:
             return AgentToolResult([TextContent(str(error))], is_error=True)
         runner = factory(sandbox_tools)
+        if runner.language != language:
+            await runner.close()
+            raise ValueError(f"The sandbox runs {runner.language} scripts, but the codemode tool is for {language}")
         try:
             result = await runner.execute(
                 source.code,
@@ -119,13 +161,13 @@ def create_codemode_tool(
         if isinstance(result, CodemodeFailure):
             content.append(TextContent(result.error.stack or result.error.message))
         elif result.value is not None:
-            content.append(TextContent(json.dumps(result.value, ensure_ascii=False)))
+            content.append(TextContent(json.dumps(result.value, ensure_ascii=False, separators=separators)))
         return AgentToolResult(content, is_error=not result.ok)
 
     return AgentTool(
         name=name,
         description=description,
-        parameters=Type.Object({"code": Type.String(description="Python source.")}),
+        parameters=Type.Object({"code": Type.String(description=code_description)}),
         label=label,
         execute=execute,
     )

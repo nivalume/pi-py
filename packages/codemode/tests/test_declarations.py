@@ -1,16 +1,16 @@
-"""Port of upstream ``test/declarations.test.ts``.
+"""Port of upstream ``test/declarations.test.ts`` for Python scripts (``pi_codemode.python_declarations``).
 
-Declarations are Python here: the same schemas and the same rules (sorted keys, comment lines for
-descriptions and constraint tags, the budget, ``$ref`` handling), rendered as Python types and stubs.
+The same schemas and the same rules (sorted keys, comment lines for descriptions and constraint tags,
+the budget, ``$ref`` handling), rendered as Python types and stubs. ``test_typescript_declarations.py``
+covers upstream's TypeScript output.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from pi_codemode import (
-    CodemodeTool,
-    CodemodeToolDeclaration,
+from pi_codemode import CodemodeTool, CodemodeToolDeclaration
+from pi_codemode.python_declarations import (
     render_declarations,
     render_tool_sample,
     render_tool_signature,

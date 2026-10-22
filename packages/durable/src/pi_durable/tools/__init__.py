@@ -1,7 +1,9 @@
 """The coding tools: ``read``, ``write``, ``edit``, ``bash``, and ``powershell`` (port of ``tools/index.ts``).
 
 Tools take their environment from ``api.env`` (a tool call without one fails), stream through
-``api.output()``, and report remarks as diagnostics. Not imported by :mod:`pi_durable`::
+``api.output()``, and report remarks as diagnostics. Their ``permission_subject`` is the command (``bash``,
+``powershell``) or the path they read or write (``command_subject``, ``path_subject``), which permission rules match.
+Not imported by :mod:`pi_durable`::
 
     from pi_durable.tools import CodingTools, create_coding_tools
 
@@ -20,11 +22,13 @@ from .bash import (
     BashToolInput,
     PowerShellToolInput,
     ShellStructuredOutput,
+    command_subject,
     create_bash_tool,
     create_powershell_tool,
 )
 from .edit import EditToolDetails, EditToolInput, create_edit_tool
 from .image_processor import DEFAULT_IMAGE_LIMITS, ImageLimits, ImageProcessor, PreparedImage
+from .path_utils import path_subject
 from .read import ReadToolDetails, ReadToolInput, create_read_tool
 from .write import WriteToolInput, create_write_tool
 
@@ -44,6 +48,8 @@ __all__ = [
     "ReadToolInput",
     "ShellStructuredOutput",
     "WriteToolInput",
+    "command_subject",
+    "path_subject",
     "create_bash_tool",
     "create_coding_tools",
     "create_edit_tool",
