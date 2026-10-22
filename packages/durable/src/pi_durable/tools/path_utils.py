@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from ..env.types import get_or_throw
 
 if TYPE_CHECKING:
     from pi_chord.context import Context
 
+    from ..approval import PathAccess, PermissionSubject
     from ..env.types import ExecutionEnv
 
-__all__ = ["resolve_read_tool_path", "resolve_tool_path"]
+__all__ = ["path_subject", "resolve_read_tool_path", "resolve_tool_path"]
 
 _UNICODE_SPACES = re.compile("[\u00a0\u2000-\u200a\u202f\u205f\u3000]")
 _NARROW_NO_BREAK_SPACE = "\u202f"
@@ -28,6 +30,27 @@ def _normalize_tool_path(path: str) -> str:
 async def resolve_tool_path(env: ExecutionEnv, path: str, context: Context) -> str:
     """The absolute path a tool argument names: special spaces as spaces, a leading ``@`` dropped."""
     return get_or_throw(await env.absolute_path(_normalize_tool_path(path), context))
+
+
+def path_subject(
+    access: PathAccess,
+) -> Callable[[dict[str, Any], ExecutionEnv | None, Context], Awaitable[PermissionSubject | None]]:
+    """``permission_subject`` of a tool whose ``path`` argument it reads or writes: the path made absolute with the
+    environment; without one, only an absolute path. A path that does not resolve has no subject."""
+
+    async def subject(args: dict[str, Any], env: ExecutionEnv | None, context: Context) -> PermissionSubject | None:
+        path = args.get("path")
+        if not isinstance(path, str):
+            return None
+        normalized = _normalize_tool_path(path)
+        if env is None:
+            return {"type": "path", "path": normalized, "access": access} if normalized.startswith("/") else None
+        resolved = await env.absolute_path(normalized, context)
+        if resolved["ok"] is False:
+            return None
+        return {"type": "path", "path": resolved["value"], "access": access}
+
+    return subject
 
 
 async def resolve_read_tool_path(env: ExecutionEnv, path: str, context: Context) -> str:

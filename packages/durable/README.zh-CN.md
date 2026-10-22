@@ -28,6 +28,7 @@
 - [压缩](#压缩)
 - [Agent 事件（实验性）](#agent-事件实验性)
 - [Hooks](#hooks)
+- [审批与权限](#审批与权限)
 - [更多会话与分叉](#更多会话与分叉)
 - [中止与子 Agent](#中止与子-agent)
 - [子任务](#子任务)
@@ -580,6 +581,7 @@ def settings():
         "contextRetentionMs": 600_000,  # 空闲会话的上下文在内存中保留这么久
         "documentRetentionMs": 600_000,  # 无人观察的已加载文档在最后一次使用后于内存中保留这么久
         "followUpMode": user_settings["followUpMode"],
+        "approvalTimeoutMs": 900_000,  # 审批请求等待决定的时长
     }
 
 
@@ -777,7 +779,7 @@ settings = {
 from pi_durable import watch_events
 
 stream = await watch_events(harness, root.id, context)
-print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, ...
+print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, approvals, ...
 
 
 def on_events(events, context):
@@ -816,10 +818,58 @@ registry.install(Guard)
 ```
 
 - **Generation：** `before_request(request, api, context)`（替换一次请求的消息）、`after_response(message, api, context)`、`on_yield(answer, api, context)`（用另一条用户消息继续 run）和 `after_tools(assistant_entry_id, result_entry_ids, api, context)`（一轮的工具做完后运行一次）。
-- **Tools：** `before_tool(call, api, context)`（阻塞，或重写 `arguments`）和 `after_tool(call, result, api, context)`（替换结果）。
+- **Tools：** `before_tool(call, api, context)`（阻塞、重写 `arguments`，或要求审批；见[审批与权限](#审批与权限)）和 `after_tool(call, result, api, context)`（替换结果）。
 - **Compaction：** `before_compact(compaction, api, context)`（拒绝，或提供摘要）。
 
 要把 hook 限制到某些会话，只在那里选择它的扩展，例如 `configure({"extensions": {"add": [Guard]}})`。
+
+## 审批与权限
+
+审批策略按每次工具调用决定它直接运行、被拒绝，还是等人审批。这是对上游的补充，移植自 delta（pi 的 Rust 实现），delta 把 Codex 的审批流程做成了持久化的。用 `approval` 传入；不传时每个调用都直接运行，与上游相同：
+
+```python
+from pi_durable import PermissionDefaults, RulesPolicy
+
+policy = RulesPolicy(
+    PermissionDefaults(
+        mode="default",
+        rules={"allow": ["Bash(git status:*)", "Bash(cargo test:*)"], "deny": ["Read(./.env)", "Bash(rm *)"]},
+    )
+)
+harness = await Harness.open(storage, {"models": models, "registry": registry, "env": env, "approval": policy}, context)
+```
+
+策略要求审批时，工具调用把一个带截止时间的请求提交到会话的 `pi.approvals` 文档，然后在它的 `approval` 阶段等待。UI 列出请求并做决定：
+
+```python
+for request in await root.pending_approvals(context):
+    print(request["name"], request["arguments"], request.get("prompt"), request.get("proposedRule"))
+    await root.decide(request["id"], {"type": "approved"}, context)
+```
+
+| 决定 | 效果 |
+|---|---|
+| `{"type": "approved"}` | 调用以请求中的参数运行。 |
+| `{"type": "approvedForSession"}` | 另外，本会话中同一工具、同一审批键（默认是参数的 JSON）的后续调用不再询问。 |
+| `{"type": "approvedWithRule", "rule": "Bash(git push:*)"}` | 另外，该规则加入会话级（session）允许规则（`harness.permission_rules()`），对所有会话生效。 |
+| `{"type": "denied", "rejection": "..."}` | 调用以 `Tool call blocked: approval denied: ...` 结束。 |
+| `{"type": "abort"}` | 中止会话的 run。 |
+
+无人决定的请求在 `settings["approvalTimeoutMs"]`（15 分钟）或策略给出的 `timeoutMs` 之后超时，调用以 `Tool call blocked: approval timed out after <n>s` 结束。`harness.decide(id, decision, context)` 在调用所在的会话里做决定，`harness.pending_approvals(context)` 列出所有会话的请求。决定及其 `pi.approval` 条目（仅用于展示，从不进入模型上下文）先提交，再通知等待中的调用，所以任何时刻重启都只留下一个结果：进程停止时正在等待的调用会重新等待到存储的截止时间，并读取停机期间做出的决定。`decide()` 会抛出 `ApprovalNotPending`、`UnknownApproval`、`InvalidDecision`（`timedOut` 只能由 Harness 写入）或 `RuleError`。
+
+**规则**使用 Claude Code 的语法。`Bash(<command>)` 匹配命令：`*` 匹配任意文本，结尾的 ` *` 或 `:*` 也匹配不带参数的命令（`Bash(npm run test:*)`）。命令在引号外的 `&&`、`||`、`;`、`|`、`&` 和换行处拆分，并去掉开头的 `NAME=value` 赋值和 `timeout`、`nohup` 等包装命令；拒绝或询问规则在任一部分匹配时生效，允许规则要求每一部分都被允许。`Read(<path>)` 匹配调用读取的路径，`Edit(<path>)` 和 `Write(<path>)` 匹配写入的路径：`//abs/path`、`~/path`、`/path`（相对 `PermissionDefaults.root`）、`./path` 或 `path`（相对调用的工作目录），支持 `*`、`**` 和 `?`；路径匹配模式本身或其下的任何内容，`Read` 拒绝规则也覆盖写入。其他不带括号的名字指工具（`deploy`）。
+
+**模式**决定没有规则时什么可以直接运行：`default`（工作目录和 `directories` 内的读取直接运行，其余询问）、`acceptEdits`（那里的写入也直接运行）、`plan`（拒绝命令和写入）、`dontAsk`（本该询问的都拒绝）、`bypassPermissions`（全部运行）。任何模式下都先看拒绝规则，再看询问规则。每个会话在 `pi.permissions` 里有自己的模式、规则和目录，分叉会复制，被拥有的会话会继承：
+
+```python
+await root.set_permission_mode("plan", context)
+await root.update_permissions({"add": {"allow": ["Bash(make *)"]}, "directories": ["/data"]}, context)
+print(await root.permissions(context))  # {"mode": "plan", "directories": ["/data"], "rules": {"allow": ["Bash(make *)"]}}
+```
+
+调用用于匹配的是其工具的 `permission_subject(args, env, context)`：`bash` 和 `powershell` 是命令，`read`、`write`、`edit` 是绝对路径。自定义工具可以用 `define_tool(..., permission_subject=...)` 提供（参数是 `path` 时用 `pi_durable.tools.path_subject("write")`），用 `approval_key=` 改变会话授权匹配的键。`before_tool` hook 可以返回 `{"permission": "ask", "reason": "..."}`，无论策略怎么说都询问；或返回 `{"permission": "allow"}`，跳过模式本会要求的询问（拒绝和询问规则仍然生效）。
+
+自定义策略是任何带 `decide(call, api, context)` 方法的对象，返回 `{"type": "allow"}`、`{"type": "deny", "reason": ...}` 或 `{"type": "ask", "timeoutMs"?, "prompt"?, "proposedRule"?}`；内置 `AllowAll`、`AskAll` 和 `DenyAll(reason)`。策略抛出异常时调用被拒绝。Agent 事件携带待审批请求（`approval_update`）和 `pi.permissions`（`permissions_changed`），快照里有 `approvals` 和 `permissions`。
 
 ## 更多会话与分叉
 
@@ -1111,6 +1161,7 @@ print(sorted({span.name for span in telemetry.get_spans()}))
 - **二进制数据**是 `bytes`；ID 是普通 `int`（`TaskId`、`EntryId` 等是类型检查器品牌）。
 - **工具与图像**：`createCodingTools({ images })` 是 `create_coding_tools(images=...)`，`createBashTool({ commandPrefix, prepare })` 是 `create_bash_tool(command_prefix=..., prepare=...)`（`prepare` 改变 `BashExecution` dict 的 `command`、`cwd`、`env` 和 `inheritEnv`），`createNodePhotonImages()` 是 `create_pillow_images()`，用 Pillow 而非 Photon，在无空闲超时的工作线程中。`read` 对 `offset` 和 `limit` 保留 JavaScript 的数字语义，因此分数、负数和巨大的值会选择并打印相同的行。
 - **代码模式**像上游一样在 QuickJS 中运行 JavaScript，只是跑在 wasmtime 上而不是 worker 线程里；`createCodemodeExtension({ sandbox })` 是 `create_codemode_extension(sandbox=...)`。在 Monty 中运行 Python 脚本是新增的：使用 `MontyCodemodeSandbox` 时脚本全局变量是 snake_case（`search_tools()`、`models.generate_images()`），一种语言日志化的 run 不会在另一种中恢复（见[代码模式](#代码模式)）。
+- **审批与权限**是来自 delta 的新增功能：`HarnessOptions.approval`、`Conversation.decide()`、`pi.approvals`、`pi.permissions` 和 `pi.permission-rules` 文档，以及工具任务的 `approval` 阶段（见[审批与权限](#审批与权限)）。不配置策略时，工具调用的行为与上游相同。
 - **尚未移植**：Cloudflare 适配器（见[本移植包含的内容](#本移植包含的内容)）。
 
 ## 设计说明

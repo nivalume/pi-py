@@ -261,6 +261,8 @@ class TaskSchedulerOptions:
     context: Context
     #: ``HarnessOptions.telemetryContext``: parent of phase spans. Process-local, never persisted.
     telemetry_context: TelemetryContext | None = None
+    #: The Harness's approval services (``pi.tool``'s policy and waiters); process-local.
+    approvals: Any = None
 
 
 _REGISTRY: Final[ReportInfo] = {"type": "host_error", "callback": "registry"}
@@ -311,6 +313,12 @@ class TaskScheduler:
         self._withdraw_inputs = options.withdraw_inputs
         self._conversation = options.conversation
         self._context = options.context
+        if options.approvals is not None:
+            self._approvals = options.approvals
+        else:
+            from .approvals import HarnessApprovals
+
+            self._approvals = HarnessApprovals(None, lambda id: self.abort(id, self._context))
         telemetry = options.telemetry_context
         self._telemetry: TelemetryContext | None = telemetry if is_telemetry_enabled(telemetry) else None
         #: Open ``pi.harness.tool`` spans by task, so a nested call's span becomes a child of its caller's. Memory only.
@@ -2143,6 +2151,11 @@ class _Runtime:
     def telemetry_context(self) -> Any:
         """The running phase's telemetry parent: its span, or ``NOOP_TELEMETRY_CONTEXT``."""
         return self._phase.telemetry
+
+    @property
+    def approvals(self) -> Any:
+        """Internal (``pi.tool``): the Harness's approval services."""
+        return self._scheduler._approvals
 
     def bind_tool_span(self, span: Any) -> Callable[[], None]:
         """Internal (``pi.tool``): make ``span`` the parent of this call's nested calls until the returned

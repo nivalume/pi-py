@@ -308,3 +308,40 @@ API 形状：
 - 输出（`output.py`）：上游的布局、预算、溢出和图像文件；长度按码点计数，`value_text` 是紧凑 `json.dumps`（`separators=(",", ":")`，非 ASCII 原样），墙钟时间 `f"{ms / 1000:.1f}"`。
 - `pi_durable.codemode` 只导入 pi_codemode 的可移植模块（`source`、`identifier`、`declarations`、`types`，以及宿主运行时的类型）；沙箱来自调用者。`pi_durable` 不导入 `pi_durable.codemode`，两者都不加载 `pi_codemode.sandbox` 或 `pydantic_monty`（`tests/test_storage_runtime_boundary.py`）。
 - 测试：`tests/test_codemode.py`、`test_codemode_models.py` 是 Python 脚本（需要 Monty，没有则跳过），`tests/test_codemode_javascript.py` 等是 JavaScript 脚本（QuickJS）；描述/段测试覆盖两种语言；每个重启用例都在 MemoryStorage 和 SQLite 上运行。
+
+## 13. 审批与权限（来自 delta 的新增）
+
+上游没有审批。本节移植 delta 的实现（`crates/harness/src/approval/`、`docs/design/approval.md` 和 `permissions.md`），它把 Codex 的审批流程做成持久化的，并加入了 Claude Code 的权限规则和模式。
+
+| delta | Python |
+|---|---|
+| `approval/policy.rs` | `pi_durable/approval/policy.py`：`ApprovalPolicy`（带 `decide(call, api, context)` 的 `Protocol`，可同步或异步）、`ApprovalCall`（冻结 dataclass）、`PolicyDecision`（`TypedDict`）、`AllowAll`、`AskAll`、`DenyAll` |
+| `approval/document.rs` | `pi_durable/approval/document.py`：`ApprovalsDoc`、`ReviewDecision`、`ApprovalRequest`、`ApprovalGrant`、`record_decision()`、`remove_request()` |
+| `approval/pending.rs` | `pi_durable/approval/pending.py`：`PendingApprovals`、`ApprovalWaiter`（asyncio future） |
+| `approval/permissions.rs` | `pi_durable/approval/permissions.py`：`PermissionsDoc`、`PermissionRulesDoc`、`RulesPolicy`、`PermissionDefaults`、`apply_permissions_change()`、`copy_owner_permissions()` |
+| `approval/rules/{mod,bash,path}.rs` | `pi_durable/approval/{rules,commands,paths}.py` |
+| `approval/mod.rs`（`ApprovalError`） | `pi_durable/approval/errors.py`：`ApprovalNotPending`、`UnknownApproval`、`InvalidDecision`；无效规则是 `RuleError`（`ValueError`） |
+| `tool/approval.rs`、`tool/pipeline.rs`（策略、intent） | `pi_durable/harness/tool.py`：`_policy`、`_request_approval`、`_wait`、`_consume`、`_abort_run`、`_commit_intent` |
+| `harness/approvals.rs`、`harness/permissions.rs` | `pi_durable/harness/approvals.py`（`HarnessApprovals` 和表面函数）以及 `Harness`/`ConversationImpl` 的方法 |
+| `observe/{view,translate}.rs` | `view.py` 挂载 `pi.approvals` 和 `pi.permissions`；`events.py` 在快照中加入 `approvals`/`permissions`，并新增 `approval_update`/`permissions_changed` |
+
+持久化 JSON 遵循本移植的规则（camelCase 键、`pi.*` 种类），而不是 delta 的 snake_case：
+
+- `pi.approvals`（会话作用域，`latest`，`fork="initial"`，没有待审批请求时写完整基线）：`{"requests": [{id, callId, name, arguments, approvalKey?, prompt?, proposedRule?, requestedAt, deadline, decision?}], "grants": [{tool, key, grantedBy}]}`。请求的 id 就是其工具任务的 id。
+- 决定：`{"type": "approved" | "approvedForSession" | "denied"（+ "rejection"?）| "timedOut" | "abort" | "approvedWithRule"（+ "rule"）}`。
+- 仅展示的条目 `pi.approval`，数据为 `{approvalId, callId, name, decision}`，以请求 id `approval:<id>` 作为写入提交一次，因此从不进入模型上下文。
+- `pi.permissions`（会话作用域，`rewindable`，`fork="asOf"`，初始 `{}`，每次变更写完整基线）：`{mode?, rules?: {allow?, ask?, deny?}, directories?}`。模式使用 Claude Code 的名字：`default`、`acceptEdits`、`plan`、`dontAsk`、`bypassPermissions`。
+- `pi.permission-rules`（session 作用域，初始 `{}`）：`{allow?}`，即 `approvedWithRule` 加入的规则。
+- 工具任务仍是 `pi.tool` 版本 2，新增一个阶段 `{"phase": "approval", arguments, replay, deadline}`。旧版 pi-py 无法运行处于该阶段的任务。
+- `RulesPolicy` 把决定以 `pi.permissions.decision` 记在任务的 memo 中。
+
+流程（与 delta 相同）：在 `before_tool` 和第二次校验之后，策略基于最终参数、调用的 `permission_subject`（用环境转换为绝对路径）和 `cwd` 做决定。拒绝时以 `blocked` 结束（`Tool call blocked: approval denied: <reason>`）；策略抛出异常时以其文本拒绝，并上报（`host_error`，callback 为 `approval`）。要求审批但被会话授权覆盖的调用直接运行；否则一次提交加入请求并把任务移到 `approval` 阶段。该阶段先注册等待者，再读取已提交的请求（这样中间提交的决定无论哪种顺序都能看到），然后在 Harness 的定时器上等待通知或截止时间，到期时除非已有决定，否则提交 `timedOut`。`decide()` 在一次提交里写入决定、条目、授权或规则，然后通知。批准时在 intent 提交中移除请求，并以请求中的参数运行调用；拒绝或超时以 `blocked` 结束，并在 settle 提交中撤回请求；abort 处理器撤回待审批请求，不写条目。恢复时重新运行 `approval` 阶段，读取已存储的决定，或等待到已存储的截止时间。
+
+与 delta 的差异：
+
+- **中止决定。** delta 等待调度器中止会话的 run，再等待级联取消该调用。这里的阶段把 run 和调用自身都标记为中止，不等待它们结束，然后等待自己被取消；abort 处理器以 `aborted` 结束。不属于该 run 的调用同样会被中止。
+- **被拥有的会话**只在 Harness 配置了策略时复制拥有者会话的 `pi.permissions`：本移植的 `Tx` 没有不创建缺失文档的读取方法，而没有策略的 Harness 从不读取它。
+- **AllowAll**（默认）走快速路径：不为策略构建环境或主体。
+- **`permission_subject(args, env, context)`** 可以是异步的，因为 `ExecutionEnv.absolute_path()` 是异步的。`approval_key(args)` 默认是键排序后的紧凑 JSON（delta 的 `canonical_json`）。
+- **Hooks。** `before_tool` 结果中的 `permission`（`"allow"` 或 `"ask"`，`reason` 作为提示）对应 delta 的 `HookPermission`；delta 的 hook `context`（来自 Claude Code hooks）没有移植。
+- `powershell` 也有命令主体，因此 `Bash(...)` 规则、`plan` 和 `dontAsk` 同样作用于它。

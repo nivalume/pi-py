@@ -28,6 +28,7 @@ Python port of [`@earendil-works/pi-durable`](https://github.com/earendil-works/
 - [Compaction](#compaction)
 - [Agent Events (Experimental)](#agent-events-experimental)
 - [Hooks](#hooks)
+- [Approvals and Permissions](#approvals-and-permissions)
 - [More Conversations and Forks](#more-conversations-and-forks)
 - [Abort and Subagents](#abort-and-subagents)
 - [Child Tasks](#child-tasks)
@@ -580,6 +581,7 @@ def settings():
         "contextRetentionMs": 600_000,  # idle conversations keep their context in memory this long
         "documentRetentionMs": 600_000,  # loaded documents nothing observes stay in memory this long after their last use
         "followUpMode": user_settings["followUpMode"],
+        "approvalTimeoutMs": 900_000,  # how long an approval request waits for a decision
     }
 
 
@@ -777,7 +779,7 @@ For consumers that want coding-agent style events (`message_start`, `message_upd
 from pi_durable import watch_events
 
 stream = await watch_events(harness, root.id, context)
-print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, ...
+print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, approvals, ...
 
 
 def on_events(events, context):
@@ -816,10 +818,58 @@ registry.install(Guard)
 ```
 
 - **Generation:** `before_request(request, api, context)` (replace the messages of one request), `after_response(message, api, context)`, `on_yield(answer, api, context)` (continue the run with another user message), and `after_tools(assistant_entry_id, result_entry_ids, api, context)` (runs once a round's tools are done).
-- **Tools:** `before_tool(call, api, context)` (block, or rewrite `arguments`) and `after_tool(call, result, api, context)` (replace the result).
+- **Tools:** `before_tool(call, api, context)` (block, rewrite `arguments`, or ask for approval; see [Approvals and Permissions](#approvals-and-permissions)) and `after_tool(call, result, api, context)` (replace the result).
 - **Compaction:** `before_compact(compaction, api, context)` (decline, or supply a summary).
 
 To limit a hook to some conversations, select its extension only there, for example with `configure({"extensions": {"add": [Guard]}})`.
+
+## Approvals and Permissions
+
+An approval policy decides, per tool call, whether it runs, is denied, or waits for a person. It is an addition to upstream, ported from delta (the Rust implementation of pi), which made Codex's approval flow durable. Pass it as `approval`; without one every call runs, as upstream:
+
+```python
+from pi_durable import PermissionDefaults, RulesPolicy
+
+policy = RulesPolicy(
+    PermissionDefaults(
+        mode="default",
+        rules={"allow": ["Bash(git status:*)", "Bash(cargo test:*)"], "deny": ["Read(./.env)", "Bash(rm *)"]},
+    )
+)
+harness = await Harness.open(storage, {"models": models, "registry": registry, "env": env, "approval": policy}, context)
+```
+
+When the policy asks, the tool call commits a request into the conversation's `pi.approvals` document, with a deadline, and waits in its `approval` phase. A UI lists the requests and decides:
+
+```python
+for request in await root.pending_approvals(context):
+    print(request["name"], request["arguments"], request.get("prompt"), request.get("proposedRule"))
+    await root.decide(request["id"], {"type": "approved"}, context)
+```
+
+| Decision | Effect |
+|---|---|
+| `{"type": "approved"}` | The call runs with the requested arguments. |
+| `{"type": "approvedForSession"}` | Also later calls of the tool with the same approval key (by default the arguments as JSON) run without asking, in this conversation. |
+| `{"type": "approvedWithRule", "rule": "Bash(git push:*)"}` | Also the rule joins the session's allow rules (`harness.permission_rules()`), for every conversation. |
+| `{"type": "denied", "rejection": "..."}` | The call ends `Tool call blocked: approval denied: ...`. |
+| `{"type": "abort"}` | Aborts the conversation's run. |
+
+A request nobody decides times out after `settings["approvalTimeoutMs"]` (15 minutes) or the policy's `timeoutMs`, and the call ends `Tool call blocked: approval timed out after <n>s`. `harness.decide(id, decision, context)` decides in whichever conversation the call runs, and `harness.pending_approvals(context)` lists every conversation's requests. The decision and its `pi.approval` entry (display-only, never model context) commit before the waiting call hears of it, so a restart at any point leaves one outcome: a call waiting when the process stopped waits again, until the stored deadline, and consumes a decision made while it was down. `decide()` raises `ApprovalNotPending`, `UnknownApproval`, `InvalidDecision` (`timedOut` is the Harness's own), or `RuleError`.
+
+**Rules** use Claude Code's grammar. `Bash(<command>)` matches commands: `*` is any text, and a trailing ` *` or `:*` also matches the bare command (`Bash(npm run test:*)`). A command is split at `&&`, `||`, `;`, `|`, `&` and newlines outside quotes, without leading `NAME=value` assignments and wrappers such as `timeout` or `nohup`; a deny or ask rule applies when any part matches, an allow rule only when every part is allowed. `Read(<path>)` matches what a call reads, `Edit(<path>)` and `Write(<path>)` what it writes: `//abs/path`, `~/path`, `/path` (relative to `PermissionDefaults.root`), `./path` or `path` (relative to the call's directory), with `*`, `**` and `?`; a path matches its pattern or anything below it, and a `Read` deny also covers writes. Any other name, without parentheses, names a tool (`deploy`).
+
+**Modes** set what runs without a rule: `default` (reads inside the working directory and `directories` run, the rest asks), `acceptEdits` (writes there too), `plan` (commands and writes are denied), `dontAsk` (what would ask is denied), `bypassPermissions` (everything runs). Deny rules, then ask rules, come first in every mode. Each conversation has its own mode, rules, and directories in `pi.permissions`, which forks copy and owned conversations inherit:
+
+```python
+await root.set_permission_mode("plan", context)
+await root.update_permissions({"add": {"allow": ["Bash(make *)"]}, "directories": ["/data"]}, context)
+print(await root.permissions(context))  # {"mode": "plan", "directories": ["/data"], "rules": {"allow": ["Bash(make *)"]}}
+```
+
+What a call is matched on is its tool's `permission_subject(args, env, context)`: the command of `bash` and `powershell`, the absolute path of `read`, `write` and `edit`. Give your own tools one with `define_tool(..., permission_subject=...)` (`pi_durable.tools.path_subject("write")` for a `path` argument), and `approval_key=` to change what session grants match. A `before_tool` hook can return `{"permission": "ask", "reason": "..."}` to ask whatever the policy says, or `{"permission": "allow"}` to skip what the mode would ask (deny and ask rules still apply).
+
+Your own policy is any object with `decide(call, api, context)` returning `{"type": "allow"}`, `{"type": "deny", "reason": ...}` or `{"type": "ask", "timeoutMs"?, "prompt"?, "proposedRule"?}`; `AllowAll`, `AskAll` and `DenyAll(reason)` are built in. A policy that raises denies the call. Agent events carry the pending requests (`approval_update`) and `pi.permissions` (`permissions_changed`), and their snapshot has `approvals` and `permissions`.
 
 ## More Conversations and Forks
 
@@ -1111,6 +1161,7 @@ Task code gets the running phase's span as `runtime.telemetry_context`, and a to
 - **Binary data** is `bytes`; IDs are plain `int`s (`TaskId`, `EntryId`, ... are type-checker brands).
 - **Tools and images**: `createCodingTools({ images })` is `create_coding_tools(images=...)`, `createBashTool({ commandPrefix, prepare })` is `create_bash_tool(command_prefix=..., prepare=...)` (`prepare` changes the `BashExecution` dict's `command`, `cwd`, `env`, and `inheritEnv`), and `createNodePhotonImages()` is `create_pillow_images()`, on Pillow instead of Photon, in a worker thread without an idle timeout. `read` keeps JavaScript's number semantics for `offset` and `limit`, so fractional, negative, and huge values select and print the same lines.
 - **Code mode** runs JavaScript in QuickJS as upstream's does, on wasmtime instead of a worker thread; `createCodemodeExtension({ sandbox })` is `create_codemode_extension(sandbox=...)`. Python scripts in Monty are an addition: with a `MontyCodemodeSandbox` the script globals are snake_case (`search_tools()`, `models.generate_images()`), and a run journaled in one language does not resume in the other (see [Code Mode](#code-mode)).
+- **Approvals and permissions** are an addition from delta: `HarnessOptions.approval`, `Conversation.decide()`, the `pi.approvals`, `pi.permissions` and `pi.permission-rules` documents, and the tool task's `approval` phase (see [Approvals and Permissions](#approvals-and-permissions)). Without a policy, tool calls behave as upstream's.
 - **Not ported yet**: the Cloudflare adapters (see [What This Port Includes](#what-this-port-includes)).
 
 ## Design Notes

@@ -29,6 +29,7 @@ from .types import (
 )
 
 __all__ = [
+    "DEFAULT_APPROVAL_TIMEOUT_MS",
     "DEFAULT_COMPACTION_POLICY",
     "DEFAULT_PROGRESS_POLICY",
     "DEFAULT_RESTART_LIMIT",
@@ -83,6 +84,9 @@ _DEFAULT_CONTEXT_RETENTION_MS: Final = 600_000
 #: Default ``settings.restartLimit``.
 DEFAULT_RESTART_LIMIT: Final = 5
 
+#: Default ``settings.approvalTimeoutMs``: fifteen minutes.
+DEFAULT_APPROVAL_TIMEOUT_MS: Final = 15 * 60 * 1000
+
 
 def _is_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
@@ -124,6 +128,7 @@ def resolve_settings(settings: HarnessSettings | None) -> Settings:
             "documentRetentionMs": document_retention(_given(settings, "documentRetentionMs")),
             "afterFailedRun": _given(settings, "afterFailedRun") or "keep",
             "restartLimit": _restart_limit(_given(settings, "restartLimit")),
+            "approvalTimeoutMs": _first(_given(settings, "approvalTimeoutMs"), DEFAULT_APPROVAL_TIMEOUT_MS),
         }
     )
     return resolved  # type: ignore[return-value]

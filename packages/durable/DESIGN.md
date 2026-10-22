@@ -543,3 +543,63 @@ Rules:
 - Tests: `tests/test_codemode.py` and `test_codemode_models.py` run Python scripts (they need Monty and skip without
   it), `tests/test_codemode_javascript.py` and its siblings JavaScript scripts on QuickJS; the description/section tests
   cover both languages; every restart case runs on MemoryStorage and SQLite.
+
+## 13. Approvals and permissions (addition from delta)
+
+Upstream has no approvals. This section ports delta's (`crates/harness/src/approval/`, `docs/design/approval.md` and
+`permissions.md`), which made Codex's approval flow durable and added Claude Code's permission rules and modes.
+
+| delta | Python |
+|---|---|
+| `approval/policy.rs` | `pi_durable/approval/policy.py`: `ApprovalPolicy` (a `Protocol` with `decide(call, api, context)`, sync or async), `ApprovalCall` (frozen dataclass), `PolicyDecision` (`TypedDict`s), `AllowAll`, `AskAll`, `DenyAll` |
+| `approval/document.rs` | `pi_durable/approval/document.py`: `ApprovalsDoc`, `ReviewDecision`, `ApprovalRequest`, `ApprovalGrant`, `record_decision()`, `remove_request()` |
+| `approval/pending.rs` | `pi_durable/approval/pending.py`: `PendingApprovals`, `ApprovalWaiter` (asyncio futures) |
+| `approval/permissions.rs` | `pi_durable/approval/permissions.py`: `PermissionsDoc`, `PermissionRulesDoc`, `RulesPolicy`, `PermissionDefaults`, `apply_permissions_change()`, `copy_owner_permissions()` |
+| `approval/rules/{mod,bash,path}.rs` | `pi_durable/approval/{rules,commands,paths}.py` |
+| `approval/mod.rs` (`ApprovalError`) | `pi_durable/approval/errors.py`: `ApprovalNotPending`, `UnknownApproval`, `InvalidDecision`; an invalid rule is `RuleError` (`ValueError`) |
+| `tool/approval.rs`, `tool/pipeline.rs` (policy, intent) | `pi_durable/harness/tool.py`: `_policy`, `_request_approval`, `_wait`, `_consume`, `_abort_run`, `_commit_intent` |
+| `harness/approvals.rs`, `harness/permissions.rs` | `pi_durable/harness/approvals.py` (`HarnessApprovals` and the surface functions) and the `Harness`/`ConversationImpl` methods |
+| `observe/{view,translate}.rs` | `view.py` mounts `pi.approvals` and `pi.permissions`; `events.py` adds `approvals`/`permissions` to the snapshot and `approval_update`/`permissions_changed` |
+
+Persisted JSON follows this port's rule (camelCase keys, `pi.*` kinds), not delta's snake_case:
+
+- `pi.approvals` (conversation, `latest`, `fork="initial"`, a complete base whenever no request is pending):
+  `{"requests": [{id, callId, name, arguments, approvalKey?, prompt?, proposedRule?, requestedAt, deadline,
+  decision?}], "grants": [{tool, key, grantedBy}]}`. A request's id is its tool task's id.
+- Decisions: `{"type": "approved" | "approvedForSession" | "denied" (+ "rejection"?) | "timedOut" | "abort" |
+  "approvedWithRule" (+ "rule")}`.
+- The display-only entry `pi.approval` with `{approvalId, callId, name, decision}`, admitted once as a write under
+  request id `approval:<id>`, so it never enters model context.
+- `pi.permissions` (conversation, `rewindable`, `fork="asOf"`, `{}` initially, a complete base on every change):
+  `{mode?, rules?: {allow?, ask?, deny?}, directories?}`. Modes are Claude Code's names: `default`, `acceptEdits`,
+  `plan`, `dontAsk`, `bypassPermissions`.
+- `pi.permission-rules` (session, `{}` initially): `{allow?}`, the rules `approvedWithRule` added.
+- The tool task stays `pi.tool` version 2 with a new phase, `{"phase": "approval", arguments, replay, deadline}`. An
+  older pi-py cannot run a task in that phase.
+- `RulesPolicy` memoizes its decision in the task as `pi.permissions.decision`.
+
+The flow (delta's): after `before_tool` and the second validation, the policy decides on the final arguments with the
+call's `permission_subject` (made absolute with the environment) and `cwd`. A deny settles `blocked` (`Tool call
+blocked: approval denied: <reason>`); a policy that raises denies with its text and is reported (`host_error`, callback
+`approval`). An ask that a session grant covers runs; otherwise one commit adds the request and moves the task to
+`approval`. The phase registers its waiter, then reads the committed request (so a decision committed in between is
+seen either way), waits for the notification or the deadline on the Harness's timer, and on the deadline commits
+`timedOut` unless a decision landed first. `decide()` commits the decision, its entry, a grant or a rule in one commit,
+then notifies. An approval removes the request in the intent commit and runs the call with the requested arguments; a
+denial or timeout settles `blocked` and withdraws the request in the settle commit; the abort handler withdraws a pending
+request without an entry. Recovery reruns the `approval` phase, which consumes a stored decision or waits again until
+the stored deadline.
+
+Differences from delta:
+
+- **Abort decision.** delta awaits the scheduler's abort of the conversation's run, then waits for the cascade to
+  cancel the call. Here the phase marks the run and the call itself for abort, without joining either, and waits for
+  its own cancellation; the abort handler settles `aborted`. A call that the run does not own is aborted as well.
+- **Owned conversations** copy the owner conversation's `pi.permissions` only when the Harness has a policy: this
+  port's `Tx` has no read that leaves an absent document absent, and a Harness without a policy never reads it.
+- **AllowAll** (the default) is a fast path: no environment or subject is built for the policy.
+- **`permission_subject(args, env, context)`** may be async, because `ExecutionEnv.absolute_path()` is.
+  `approval_key(args)` defaults to the arguments as compact JSON with sorted keys (delta's `canonical_json`).
+- **Hooks.** A `before_tool` result's `permission` (`"allow"` or `"ask"`, with `reason` as the prompt) is delta's
+  `HookPermission`; delta's hook `context` (from Claude Code hooks) is not ported.
+- `powershell` has the command subject too, so `Bash(...)` rules, `plan` and `dontAsk` apply to it.

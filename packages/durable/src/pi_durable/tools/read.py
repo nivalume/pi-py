@@ -36,7 +36,7 @@ from .image_processor import (
     base64_length,
     to_base64,
 )
-from .path_utils import resolve_read_tool_path
+from .path_utils import path_subject, resolve_read_tool_path
 
 if TYPE_CHECKING:
     from pi_chord.context import Context
@@ -173,6 +173,7 @@ def create_read_tool(*, images: ImageProcessor | None = None) -> ToolRegistratio
         ),
         parameters=_READ_SCHEMA,
         execute=execute,
+        permission_subject=path_subject("read"),
     )
 
 

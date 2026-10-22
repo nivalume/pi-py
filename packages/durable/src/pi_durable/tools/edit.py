@@ -21,7 +21,7 @@ from .edit_diff import (
 )
 from .env import require_env
 from .file_mutation_queue import with_file_mutation_queue
-from .path_utils import resolve_tool_path
+from .path_utils import path_subject, resolve_tool_path
 
 if TYPE_CHECKING:
     from pi_chord.context import Context
@@ -195,4 +195,5 @@ def create_edit_tool() -> ToolRegistration:
         parameters=_EDIT_SCHEMA,
         prepare_arguments=_prepare_edit_arguments,
         execute=execute,
+        permission_subject=path_subject("write"),
     )

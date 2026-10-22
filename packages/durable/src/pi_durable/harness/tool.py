@@ -13,7 +13,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypeAlias, TypedDict, TypeVar, cast
 
 from pi_ai.serialization import content_from_dict, to_json_value
 from pi_ai.types import ImageContent, TextContent, ToolCall, ToolResultMessage
@@ -35,6 +35,20 @@ from pi_chord.output import (
 from pi_telemetry import NOOP_TELEMETRY_CONTEXT, SchemaTelemetrySpan, bind_typed_span_starter, is_telemetry_enabled
 from pi_telemetry import record_content as record_telemetry_content
 
+from ..approval import (
+    ApprovalCall,
+    ApprovalRequest,
+    ApprovalsDoc,
+    HookPermission,
+    PermissionSubject,
+    PolicyAsk,
+    PolicyDecision,
+    ReviewDecision,
+    find_request,
+    granted,
+    record_decision,
+    remove_request,
+)
 from ..documents import define_doc_family
 from ..entries import AssistantEntry, ToolResultEntry
 from ..errors import error_message
@@ -64,13 +78,18 @@ __all__ = [
     "NestedCallState",
     "ToolTask",
     "ToolTaskCheckpoint",
+    "ToolTaskCheckpointApproval",
     "ToolTaskInput",
     "ToolTaskInputModel",
     "ToolTaskInputNested",
     "ToolTaskResult",
     "append_tool_result",
+    "approval_key",
     "harness_error",
 ]
+
+if TYPE_CHECKING:
+    from .approvals import HarnessApprovals
 
 T = TypeVar("T")
 
@@ -111,7 +130,17 @@ class ToolTaskCheckpointExecute(TypedDict):
     replay: Literal["safe", "unsafe"]
 
 
-ToolTaskCheckpoint: TypeAlias = ToolTaskCheckpointCall | ToolTaskCheckpointExecute
+class ToolTaskCheckpointApproval(TypedDict):
+    """Waiting for the decision on the call's approval request (``pi.approvals``): the final arguments the call runs
+    with when approved, its replay policy, and the request's deadline (Harness clock, epoch milliseconds)."""
+
+    phase: Literal["approval"]
+    arguments: dict[str, Any]
+    replay: Literal["safe", "unsafe"]
+    deadline: float
+
+
+ToolTaskCheckpoint: TypeAlias = ToolTaskCheckpointCall | ToolTaskCheckpointApproval | ToolTaskCheckpointExecute
 
 
 class ToolTaskResultModel(TypedDict):
@@ -187,7 +216,7 @@ async def _call_body(
         return await _settle(
             runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context, telemetry=telemetry
         )
-    state: dict[str, Any] = {"args": checked["json"], "block": None}
+    state: dict[str, Any] = {"args": checked["json"], "block": None, "permission": None, "reason": None}
 
     async def before_tool(hook: Any) -> None:
         if state["block"] is not None:
@@ -197,8 +226,16 @@ async def _call_body(
             decision = await result if inspect.isawaitable(result) else result
             if decision is not None and decision.get("block") is not None:
                 state["block"] = decision["block"]
-            elif decision is not None and decision.get("arguments") is not None:
+                return
+            if decision is not None and decision.get("arguments") is not None:
                 state["args"] = decision["arguments"]
+            # The most restrictive word on approval wins: ``ask`` over ``allow``, with the first ``ask``'s reason.
+            permission = None if decision is None else decision.get("permission")
+            if permission == "ask" and state["permission"] != "ask":
+                state["permission"] = "ask"
+                state["reason"] = decision.get("reason")  # type: ignore[union-attr]
+            elif permission == "allow" and state["permission"] is None:
+                state["permission"] = "allow"
         except Exception as error:
             if runtime.signal.aborted:
                 raise
@@ -218,8 +255,28 @@ async def _call_body(
         )
     # Strict JSON: repair may set optional properties to UNDEFINED, which the slot and checkpoint cannot hold.
     final: dict[str, Any] = copy_json(validated["json"], omit_undefined_properties=True)  # type: ignore[assignment]
+    final_call = dataclasses.replace(call, arguments=final)
+    verdict = await _policy(runtime, tool, final_call, state["permission"], state["reason"], context)
+    if verdict["type"] == "deny":
+        blocked = harness_error("blocked", f"Tool call blocked: approval denied: {verdict['reason']}")
+        telemetry.blocked()
+        return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: blocked, context, telemetry=telemetry)
+    if verdict["type"] == "ask" and not await _granted(runtime, tool, final, context):
+        deadline = await _request_approval(runtime, final_call, tool, verdict, context)
+        return await _wait(runtime, task_input, call, final, tool.replay or "unsafe", deadline, telemetry, context)
+    await _commit_intent(runtime, task_input, final, tool.replay or "unsafe", False, context)
+    await _run(runtime, task_input, call, tool, final, validated["args"], context, telemetry)
+
+
+async def _commit_intent(
+    runtime: Any, task_input: Any, final: dict[str, Any], replay: str, approved: bool, context: Context
+) -> None:
+    """The intent commit: the final arguments and the replay policy become the checkpoint, and the slot shows the call
+    running (a nested slot with the final arguments); an approved request is removed."""
 
     async def intent(tx: Tx, _current: Any) -> Any:
+        if approved:
+            await remove_request(tx, runtime.conversation_id, runtime.task_id)
         slot = tool_slot(await tx.doc(LiveDoc, runtime.conversation_id), runtime.task_id)
         if slot is not None:
             slot["status"] = "running"
@@ -228,11 +285,288 @@ async def _call_body(
         changed = task_input["kind"] == "nested" and not json_equal(task_input["call"]["arguments"], final)
         if changed and slot is not None and "parentTaskId" in slot:
             slot["arguments"] = final
-        checkpoint = {"phase": "execute", "arguments": final, "replay": tool.replay or "unsafe"}
+        checkpoint = {"phase": "execute", "arguments": final, "replay": replay}
         return {"status": "running", "checkpoint": checkpoint}
 
     await runtime.commit(intent, context)
-    await _run(runtime, task_input, call, tool, final, validated["args"], context, telemetry)
+
+
+# ─── approval ───────────────────────────────────────────────────────────────
+
+
+async def _policy(
+    runtime: Any,
+    tool: ToolRegistration,
+    call: ToolHookCall,
+    hook: HookPermission | None,
+    reason: str | None,
+    context: Context,
+) -> PolicyDecision:
+    """The approval policy on the final arguments. A policy failure denies (fail closed); a hook's ``ask`` makes an
+    allowed call ask."""
+    approvals: HarnessApprovals = runtime.approvals
+    policy = approvals.policy
+    if policy is None and hook != "ask":
+        return {"type": "allow"}
+    decision: PolicyDecision = {"type": "allow"}
+    if policy is not None:
+        try:
+            # The environment makes the subject's paths absolute; without one the policy decides on what the call names.
+            env = await _policy_env(runtime, context)
+            agent_cwd = (await runtime.agent(context)).get("cwd")
+            subject = await _subject(tool, call.arguments, env, context)
+            cwd = env.cwd if env is not None else agent_cwd
+            request = ApprovalCall(runtime.conversation_id, runtime.task_id, call, tool, subject, cwd, hook)
+            decided = policy.decide(request, runtime, context)
+            decision = await decided if inspect.isawaitable(decided) else decided
+            _check_decision(decision)
+        except Exception as error:
+            if runtime.signal.aborted:
+                raise
+            runtime.report(error, {"type": "host", "callback": "approval"})
+            return {"type": "deny", "reason": error_message(error)}
+    if hook != "ask" or decision["type"] == "deny":
+        return decision
+    if decision["type"] == "allow":
+        return {"type": "ask", "prompt": reason} if reason else {"type": "ask"}
+    if reason and "prompt" not in decision:
+        return {**decision, "prompt": reason}
+    return decision
+
+
+async def _policy_env(runtime: Any, context: Context) -> Any:
+    try:
+        return await runtime.env(context)
+    except Exception as error:
+        if runtime.signal.aborted:
+            raise
+        runtime.report(error, {"type": "host", "callback": "env"})
+        return None
+
+
+async def _subject(
+    tool: ToolRegistration, args: dict[str, Any], env: Any, context: Context
+) -> PermissionSubject | None:
+    if tool.permission_subject is None:
+        return None
+    subject = tool.permission_subject(args, env, context)
+    return await subject if inspect.isawaitable(subject) else subject
+
+
+def _check_decision(decision: Any) -> None:
+    kind = decision.get("type") if isinstance(decision, Mapping) else None
+    if kind not in ("allow", "deny", "ask"):
+        raise TypeError(f"An approval policy returned {decision!r}, not an allow, deny or ask decision")
+    if kind == "deny" and not isinstance(decision.get("reason"), str):
+        raise TypeError("A deny decision needs a reason")
+
+
+def approval_key(tool: ToolRegistration, args: dict[str, Any]) -> str | None:
+    """The key a session grant of ``tool`` matches for ``args``: ``tool.approval_key``, else the arguments as JSON with
+    sorted keys."""
+    if tool.approval_key is not None:
+        return tool.approval_key(args)
+    return json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+async def _granted(runtime: Any, tool: ToolRegistration, args: dict[str, Any], context: Context) -> bool:
+    """Whether a session grant (``approvedForSession``) lets the call run without asking."""
+    key = approval_key(tool, args)
+    if key is None:
+        return False
+    return granted(await runtime.snapshot(ApprovalsDoc, runtime.conversation_id, context), tool.name, key)
+
+
+async def _request_approval(
+    runtime: Any, call: ToolHookCall, tool: ToolRegistration, ask: PolicyAsk, context: Context
+) -> float:
+    """Commit the request, with its deadline, and move to the ``approval`` phase; returns the deadline."""
+    timeout = ask.get("timeoutMs")
+    if timeout is None:
+        timeout = runtime.settings["approvalTimeoutMs"]
+    now = runtime.now()
+    # The deadline is stored as JSON: an infinite timeout waits as long as a finite one can.
+    deadline = now + min(max(0, timeout), _MAX_APPROVAL_TIMEOUT_MS)
+    request: dict[str, Any] = {"id": runtime.task_id, "callId": call.id, "name": call.name, "arguments": call.arguments}
+    key = approval_key(tool, call.arguments)
+    if key is not None:
+        request["approvalKey"] = key
+    for name in ("prompt", "proposedRule"):
+        text = ask.get(name)
+        if text:
+            request[name] = text
+    request["requestedAt"] = now
+    request["deadline"] = deadline
+    checkpoint = {
+        "phase": "approval",
+        "arguments": call.arguments,
+        "replay": tool.replay or "unsafe",
+        "deadline": deadline,
+    }
+
+    async def change(tx: Tx, _current: Any) -> Any:
+        requests = (await tx.doc(ApprovalsDoc, runtime.conversation_id))["requests"]
+        at = len(requests)
+        for index, pending in enumerate(requests):
+            if pending["id"] == runtime.task_id:
+                del requests[index]
+                at = index
+                break
+            if pending["id"] > runtime.task_id:
+                at = index
+                break
+        requests.insert(at, cast(Any, copy_json(request)))
+        return {"status": "running", "checkpoint": checkpoint}
+
+    await runtime.commit(change, context)
+    return deadline
+
+
+async def _approval(task: Any, runtime: Any, context: Context) -> None:
+    """Recovery in the ``approval`` phase: wait for the decision again; a committed one is consumed at once."""
+    task_input = task["input"]
+    call = await _read_call(runtime, task_input, context)
+    checkpoint = task["state"]["checkpoint"]
+    await _traced_tool(
+        runtime,
+        task,
+        "approval",
+        call,
+        None,
+        context,
+        lambda telemetry: _wait(
+            runtime,
+            task_input,
+            call,
+            checkpoint["arguments"],
+            checkpoint["replay"],
+            checkpoint["deadline"],
+            telemetry,
+            context,
+        ),
+    )
+
+
+async def _wait(
+    runtime: Any,
+    task_input: Any,
+    call: ToolHookCall,
+    arguments: dict[str, Any],
+    replay: str,
+    deadline: float,
+    telemetry: _ToolTelemetry,
+    context: Context,
+) -> None:
+    """The ``approval`` phase: register a waiter, then read the committed request (registering first closes the race
+    with a decision committed in between); without a decision wait for the notification until ``deadline``, then
+    commit ``timedOut`` unless a decision landed first."""
+    approvals: HarnessApprovals = runtime.approvals
+    with approvals.pending.register(runtime.task_id) as waiter:
+        state = await runtime.snapshot(ApprovalsDoc, runtime.conversation_id, context)
+        request = find_request(state, runtime.task_id)
+        if request is None:
+            raise RuntimeError(f"Approval request {runtime.task_id} is missing")
+        decision = request.get("decision")
+        if decision is None:
+            decision = await _notified(runtime, waiter.decision(), deadline, context)
+        if decision is None:
+            decision = await _time_out(runtime, context)
+    await _consume(runtime, task_input, call, request, decision, arguments, replay, telemetry, context)
+
+
+async def _notified(
+    runtime: Any, notified: asyncio.Future[ReviewDecision | None], deadline: float, context: Context
+) -> ReviewDecision | None:
+    """The notified decision, or ``None`` once ``deadline`` passes on the Harness's timer."""
+    expired: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def expire() -> None:
+        if not expired.done():
+            expired.set_result(None)
+
+    disarm = runtime.set_timer(expire, max(0, deadline - runtime.now()))
+    try:
+        first = asyncio.ensure_future(asyncio.wait({notified, expired}, return_when=asyncio.FIRST_COMPLETED))
+        await await_with_context(first, context)
+    finally:
+        disarm()
+        if not expired.done():
+            expired.cancel()
+    if notified.done() and not notified.cancelled():
+        return notified.result()
+    return None
+
+
+async def _time_out(runtime: Any, context: Context) -> ReviewDecision:
+    """Commit ``timedOut`` unless a decision landed first; returns the request's decision."""
+    found: list[Any] = []
+
+    async def change(tx: Tx, _current: Any) -> None:
+        timed_out: ReviewDecision = {"type": "timedOut"}
+        found[:] = await record_decision(
+            tx, runtime.conversation_id, runtime.task_id, timed_out, runtime.now(), runtime.settings
+        )
+
+    await runtime.commit(change, context)
+    recorded, decision = found
+    if recorded == "missing" or decision is None:
+        raise RuntimeError(f"Approval request {runtime.task_id} is missing")
+    return decision
+
+
+async def _consume(
+    runtime: Any,
+    task_input: Any,
+    call: ToolHookCall,
+    request: ApprovalRequest,
+    decision: ReviewDecision,
+    arguments: dict[str, Any],
+    replay: str,
+    telemetry: _ToolTelemetry,
+    context: Context,
+) -> None:
+    """Act on the decision: an approval runs the call with the requested arguments, a denial or timeout settles
+    ``blocked``, an abort aborts the conversation's run."""
+
+    async def blocked(reason: str) -> None:
+        result = harness_error("blocked", f"Tool call blocked: {reason}")
+        telemetry.blocked()
+        await _settle(
+            runtime, task_input, call, _COMPLETED, lambda _slot: result, context, telemetry=telemetry, withdraw=True
+        )
+
+    kind = decision["type"]
+    if kind in ("approved", "approvedForSession", "approvedWithRule"):
+        tool = await _resolve_tool(runtime, task_input, call.name, context)
+        if tool is None:
+            error = harness_error("tool_unavailable", f"Tool {call.name} is not available")
+            return await _settle(
+                runtime, task_input, call, _COMPLETED, lambda _slot: error, context, telemetry=telemetry, withdraw=True
+            )
+        await _commit_intent(runtime, task_input, arguments, replay, True, context)
+        return await _run(
+            runtime, task_input, call, tool, arguments, _execution_args(tool, arguments), context, telemetry
+        )
+    if kind == "denied":
+        rejection = decision.get("rejection")
+        return await blocked(f"approval denied: {rejection}" if rejection else "approval denied")
+    if kind == "timedOut":
+        seconds = int((request["deadline"] - request["requestedAt"]) // 1000)
+        return await blocked(f"approval timed out after {seconds}s")
+    await _abort_run(runtime, task_input, call, telemetry, context)
+
+
+async def _abort_run(
+    runtime: Any, task_input: Any, call: ToolHookCall, telemetry: _ToolTelemetry, context: Context
+) -> None:
+    """An ``abort`` decision: mark the conversation's run and this call for abort, then wait for the call's
+    cancellation; the abort handler settles and withdraws the request."""
+    live = await runtime.snapshot(LiveDoc, runtime.conversation_id, context)
+    run = None if live is None else live.get("run")
+    ids = [] if run is None else [run["taskId"]]
+    approvals: HarnessApprovals = runtime.approvals
+    approvals.abort_tasks([*ids, runtime.task_id])
+    await await_with_context(asyncio.get_running_loop().create_future(), context)
 
 
 async def _execute(task: Any, runtime: Any, context: Context) -> None:
@@ -314,6 +648,8 @@ async def _abort_body(runtime: Any, task: Any, call: ToolHookCall, telemetry: _T
         lambda slot: _from_slot(slot, code, message),
         context,
         telemetry=telemetry,
+        # A pending approval request is withdrawn, without a decision entry.
+        withdraw=task["state"]["checkpoint"]["phase"] == "approval",
     )
 
 
@@ -322,16 +658,17 @@ def _migrate(input: Any, checkpoint: Any, _version: int) -> Any:
     return {"input": {"kind": "model", **input}, "checkpoint": checkpoint}
 
 
-#: Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs ``before_tool``,
-#: records intent, executes, runs ``after_tool``, and settles the result, all in one ``call`` handler. ``execute`` is
-#: reached only by recovery and applies the replay rule. A model-issued call settles by appending its result
-#: entry; a nested call by writing its result to its caller's ``NestedCallDoc``.
+#: Built-in tool task: resolves the called tool among its phase agent's tools, validates, runs ``before_tool``, asks
+#: the approval policy, records intent, executes, runs ``after_tool``, and settles the result, all in one ``call``
+#: handler. A call the policy asks about commits its request and waits in ``approval`` (also its recovery) for the
+#: decision. ``execute`` is reached only by recovery and applies the replay rule. A model-issued call settles by
+#: appending its result entry; a nested call by writing its result to its caller's ``NestedCallDoc``.
 ToolTask: Task[ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks] = define_task(
     name="pi.tool",
     version=2,
     initial=lambda _input: {"phase": "call"},
     migrate=_migrate,
-    phases={"call": _call, "execute": _execute},
+    phases={"call": _call, "approval": _approval, "execute": _execute},
     abort=_abort,
 )
 
@@ -887,8 +1224,9 @@ async def _settle(
     duration_ms: float | None = None,
     *,
     telemetry: _ToolTelemetry | None = None,
+    withdraw: bool = False,
 ) -> None:
-    """Commit the tool's terminal state and mark its slot done.
+    """Commit the tool's terminal state and mark its slot done; ``withdraw`` also removes the call's approval request.
 
     A model-issued call appends its result entry and ends with the entry ID; a nested call writes its result to
     the caller's ``NestedCallDoc``, records its usage, and ends with a small receipt. Nested calls this call left
@@ -911,6 +1249,8 @@ async def _settle(
 
     async def change(tx: Tx, _current: Any) -> Any:
         conversation_id = runtime.conversation_id
+        if withdraw:
+            await remove_request(tx, conversation_id, runtime.task_id)
         live = await tx.doc(LiveDoc, conversation_id)
         slot = tool_slot(live, runtime.task_id)
         result = build(None if slot is None else copy_json(slot))
@@ -1098,6 +1438,8 @@ def _fallback_result(task_id: TaskId[Any], name: str, outcome: Any) -> NestedToo
 
 
 _COMPLETED: Final[dict[str, Any]] = {"status": "completed"}
+#: The longest an approval request waits: about a hundred years.
+_MAX_APPROVAL_TIMEOUT_MS: Final = 100 * 365 * 24 * 3600 * 1000
 
 
 # ─── telemetry ──────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 [project]
 name = "pi-ai-python"
-version = "2.0.0"
+version = "2.1.0"
 description = "Python port of pi's AI libraries: a unified LLM API (pi_ai) and a stateful agent runtime (pi_agent)"
 readme = "README.md"
 requires-python = ">=3.11"

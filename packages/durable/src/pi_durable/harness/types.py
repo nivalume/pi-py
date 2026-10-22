@@ -80,6 +80,16 @@ if TYPE_CHECKING:
     from pi_ai.models import Models
     from pi_telemetry import TelemetryContext
 
+    from ..approval import (
+        ApprovalPolicy,
+        ApprovalRequest,
+        PermissionMode,
+        PermissionRules,
+        PermissionsChange,
+        PermissionsState,
+        PermissionSubject,
+        ReviewDecision,
+    )
     from ..env import ExecutionEnv, ShellOutputSkip, ShellOutputWindow
     from .task_graph import TaskGraph, TaskGraphWatch
     from .usage import UsageState
@@ -445,6 +455,19 @@ class ToolRegistration(Tool):
     #: Not offered to the model until loaded (``modelTools`` names it).
     deferred: Literal[True] | None = None
     output_limits: ToolOutputLimits | None = None
+    #: What permission rules match a call on: ``permission_subject(args, env, context)`` (may be async) returns a command
+    #: the call runs or a path it reads or writes, absolute (``env``, ``None`` without one, resolves relative paths).
+    #: Default none: only rules naming the tool match it.
+    permission_subject: (
+        Callable[
+            [dict[str, Any], ExecutionEnv | None, Context],
+            PermissionSubject | Awaitable[PermissionSubject | None] | None,
+        ]
+        | None
+    ) = None
+    #: The key a session grant (``approvedForSession``) matches: ``approval_key(args)``; ``None`` from it: never
+    #: granted for the session. Default the final arguments as JSON with sorted keys.
+    approval_key: Callable[[dict[str, Any]], str | None] | None = None
 
     def __hash__(self) -> int:  # pyright: ignore[reportIncompatibleVariableOverride]
         return id(self)
@@ -770,6 +793,8 @@ class HarnessSettings(TypedDict, total=False):
     documentRetentionMs: float
     afterFailedRun: AfterFailedRun
     restartLimit: float
+    #: How long an approval request waits for a decision unless the policy says otherwise; default 15 minutes.
+    approvalTimeoutMs: float
 
 
 class Settings(TypedDict):
@@ -787,6 +812,7 @@ class Settings(TypedDict):
     documentRetentionMs: ReadOnly[float]
     afterFailedRun: ReadOnly[AfterFailedRun]
     restartLimit: ReadOnly[float]
+    approvalTimeoutMs: ReadOnly[float]
 
 
 class EnvTarget(TypedDict):
@@ -817,6 +843,9 @@ class HarnessOptions(TypedDict):
     registry: ReadOnly[RegistryReader]
     settings: ReadOnly[NotRequired[HarnessSettings | Callable[[], HarnessSettings | None]]]
     env: ReadOnly[NotRequired[EnvBuilder]]
+    #: Decides, per tool call, whether it runs, is denied or must be approved; default every call runs
+    #: (:class:`pi_durable.approval.AllowAll`). Held in memory only.
+    approval: ReadOnly[NotRequired[ApprovalPolicy]]
     #: Runs in every commit that creates or forks a conversation: ``conversationCreated(tx, conversation)``.
     conversationCreated: ReadOnly[NotRequired[Callable[[Tx, ConversationRecord], Awaitable[None] | None]]]
     #: The Harness clock, epoch milliseconds; default ``time.time() * 1000`` as an ``int``.
@@ -961,6 +990,26 @@ class Conversation(Protocol):
         """The structural view as a serialized exact-frame watch with bounded pending frames."""
         ...
 
+    def decide(self, id: TaskId[Any], decision: ReviewDecision, context: Context) -> Awaitable[None]:
+        """Decide the pending approval request ``id`` (its tool task's id) of this conversation."""
+        ...
+
+    def pending_approvals(self, context: Context) -> Awaitable[list[ApprovalRequest]]:
+        """The conversation's approval requests waiting for a decision, in id order."""
+        ...
+
+    def permissions(self, context: Context) -> Awaitable[PermissionsState]:
+        """The conversation's ``pi.permissions``; ``{}`` when none were set."""
+        ...
+
+    def update_permissions(self, change: PermissionsChange, context: Context) -> Awaitable[PermissionsState]:
+        """Change the conversation's mode, rules or directories in one commit; returns the new state."""
+        ...
+
+    def set_permission_mode(self, mode: PermissionMode | None, context: Context) -> Awaitable[PermissionsState]:
+        """Set the conversation's permission mode; ``None`` returns it to the policy's default."""
+        ...
+
 
 class EntriesQuery(TypedDict, total=False):
     """``Omit<EntryQuery, "conversationId">``: the query of ``Conversation.entries()``."""
@@ -1017,6 +1066,22 @@ class Harness(Session, Protocol):
     def wait_for_idle(self, context: Context) -> Awaitable[None]: ...
     def usage(self, context: Context) -> Awaitable[UsageState]:
         """Session total: every conversation's ``pi.usage`` summed."""
+        ...
+
+    def decide(self, id: TaskId[Any], decision: ReviewDecision, context: Context) -> Awaitable[None]:
+        """Decide the approval request ``id`` in whichever conversation its tool task runs."""
+        ...
+
+    def pending_approvals(self, context: Context) -> Awaitable[list[tuple[ConversationId, ApprovalRequest]]]:
+        """Every conversation's approval requests waiting for a decision."""
+        ...
+
+    def permission_rules(self, context: Context) -> Awaitable[PermissionRules]:
+        """The allow rules approvals added (``approvedWithRule``), for every conversation."""
+        ...
+
+    def remove_permission_rule(self, rule: str, context: Context) -> Awaitable[bool]:
+        """Remove ``rule`` from the rules approvals added; whether it was there."""
         ...
 
     def task_graph(self, context: Context) -> Awaitable[AttachedReplicatedState[TaskGraph]]: ...
@@ -1085,13 +1150,19 @@ class ToolHookCall(ToolCall):
 class BeforeToolResult(TypedDict, total=False):
     arguments: ReadOnly[JsonObject]
     block: ReadOnly[str]
+    #: The hook's word on approval; the most restrictive of the chain reaches the policy. ``allow`` skips what the
+    #: policy would ask by its mode (deny and ask rules still apply); ``ask`` asks even when the policy allows.
+    permission: ReadOnly[Literal["allow", "ask"]]
+    #: The prompt of ``permission: "ask"``.
+    reason: ReadOnly[str]
 
 
 class ToolHooks(TypedDict, total=False):
     """Hooks of the built-in tool task, for model-issued and nested calls.
 
     - ``before_tool(call, api, context)``: before intent; the first ``block`` wins, otherwise ``arguments``
-      replace the call's arguments. A raise blocks.
+      replace the call's arguments, and the most restrictive ``permission`` reaches the approval policy. A raise
+      blocks.
     - ``after_tool(call, result, api, context)``: after execution, before the result is committed; replaces it.
     """
 
