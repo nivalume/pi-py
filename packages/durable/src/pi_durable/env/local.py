@@ -688,7 +688,7 @@ class _Execution:
     # ─── lifecycle ───────────────────────────────────────────────────────────
 
     async def run(
-        self, program: str, args: Sequence[str], cwd: str, env: Mapping[str, str], stdin_command: str | None
+        self, program: str, args: Sequence[str], cwd: str, env: Mapping[str, str], stdin_data: str | bytes | None
     ) -> Result[ShellExecResult, ExecutionError]:
         import subprocess
 
@@ -699,7 +699,7 @@ class _Execution:
                 *args,
                 cwd=cwd,
                 env=dict(env),
-                stdin=subprocess.DEVNULL if stdin_command is None else subprocess.PIPE,
+                stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=not _is_windows(),
@@ -712,11 +712,12 @@ class _Execution:
         assert transport is not None
         self.pid = transport.get_pid()
         self.env._active_child_pids.add(self.pid)
-        if stdin_command is not None:
+        if stdin_data is not None:
             stdin = transport.get_pipe_transport(0)
             if stdin is not None:
                 try:
-                    cast(asyncio.WriteTransport, stdin).write(stdin_command.encode())
+                    data = stdin_data.encode() if isinstance(stdin_data, str) else stdin_data
+                    cast(asyncio.WriteTransport, stdin).write(data)
                     stdin.close()
                 except Exception:
                     pass
@@ -1058,7 +1059,8 @@ class LocalExecutionEnv:
         cwd_option = None if options is None else options.get("cwd")
         cwd = resolve_path(self.cwd, cwd_option) if cwd_option else self.cwd
         # A string runs through the shell; an argv sequence runs its program directly, without shell parsing.
-        stdin_command: str | None = None
+        stdin_input = None if options is None else options.get("stdin")
+        stdin_data: str | bytes | None = stdin_input
         if isinstance(command, str):
             config = await _blocking(_shell_config, self._shell_path)
             if config["ok"] is False:
@@ -1066,8 +1068,11 @@ class LocalExecutionEnv:
             shell = config["value"]
             program = shell["shell"]
             if shell["commandTransport"] == "stdin":
+                if stdin_input is not None:
+                    message = f"{program} reads the command from standard input, so it cannot take other input"
+                    return err(ExecutionError("spawn_error", message))
                 args: list[str] = list(shell["args"])
-                stdin_command = command
+                stdin_data = command
             else:
                 args = [*shell["args"], command]
         else:
@@ -1087,7 +1092,7 @@ class LocalExecutionEnv:
             None if options is None else options.get("inheritEnv"),
         )
         execution = _Execution(self, options, context, timeout["value"])
-        return await execution.run(program, args, cwd, env, stdin_command)
+        return await execution.run(program, args, cwd, env, stdin_data)
 
     async def open_text_line_reader(self, path: str, context: Context) -> Result[TextLineReader, FileError]:
         resolved = resolve_path(self.cwd, path)

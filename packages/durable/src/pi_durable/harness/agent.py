@@ -31,6 +31,7 @@ from .types import (
 __all__ = [
     "DEFAULT_APPROVAL_TIMEOUT_MS",
     "DEFAULT_COMPACTION_POLICY",
+    "DEFAULT_MAX_CONTINUATIONS",
     "DEFAULT_PROGRESS_POLICY",
     "DEFAULT_RESTART_LIMIT",
     "DEFAULT_RETRY_POLICY",
@@ -87,6 +88,9 @@ DEFAULT_RESTART_LIMIT: Final = 5
 #: Default ``settings.approvalTimeoutMs``: fifteen minutes.
 DEFAULT_APPROVAL_TIMEOUT_MS: Final = 15 * 60 * 1000
 
+#: Default ``settings.maxContinuations``: how many ``on_yield`` continuations one run takes.
+DEFAULT_MAX_CONTINUATIONS: Final = 8
+
 
 def _is_number(value: object) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
@@ -129,6 +133,7 @@ def resolve_settings(settings: HarnessSettings | None) -> Settings:
             "afterFailedRun": _given(settings, "afterFailedRun") or "keep",
             "restartLimit": _restart_limit(_given(settings, "restartLimit")),
             "approvalTimeoutMs": _first(_given(settings, "approvalTimeoutMs"), DEFAULT_APPROVAL_TIMEOUT_MS),
+            "maxContinuations": _first(_given(settings, "maxContinuations"), DEFAULT_MAX_CONTINUATIONS),
         }
     )
     return resolved  # type: ignore[return-value]

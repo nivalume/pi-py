@@ -14,14 +14,14 @@ from collections.abc import Sequence
 from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 from pi_ai.serialization import from_dict, message_from_dict, to_json_value
-from pi_ai.types import AssistantMessage, DeferredHandle, Message, ToolCall, UserMessage
+from pi_ai.types import AssistantMessage, DeferredHandle, Message, SystemMessage, ToolCall, UserMessage
 from pi_ai.utils.overflow import is_context_overflow
 from pi_ai.utils.retry import is_retryable_assistant_error
 from pi_ai.utils.transcript import get_current_tools
 from pi_chord.context import Context
 from pi_chord.json import copy_json
 
-from ..entries import AssistantEntry, ResetEntry, SystemEntry, UserEntry
+from ..entries import AssistantEntry, ContextEntry, ResetEntry, SystemEntry, UserEntry
 from ..tasks import define_task
 from ..telemetry import phase_span
 from ..types import ConversationId, EntryId, SubmissionId, SubmissionSettlement, Task, TaskId, Tx
@@ -146,6 +146,8 @@ async def _prepare(task: Any, runtime: Any, context: Context) -> None:
     resolved = None if model is None else runtime.models.get_model(model["provider"], model["modelId"])
     if model is None or resolved is None:
         return await _fail_no_model(runtime, model, context)
+    if await _on_input(runtime, context):
+        return
     checkpoint = task["state"]["checkpoint"]
     attempt = checkpoint["attempt"]
     compacted = checkpoint.get("compacted")
@@ -220,6 +222,63 @@ async def _prepare(task: Any, runtime: Any, context: Context) -> None:
         return {"status": "running", "checkpoint": request}
 
     await runtime.commit(commit_request, context)
+
+
+async def _on_input(runtime: Any, context: Context) -> bool:
+    """The ``on_input`` hooks, once per run in its first generation; returns whether they ended the run.
+
+    The first block fails the run ``blocked``; contexts become ``pi.context`` entries in the commit that marks the input
+    checked. Without hooks nothing is committed.
+    """
+    conversation_id = runtime.conversation_id
+    live = await runtime.snapshot(LiveDoc, conversation_id, context)
+    run = None if live is None else live.get("run")
+    if run is None or run["taskId"] != runtime.task_id or run.get("inputChecked") is True:
+        return False
+    entries: list[Any] = []
+    loaded: list[bool] = []
+    contexts: list[str] = []
+    blocked: list[str] = []
+
+    async def on_input(hook: Any) -> None:
+        if blocked:
+            return
+        if not loaded:
+            loaded.append(True)
+            for id in run["inputs"]:
+                record = await runtime.submission(id, context)
+                entry_id = None if record is None else record.get("entry")
+                entry = None if entry_id is None else await runtime.entry(entry_id, context)
+                if entry is not None:
+                    entries.append(entry)
+        result = hook({"entries": list(entries)}, runtime, context)
+        decision = await result if inspect.isawaitable(result) else result
+        if decision is None:
+            return
+        if decision.get("block") is not None:
+            blocked.append(str(decision["block"]))
+        elif decision.get("context") is not None:
+            contexts.append(str(decision["context"]))
+
+    await runtime.hooks.each("on_input", on_input)
+    if not loaded:
+        return False
+    if blocked:
+        await _fail_blocked(runtime, blocked[0], context)
+        return True
+    task_id = runtime.task_id
+
+    async def checked(tx: Tx, _current: Any) -> None:
+        for text in contexts:
+            await tx.append_entry(
+                ContextEntry, conversation_id, {"model": [SystemMessage(text, timestamp=runtime.now())]}
+            )
+        current = (await tx.doc(LiveDoc, conversation_id)).get("run")
+        if current is not None and current["taskId"] == task_id:
+            current["inputChecked"] = True
+
+    await runtime.commit(checked, context)
+    return False
 
 
 async def _request(task: Any, runtime: Any, context: Context) -> None:
@@ -466,6 +525,23 @@ async def _fail_model_error(runtime: Any, text: str, context: Context) -> None:
     await runtime.commit(change, context)
 
 
+async def _fail_blocked(runtime: Any, reason: str, context: Context) -> None:
+    """An ``on_input`` hook blocked the run: settle its inputs ``unanswered`` with ``blocked`` and fail."""
+
+    async def change(tx: Tx, _current: Any) -> Any:
+        failure = await _prepare_failure(tx, runtime)
+        live = await tx.doc(LiveDoc, runtime.conversation_id)
+        await _end_failed_run(
+            tx, runtime, live, failure, {"status": "unanswered", "reason": "blocked", "detail": reason}
+        )
+        return {
+            "status": "terminal",
+            "outcome": {"status": "failed", "error": {"message": reason, "detail": {"reason": "blocked"}}},
+        }
+
+    await runtime.commit(change, context)
+
+
 async def _fail_no_model(runtime: Any, ref: ModelRef | None, context: Context) -> None:
     """Settle the run's inputs ``unanswered`` with ``no_model`` and fail."""
     message = "No model is configured" if ref is None else f"Model {ref['provider']}/{ref['modelId']} is not available"
@@ -686,17 +762,29 @@ async def _answer(runtime: Any, message: AssistantMessage, context: Context) -> 
     selected user items start the next run.
     """
     continuation: list[UserInput] = []
+    # Once a continuation was taken or refused, later hooks are not asked.
+    decided_once: list[bool] = []
+    conversation_id = runtime.conversation_id
 
     async def on_yield(hook: Any) -> None:
-        if continuation:
+        if decided_once:
             return
         result = hook(message, runtime, context)
         decided = await result if inspect.isawaitable(result) else result
-        if decided is not None and "continue" in decided:
-            continuation.append(decided["continue"])
+        if decided is None or "continue" not in decided:
+            return
+        decided_once.append(True)
+        live = await runtime.snapshot(LiveDoc, conversation_id, context)
+        run = None if live is None else live.get("run")
+        taken = run.get("continuations", 0) if run is not None and run["taskId"] == runtime.task_id else 0
+        limit = runtime.settings["maxContinuations"]
+        if taken >= limit:
+            # Raised here, so the report names the hook's extension.
+            shown = int(limit) if math.isfinite(limit) else limit
+            raise RuntimeError(f"The run took {shown} continuations; the next one is ignored")
+        continuation.append(decided["continue"])
 
     await runtime.hooks.each("on_yield", on_yield)
-    conversation_id = runtime.conversation_id
 
     async def change(tx: Tx, _current: Any) -> Any:
         # Queue modes are read on the Session line, when the boundary is decided.
@@ -709,6 +797,9 @@ async def _answer(runtime: Any, message: AssistantMessage, context: Context) -> 
             content = continuation[0]
             user = UserMessage(content if isinstance(content, str) else list(content), timestamp=runtime.now())
             await tx.append_entry(UserEntry, conversation_id, {"model": [user]})
+            run = live.get("run")
+            if run is not None and run["taskId"] == runtime.task_id:
+                run["continuations"] = run.get("continuations", 0) + 1
             hand_over(live, runtime.task_id, await _create_generation(tx, conversation_id))
             live.pop("generation", None)
             return result

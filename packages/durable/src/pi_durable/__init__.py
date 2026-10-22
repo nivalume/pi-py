@@ -43,6 +43,7 @@ from .entries import (
     AssistantEntry,
     CompactionEntry,
     CompactionEntryData,
+    ContextEntry,
     ResetEntry,
     SystemEntry,
     ToolResultEntry,
@@ -256,6 +257,7 @@ __all__ = [
     # built-in entries
     "AssistantEntry",
     "CompactionEntry",
+    "ContextEntry",
     "CompactionEntryData",
     "ResetEntry",
     "SystemEntry",

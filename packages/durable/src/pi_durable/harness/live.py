@@ -115,6 +115,10 @@ class CompactionFailure(TypedDict):
 class LiveRun(TypedDict):
     taskId: TaskId[Any]
     inputs: list[SubmissionId]
+    #: ``on_yield`` continuations the run took; absent while none.
+    continuations: NotRequired[int]
+    #: The ``on_input`` hooks saw the run's inputs; absent until then.
+    inputChecked: NotRequired[Literal[True]]
 
 
 class LiveGeneration(TypedDict):

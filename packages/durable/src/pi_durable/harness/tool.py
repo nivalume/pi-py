@@ -159,6 +159,8 @@ ToolTaskResult: TypeAlias = ToolTaskResultModel | ToolTaskResultNested
 
 #: Memo of a tool task that made a nested call, in any attempt, committed before the first admission of each attempt.
 _MADE_NESTED_CALLS: Final = "pi.tool.madeNestedCalls"
+#: Memo of the ``before_tool`` hooks' context, appended to the result.
+_HOOK_CONTEXT: Final = "pi.tool.context"
 
 
 class NestedCallState(TypedDict, total=False):
@@ -216,7 +218,7 @@ async def _call_body(
         return await _settle(
             runtime, task_input, call, _COMPLETED, lambda _slot: _invalid(failure), context, telemetry=telemetry
         )
-    state: dict[str, Any] = {"args": checked["json"], "block": None, "permission": None, "reason": None}
+    state: dict[str, Any] = {"args": checked["json"], "block": None, "permission": None, "reason": None, "context": []}
 
     async def before_tool(hook: Any) -> None:
         if state["block"] is not None:
@@ -236,6 +238,8 @@ async def _call_body(
                 state["reason"] = decision.get("reason")  # type: ignore[union-attr]
             elif permission == "allow" and state["permission"] is None:
                 state["permission"] = "allow"
+            if decision is not None and decision.get("context") is not None:
+                state["context"].append(str(decision["context"]))
         except Exception as error:
             if runtime.signal.aborted:
                 raise
@@ -246,6 +250,9 @@ async def _call_body(
         blocked = harness_error("blocked", f"Tool call blocked: {state['block']}")
         telemetry.blocked()
         return await _settle(runtime, task_input, call, _COMPLETED, lambda _slot: blocked, context, telemetry=telemetry)
+    if state["context"]:
+        # Kept in the task, so the context outlives an approval wait and recovery.
+        await runtime.memo(_HOOK_CONTEXT, state["context"], context)
     validated = _validate(tool, call, state["args"])
     if "error" in validated:
         failure = validated["error"]
@@ -1160,6 +1167,10 @@ async def _final_result(
     bounded, dropped_bytes, dropped_lines = _bound_content(list(final.get("output") or []), reported.limits)
     if dropped_bytes > 0:
         harness.append(_truncated(dropped_lines, dropped_bytes, reported.limits.retain))
+    # The ``before_tool`` hooks' context, after the hooks that may rewrite the output.
+    notes = await runtime.memo(_HOOK_CONTEXT, context)
+    if notes:
+        bounded = [*bounded, TextContent("\n\n".join(notes))]
     broken = _structured_output_error(tool, final)
     if broken is not None:
         rest = {key: value for key, value in final.items() if key != "structuredOutput"}

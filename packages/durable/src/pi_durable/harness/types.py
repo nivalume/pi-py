@@ -181,6 +181,10 @@ __all__ = [
     "HookResult",
     "GenerationRequest",
     "GenerationContinue",
+    "RunInput",
+    "InputBlock",
+    "InputContext",
+    "InputDecision",
     "GenerationHooks",
     "ToolCallParent",
     "ToolHookCall",
@@ -795,6 +799,8 @@ class HarnessSettings(TypedDict, total=False):
     restartLimit: float
     #: How long an approval request waits for a decision unless the policy says otherwise; default 15 minutes.
     approvalTimeoutMs: float
+    #: How many ``on_yield`` continuations one run takes; later ones are reported and ignored. Default 8.
+    maxContinuations: float
 
 
 class Settings(TypedDict):
@@ -813,6 +819,7 @@ class Settings(TypedDict):
     afterFailedRun: ReadOnly[AfterFailedRun]
     restartLimit: ReadOnly[float]
     approvalTimeoutMs: ReadOnly[float]
+    maxContinuations: ReadOnly[float]
 
 
 class EnvTarget(TypedDict):
@@ -1105,6 +1112,23 @@ class HookApi(DocumentReader, Protocol):
     @overload
     async def memo(self, name: str, candidate: T, context: Context, /) -> T: ...
 
+    async def agent(self, context: Context) -> Agent:
+        """The conversation's agent as the phase resolved it."""
+        ...
+
+    async def env(self, context: Context) -> ExecutionEnv | None:
+        """The conversation's environment, built for this use; ``None`` without ``HarnessOptions.env``. Commands a hook
+        runs go through it."""
+        ...
+
+    async def cwd(self, context: Context) -> str | None:
+        """The conversation's working directory: its environment's, else the agent's ``cwd``."""
+        ...
+
+    async def conversation_record(self, context: Context) -> ConversationRecord | None:
+        """The committed record of the hook's conversation (its owner, its parent)."""
+        ...
+
 
 #: What a hook returns: a value, ``None`` for no decision, or an awaitable of either.
 HookResult: TypeAlias = "T | Awaitable[T | None] | None"
@@ -1118,18 +1142,45 @@ class GenerationRequest(TypedDict):
 GenerationContinue = TypedDict("GenerationContinue", {"continue": "UserInput"})
 
 
+class RunInput(TypedDict):
+    """The input a run starts with, as ``on_input`` sees it: the entries its inputs placed, in order."""
+
+    entries: ReadOnly[Sequence[EntryRecord]]
+
+
+class InputBlock(TypedDict):
+    """Ends the run ``unanswered`` with reason ``blocked`` and this detail before any request; the input stays in the
+    transcript."""
+
+    block: ReadOnly[str]
+
+
+class InputContext(TypedDict):
+    """Context for the model, appended as a ``pi.context`` entry (one system message) before the first request."""
+
+    context: ReadOnly[str]
+
+
+#: What an ``on_input`` hook decides about a run's input.
+InputDecision: TypeAlias = InputBlock | InputContext
+
+
 class GenerationHooks(TypedDict, total=False):
     """Hooks of the built-in generation task.
 
     - ``before_request(request, api, context)``: before every request attempt; the result is used for that
       request only.
     - ``after_response(message, api, context)``: every terminal provider message, before classification.
-    - ``on_yield(answer, api, context)``: a final answer; the first ``{"continue": input}`` continues the run.
+    - ``on_input(input, api, context)``: once per run, before its first request; the first ``{"block": reason}``
+      ends the run, every ``{"context": text}`` is appended for the model. A raise is reported.
+    - ``on_yield(answer, api, context)``: a final answer; the first ``{"continue": input}`` continues the run, up to
+      ``settings.maxContinuations`` times (the count so far is ``pi.live``'s ``run.continuations``).
     - ``after_tools(assistant, results, api, context)``: after every tool of the round is terminal.
     """
 
     before_request: Callable[[GenerationRequest, HookApi, Context], HookResult[GenerationRequest]]
     after_response: Callable[[AssistantMessage, HookApi, Context], Awaitable[None] | None]
+    on_input: Callable[[RunInput, HookApi, Context], HookResult[InputDecision]]
     on_yield: Callable[[AssistantMessage, HookApi, Context], HookResult[GenerationContinue]]
     after_tools: Callable[[EntryId, Sequence[EntryId], HookApi, Context], Awaitable[None] | None]
 
@@ -1155,14 +1206,17 @@ class BeforeToolResult(TypedDict, total=False):
     permission: ReadOnly[Literal["allow", "ask"]]
     #: The prompt of ``permission: "ask"``.
     reason: ReadOnly[str]
+    #: Text for the model, appended to the call's result as a final text item (after ``after_tool``); every hook's
+    #: context is kept.
+    context: ReadOnly[str]
 
 
 class ToolHooks(TypedDict, total=False):
     """Hooks of the built-in tool task, for model-issued and nested calls.
 
     - ``before_tool(call, api, context)``: before intent; the first ``block`` wins, otherwise ``arguments``
-      replace the call's arguments, and the most restrictive ``permission`` reaches the approval policy. A raise
-      blocks.
+      replace the call's arguments, the most restrictive ``permission`` reaches the approval policy, and every
+      ``context`` follows the result. A raise blocks.
     - ``after_tool(call, result, api, context)``: after execution, before the result is committed; replaces it.
     """
 

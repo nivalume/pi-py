@@ -2188,6 +2188,21 @@ class _Runtime:
             raise self._ended()
         return await self._scheduler._env(self._invocation.conversation_id, context)
 
+    async def cwd(self, context: Context) -> str | None:
+        """The conversation's working directory: its environment's, else the agent's ``cwd``."""
+        env = await self.env(context)
+        if env is not None:
+            return env.cwd
+        return (await self.agent(context)).get("cwd")
+
+    async def conversation_record(self, context: Context) -> Any:
+        """The committed record of the task's conversation."""
+        if self._invocation.ended:
+            raise self._ended()
+        scheduler = self._scheduler
+        id = self._invocation.conversation_id
+        return await scheduler._session.read_on_line(lambda: scheduler._storage.conversation(id, context))
+
     def commit(self, change: Callable[[Any, Any], Any], context: Context) -> asyncio.Future[None]:
         scheduler = self._scheduler
         invocation = self._invocation
@@ -2331,6 +2346,13 @@ class _Runtime:
 
         binding = InvocationBinding(invocation.controller.signal, check)
         return await self._scheduler._conversation(id, binding, context)
+
+    async def submission(self, id: Any, context: Context) -> Any:
+        """Internal (``pi.generation``): the committed record of submission ``id``."""
+        if self._invocation.ended:
+            raise self._ended()
+        scheduler = self._scheduler
+        return await scheduler._session.read_on_line(lambda: scheduler._storage.submission(id, context))
 
     async def entry(self, *args: Any) -> Any:
         if len(args) == 2:
