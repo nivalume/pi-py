@@ -287,24 +287,61 @@ API 形状：
 |---|---|
 | `codemode/index.ts` | `pi_durable/codemode/__init__.py`：`create_codemode_extension`、`create_codemode_tool`、`CodemodeStoreDoc`、`CodemodeNamespace`、`CodemodeToolDetails`、`CodemodeNestedCall`、`CodemodeToolInput`、`CodemodeGlobal`、`CODEMODE_MODULE_VERSION`、`CODEMODE_TOOL_NAME`、`DEFAULT_CODEMODE_INLINE_BUDGET` |
 | `codemode/codemode.ts` | `pi_durable/codemode/codemode.py`（还有 `CodemodeRunDoc`、`CodemodeJournalDoc`；调用是 `_CodemodeCall`） |
-| `codemode/describe.ts`、`models.ts`、`output.ts` | `pi_durable/codemode/{describe,models,output}.py` |
+| `codemode/describe.ts`、`models.ts`、`output.ts` | `pi_durable/codemode/{describe,models,output}.py`，语言相关的名字和文本在 `pi_durable/codemode/dialect.py` |
 
-脚本是 Python，由 `pi_codemode` 沙箱（Monty）通过 `CodemodeSandboxBase.start()`/`CodemodeRun.deliver()` 运行；其他一切都是上游的。
+脚本由调用者给的 `pi_codemode` 沙箱通过 `CodemodeSandboxBase.start()`/`CodemodeRun.deliver()` 运行，语言跟随沙箱（`sandbox.language`）：`CodemodeSandbox` 是 QuickJS 中的 JavaScript（上游的语言，默认），`MontyCodemodeSandbox` 是 Monty 中的 Python。一个工具只提供一种语言。其他一切都是上游的。
 
 API 形状：
 
 - `create_codemode_extension(*, sandbox, namespaces=(), inline_budget=None, models=True, globals=())` 和 `create_codemode_tool(...)` 把上游的 `CodemodeToolOptions` 作为关键字参数。`CodemodeNamespace` 是 `TypedDict`（`name`、`prefix`、可选 `description`、`instructions`）；`CodemodeGlobal(name, execute, spread=False)` 是带 `execute(args, api, context)` 的冻结 dataclass（内部，如上游的 `globals`）。
-- 模型读到的内容为 Python 重写：工具描述（`await tools.<name>(key=value, ...)`、`asyncio.gather`、`print`、`# @options:`）、`codemode` 段（pi_codemode 的 Python 声明、`### \`id\`` 标题和预算规则，如上游）、参数描述（`Raw Python source.`）、`models.*` 描述以及显示脚本语法的错误文本（`context["state"] must be a dict`、`models.get_model_of_type(...)`）。
-- 脚本全局变量是 snake_case：`search_tools`、`describe_tool`、`describe_namespace`、`models.get_models_of_type`、`models.get_available_of_type`、`models.get_model_of_type`、`models.classify`、`models.generate_images`。工具名保持上游的，包括内部 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`（details 行像上游一样显示 `models.generateImages`）。spread 全局变量把位置参数作为列表、关键字参数作为尾部 dict 收到；`models.bind_arguments(args, names)` 把其键全部指名未填充参数的尾部 dict 绑定为关键字，因此 `f(a, b)`、`f(a, b=b)` 和 `f(a=a, b=b)` 一致。`search_tools(query, limit=..., namespace=...)` 以关键字或上游的一个选项 dict 接受其选项。
+- 模型读到的内容按语言取自 `dialect.py` 的 `JAVASCRIPT` 或 `PYTHON`。JavaScript 的是上游原文：工具描述、`codemode` 段（TypeScript 声明、`### \`id\`` 标题和预算规则）、参数描述（`Raw JavaScript source.`）、`// @options:` 语法、`models.*` 描述以及错误文本，均逐字一致（测试对照上游输出）。Python 的是重写：工具描述（`await tools.<name>(key=value, ...)`、`asyncio.gather`、`print`、`# @options:`）、Python 声明、参数描述（`Raw Python source.`）、`models.*` 描述以及显示 Python 语法的错误文本（`context["state"] must be a dict`、`models.get_model_of_type(...)`）。
+- JavaScript 的脚本全局变量是上游的 camelCase（`searchTools`、`describeTool`、`describeNamespace`、`models.getModelsOfType`、`models.getAvailableOfType`、`models.getModelOfType`、`models.classify`、`models.generateImages`），参数按位置绑定。Python 的脚本全局变量是 snake_case：`search_tools`、`describe_tool`、`describe_namespace`、`models.get_models_of_type`、`models.get_available_of_type`、`models.get_model_of_type`、`models.classify`、`models.generate_images`。工具名保持上游的，包括内部 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`（details 行像上游一样显示 `models.generateImages`）。spread 全局变量把位置参数作为列表、关键字参数作为尾部 dict 收到；`PYTHON.bind(args, names)` 把其键全部指名未填充参数的尾部 dict 绑定为关键字，因此 `f(a, b)`、`f(a, b=b)` 和 `f(a=a, b=b)` 一致。`search_tools(query, limit=..., namespace=...)` 以关键字或上游的一个选项 dict 接受其选项。
 - 模型调用：上下文像上游那样检查，并用 `pi_ai.serialization.from_dict` 解码为 `ClassifierContext`/`ImagesContext`；目录项和结果是 `to_json_value`（camelCase），`headers` 被丢弃。
 - `Start.tools[].jsName` 映射到 `CodemodeDeclaredTool.js_name`；隐藏（内部）工具被排除在 run 的工具之外。
 
 规则：
 
-- **持久化 JSON 是上游的**：`pi.codemode.run`（带 `version`、`startedAt`、`seed`、`fingerprint`、`deadline`、`tools[{name, jsName, description, structured?, hidden?}]`、`namespaces`、`globals`、`maxOutputTokens`、`store` 的 `start`；`outputDir`；`result`）、`pi.codemode.journal`（`entries[{id, at, issuedAfter?, global?: {name, args?, outcome}}]`、`firstIssued`）、`pi.codemode.store`（`values`，可回退，`fork="asOf"`）。存储的 `result` 是带其 `output` 作为 pi-ai JSON 的工具结果。`CODEMODE_MODULE_VERSION` 保持 2。Run 不在语言间移动：指纹（`pydantic-monty ...` 对比 QuickJS 的）不同，因此恢复的外语 run 以“the sandbox changed”结束。
+- **持久化 JSON 是上游的**：`pi.codemode.run`（带 `version`、`startedAt`、`seed`、`fingerprint`、`deadline`、`tools[{name, jsName, description, structured?, hidden?}]`、`namespaces`、`globals`、`maxOutputTokens`、`store` 的 `start`；`outputDir`；`result`）、`pi.codemode.journal`（`entries[{id, at, issuedAfter?, global?: {name, args?, outcome}}]`、`firstIssued`）、`pi.codemode.store`（`values`，可回退，`fork="asOf"`）。存储的 `result` 是带其 `output` 作为 pi-ai JSON 的工具结果。`CODEMODE_MODULE_VERSION` 保持 2。Run 不在语言间移动：指纹（`pydantic-monty ...` 对比 `quickjs-wasi ...`）不同，因此换了语言恢复的 run 以“the sandbox changed”结束。JavaScript 的指纹与上游相同。
 - **重放**逐行遵循上游：指纹门、重放结果的按日志顺序投递、每结果的确认计数、在启动前对照更早尝试的 `NestedCallDoc` 键（`c<VM call id>`）检查保持的调用、只在调用的 issued 计数提交后启动、在 run 文档中一次性决定发散与不匹配、对结束于实时 run 继续处的重放检查 `during`。上游的 `void promise` 工作作为 `_spawn` 保持的任务运行（意外错误使调用失败）；门上的 `then` 是完成回调。调用结束时门打开、模型槽位等待者唤醒，因此没有东西永远等待；两者都检查 `stopped` 且不收录任何东西。
 - 两个刻意的差异，结果中都不可见：释放的模型槽位直接传给第一个等待者（上游释放它并让等待者在一个微任务后取走，新调用可能抢先），以及 journal 提交后下一个提交只为排队的（结果）或已赶上的 VM 的计数开始；VM 仍在处理的（结果）的计数随下一个提交走（上游的声明规则；其代码立即提交，而 Monty 0.3 ms 的往返会让每几个结果花一次提交）。
-- 脚本值：`None` 是上游的 `undefined`（全局变量的 `None` 不带 `value` 记入 journal；返回 `None` 的脚本不给输出加值）。失败调用的结果保留上游的 `properties.structuredOutput`，Monty 脚本看不到它（异常只持消息）。不是由调用造成的 "aborted" 结果（`Sandbox closed`）不存储任何东西，并在调用的 context 中止时抛出，如上游。
+- 脚本值：`None` 是上游的 `undefined`（全局变量的 `None` 不带 `value` 记入 journal；返回 `null`/`undefined`/`None` 的脚本不给输出加值，上游对 `return null` 会输出 `null`）。失败调用的结果保留上游的 `properties.structuredOutput`：JavaScript 脚本在 `Error` 上看到它，Monty 脚本看不到（异常只持消息）。不是由调用造成的 "aborted" 结果（`Sandbox closed`）不存储任何东西，并在调用的 context 中止时抛出，如上游。
 - 输出（`output.py`）：上游的布局、预算、溢出和图像文件；长度按码点计数，`value_text` 是紧凑 `json.dumps`（`separators=(",", ":")`，非 ASCII 原样），墙钟时间 `f"{ms / 1000:.1f}"`。
 - `pi_durable.codemode` 只导入 pi_codemode 的可移植模块（`source`、`identifier`、`declarations`、`types`，以及宿主运行时的类型）；沙箱来自调用者。`pi_durable` 不导入 `pi_durable.codemode`，两者都不加载 `pi_codemode.sandbox` 或 `pydantic_monty`（`tests/test_storage_runtime_boundary.py`）。
-- 测试（`tests/test_codemode*.py`）需要 Monty，没有则跳过，描述/段测试除外；每个重启用例都在 MemoryStorage 和 SQLite 上运行。
+- 测试：`tests/test_codemode.py`、`test_codemode_models.py` 是 Python 脚本（需要 Monty，没有则跳过），`tests/test_codemode_javascript.py` 等是 JavaScript 脚本（QuickJS）；描述/段测试覆盖两种语言；每个重启用例都在 MemoryStorage 和 SQLite 上运行。
+
+## 13. 审批与权限（来自 delta 的新增）
+
+上游没有审批。本节移植 delta 的实现（`crates/harness/src/approval/`、`docs/design/approval.md` 和 `permissions.md`），它把 Codex 的审批流程做成持久化的，并加入了 Claude Code 的权限规则和模式。
+
+| delta | Python |
+|---|---|
+| `approval/policy.rs` | `pi_durable/approval/policy.py`：`ApprovalPolicy`（带 `decide(call, api, context)` 的 `Protocol`，可同步或异步）、`ApprovalCall`（冻结 dataclass）、`PolicyDecision`（`TypedDict`）、`AllowAll`、`AskAll`、`DenyAll` |
+| `approval/document.rs` | `pi_durable/approval/document.py`：`ApprovalsDoc`、`ReviewDecision`、`ApprovalRequest`、`ApprovalGrant`、`record_decision()`、`remove_request()` |
+| `approval/pending.rs` | `pi_durable/approval/pending.py`：`PendingApprovals`、`ApprovalWaiter`（asyncio future） |
+| `approval/permissions.rs` | `pi_durable/approval/permissions.py`：`PermissionsDoc`、`PermissionRulesDoc`、`RulesPolicy`、`PermissionDefaults`、`apply_permissions_change()`、`copy_owner_permissions()` |
+| `approval/rules/{mod,bash,path}.rs` | `pi_durable/approval/{rules,commands,paths}.py` |
+| `approval/mod.rs`（`ApprovalError`） | `pi_durable/approval/errors.py`：`ApprovalNotPending`、`UnknownApproval`、`InvalidDecision`；无效规则是 `RuleError`（`ValueError`） |
+| `tool/approval.rs`、`tool/pipeline.rs`（策略、intent） | `pi_durable/harness/tool.py`：`_policy`、`_request_approval`、`_wait`、`_consume`、`_abort_run`、`_commit_intent` |
+| `harness/approvals.rs`、`harness/permissions.rs` | `pi_durable/harness/approvals.py`（`HarnessApprovals` 和表面函数）以及 `Harness`/`ConversationImpl` 的方法 |
+| `observe/{view,translate}.rs` | `view.py` 挂载 `pi.approvals` 和 `pi.permissions`；`events.py` 在快照中加入 `approvals`/`permissions`，并新增 `approval_update`/`permissions_changed` |
+
+持久化 JSON 遵循本移植的规则（camelCase 键、`pi.*` 种类），而不是 delta 的 snake_case：
+
+- `pi.approvals`（会话作用域，`latest`，`fork="initial"`，没有待审批请求时写完整基线）：`{"requests": [{id, callId, name, arguments, approvalKey?, prompt?, proposedRule?, requestedAt, deadline, decision?}], "grants": [{tool, key, grantedBy}]}`。请求的 id 就是其工具任务的 id。
+- 决定：`{"type": "approved" | "approvedForSession" | "denied"（+ "rejection"?）| "timedOut" | "abort" | "approvedWithRule"（+ "rule"）}`。
+- 仅展示的条目 `pi.approval`，数据为 `{approvalId, callId, name, decision}`，以请求 id `approval:<id>` 作为写入提交一次，因此从不进入模型上下文。
+- `pi.permissions`（会话作用域，`rewindable`，`fork="asOf"`，初始 `{}`，每次变更写完整基线）：`{mode?, rules?: {allow?, ask?, deny?}, directories?}`。模式使用 Claude Code 的名字：`default`、`acceptEdits`、`plan`、`dontAsk`、`bypassPermissions`。
+- `pi.permission-rules`（session 作用域，初始 `{}`）：`{allow?}`，即 `approvedWithRule` 加入的规则。
+- 工具任务仍是 `pi.tool` 版本 2，新增一个阶段 `{"phase": "approval", arguments, replay, deadline}`。旧版 pi-py 无法运行处于该阶段的任务。
+- `RulesPolicy` 把决定以 `pi.permissions.decision` 记在任务的 memo 中。
+
+流程（与 delta 相同）：在 `before_tool` 和第二次校验之后，策略基于最终参数、调用的 `permission_subject`（用环境转换为绝对路径）和 `cwd` 做决定。拒绝时以 `blocked` 结束（`Tool call blocked: approval denied: <reason>`）；策略抛出异常时以其文本拒绝，并上报（`host_error`，callback 为 `approval`）。要求审批但被会话授权覆盖的调用直接运行；否则一次提交加入请求并把任务移到 `approval` 阶段。该阶段先注册等待者，再读取已提交的请求（这样中间提交的决定无论哪种顺序都能看到），然后在 Harness 的定时器上等待通知或截止时间，到期时除非已有决定，否则提交 `timedOut`。`decide()` 在一次提交里写入决定、条目、授权或规则，然后通知。批准时在 intent 提交中移除请求，并以请求中的参数运行调用；拒绝或超时以 `blocked` 结束，并在 settle 提交中撤回请求；abort 处理器撤回待审批请求，不写条目。恢复时重新运行 `approval` 阶段，读取已存储的决定，或等待到已存储的截止时间。
+
+与 delta 的差异：
+
+- **中止决定。** delta 等待调度器中止会话的 run，再等待级联取消该调用。这里的阶段把 run 和调用自身都标记为中止，不等待它们结束，然后等待自己被取消；abort 处理器以 `aborted` 结束。不属于该 run 的调用同样会被中止。
+- **被拥有的会话**只在 Harness 配置了策略时复制拥有者会话的 `pi.permissions`：本移植的 `Tx` 没有不创建缺失文档的读取方法，而没有策略的 Harness 从不读取它。
+- **AllowAll**（默认）走快速路径：不为策略构建环境或主体。
+- **`permission_subject(args, env, context)`** 可以是异步的，因为 `ExecutionEnv.absolute_path()` 是异步的。`approval_key(args)` 默认是键排序后的紧凑 JSON（delta 的 `canonical_json`）。
+- **Hooks。** `before_tool` 结果中的 `permission`（`"allow"` 或 `"ask"`，`reason` 作为提示）对应 delta 的 `HookPermission`；delta 的 hook `context`（来自 Claude Code hooks）没有移植。
+- `powershell` 也有命令主体，因此 `Bash(...)` 规则、`plan` 和 `dontAsk` 同样作用于它。

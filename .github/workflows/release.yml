@@ -43,6 +43,9 @@ jobs:
           uv venv /tmp/smoke
           uv pip install --python /tmp/smoke dist/*.whl
           /tmp/smoke/bin/python -c "import pi_ai, pi_agent; print('ok')"
+          # The JavaScript sandbox runs the quickjs.wasm the wheel bundles.
+          uv pip install --python /tmp/smoke "$(ls dist/*.whl)[codemode]"
+          /tmp/smoke/bin/python -c "import asyncio; from pi_codemode import CodemodeSandbox; assert asyncio.run(CodemodeSandbox().execute('return 1 + 1')).value == 2"
       - uses: actions/upload-artifact@v4
         with:
           name: dist

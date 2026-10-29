@@ -1,9 +1,10 @@
-"""Durable code mode (port of ``codemode/codemode.ts``): a tool that runs model-written Python in a Monty sandbox,
-whose script survives a restart.
+"""Durable code mode (port of ``codemode/codemode.ts``): a tool that runs model-written scripts in a sandbox, whose
+script survives a restart. Scripts are in the sandbox's language: JavaScript in QuickJS (upstream's), or Python in
+Monty.
 
 Problem: a script is in-memory sandbox state. A restart while
 
-    results = await asyncio.gather(*(tools.read(path=path) for path in paths))
+    const results = await Promise.all(paths.map((path) => tools.read({ path })));
 
 waits for the last of 200 reads would lose the script and every read it made.
 
@@ -33,9 +34,10 @@ aborted by the call's cleanup) when this module's version or the sandbox's finge
 passed, or when the script diverges: it makes another call, or calls in another order, than the journal says. Each
 ends the call with an error result.
 
-The journal's format is upstream's, but a run cannot be replayed across languages: the scripts, the globals' names,
-and the sandbox fingerprints (Monty's versus QuickJS's) differ, so a TypeScript run read here ends with "the sandbox
-changed since it started".
+The journal's format is upstream's. A run cannot be replayed in another language: its globals' names and the sandbox
+fingerprints (QuickJS's versus Monty's) differ, so a run started with one sandbox and resumed with the other ends with
+"the sandbox changed since it started". A JavaScript run reports the same fingerprint as upstream's sandbox on the same
+QuickJS build.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ from pi_ai import TextContent, Type
 from pi_ai.serialization import content_from_dict, to_json_value
 from pi_chord.json import copy_json
 from pi_codemode.identifier import to_codemode_identifier
-from pi_codemode.source import CODEMODE_SOURCE_GRAMMAR, ParsedCodemodeSource, parse_codemode_source
+from pi_codemode.source import ParsedCodemodeSource, codemode_source_grammar, parse_codemode_source
 from pi_codemode.telemetry import trace_codemode_run
 from pi_codemode.types import (
     CodemodeDeclaredGlobal,
@@ -76,15 +78,14 @@ from .describe import (
     namespace_of,
     sample_of,
 )
+from .dialect import Dialect, dialect_of
 from .models import (
-    CATALOG_GLOBALS,
     CODEMODE_INTERNAL_PREFIX,
     GENERATE_IMAGES_TOOL,
     MAX_CONCURRENT_MODEL_CALLS,
-    MODEL_CALLS,
-    bind_arguments,
     catalog_call,
     create_model_tools,
+    model_calls,
 )
 from .output import DEFAULT_MAX_OUTPUT_TOKENS, OutputFile, OutputFileResult, format_result
 
@@ -163,7 +164,7 @@ class Start(TypedDict):
     #: ``startedAt + timeout_ms`` when the script set one.
     deadline: NotRequired[float]
     tools: list[DeclaredTool]
-    #: The namespaces of the tools, as ``describe_namespace()`` and ``search_tools()`` see them.
+    #: The namespaces of the tools, as ``describeNamespace()`` and ``searchTools()`` see them.
     namespaces: list[StartNamespace]
     globals: list[StartGlobal]
     #: ``max_output_tokens`` of the script's options line, or the default.
@@ -280,13 +281,11 @@ class CodemodeGlobal:
     spread: bool = False
 
 
-_CODEMODE_SCHEMA: Final = Type.Object({"code": Type.String(description="Raw Python source.")})
-
 #: Outputs bounded by the script's own token budget; the Harness's limits only stop a runaway.
 _OUTPUT_LIMITS: Final[ToolOutputLimits] = {"maxBytes": 4 * 1024 * 1024, "maxLines": 100_000}
 
-#: Globals for finding tools, answered from the start data, so a replay sees what the first run saw.
-DISCOVERY_GLOBALS: Final = ("search_tools", "describe_tool", "describe_namespace")
+#: Tools ``searchTools()`` returns without a ``limit``. The discovery globals are answered from the start data, so a
+#: replay sees what the first run saw.
 _DEFAULT_SEARCH_LIMIT: Final = 8
 
 
@@ -298,18 +297,27 @@ class _Options:
     models: bool = True
     globals: Sequence[CodemodeGlobal] = ()
 
+    @property
+    def dialect(self) -> Dialect:
+        """The language of the sandbox's scripts, which everything the model reads follows."""
+        return dialect_of(self.sandbox.language)
+
 
 def _tool_of(options: _Options) -> ToolRegistration:
     async def execute(args: Any, api: ToolExecutionApi, context: Context) -> ToolExecutionResult:
         return await _CodemodeCall(options, api, context).execute(args["code"])
 
+    dialect = options.dialect
     return define_tool(
         name=CODEMODE_TOOL_NAME,
-        description=codemode_description(options.models),
-        parameters=_CODEMODE_SCHEMA,
+        description=codemode_description(options.models, dialect),
+        parameters=Type.Object({"code": Type.String(description=dialect.code_description)}),
         output_limits=_OUTPUT_LIMITS,
         # Capable models write the script as raw text instead of a JSON-escaped string; pi-ai applies it only for them.
-        constrained_sampling={"type": "grammar", "variants": {"openai_lark": CODEMODE_SOURCE_GRAMMAR}},
+        constrained_sampling={
+            "type": "grammar",
+            "variants": {"openai_lark": codemode_source_grammar(dialect.language)},
+        },
         callers=["model"],
         replay="safe",
         execute=execute,
@@ -327,8 +335,10 @@ def create_codemode_tool(
     """The code mode tool. Scripts call the conversation's callable tools as ``await tools.<name>(...)``.
 
     Args:
-        sandbox: Runs the scripts: a :class:`pi_codemode.CodemodeSandbox`, or any
-            :class:`pi_codemode.CodemodeSandboxBase`.
+        sandbox: Runs the scripts, and decides their language: a :class:`pi_codemode.CodemodeSandbox` for JavaScript
+            (upstream's), a :class:`pi_codemode.MontyCodemodeSandbox` for Python, or any
+            :class:`pi_codemode.CodemodeSandboxBase`. The tool's description, its prompt section, the scripts'
+            globals and the declarations they read follow ``sandbox.language``.
         namespaces: Groups of tools by name prefix, such as MCP servers, for the ``codemode`` section and tool search.
         inline_budget: Estimated tokens the tool declarations in the ``codemode`` section may use. Default 3000.
         models: Give scripts ``models.*``: the model catalog, classifiers, and image generation. Default ``True``.
@@ -352,17 +362,17 @@ def create_codemode_extension(
     budget = DEFAULT_CODEMODE_INLINE_BUDGET if inline_budget is None else inline_budget
 
     def render(input: PromptInput, _context: Context) -> str | None:
-        # Deferred tools are found with `search_tools()`, as the coding agent leaves them out too.
+        # Deferred tools are found with `searchTools()`, as the coding agent leaves them out too.
         tools = [
             tool
             for tool in input["agent"]["callable"]
             if not tool.name.startswith(CODEMODE_INTERNAL_PREFIX) and tool.deferred is not True
         ]
-        return codemode_section(tools, options.namespaces, budget)
+        return codemode_section(tools, options.namespaces, budget, options.dialect)
 
     return define_extension(
         "codemode",
-        tools=[_tool_of(options), *(create_model_tools() if models else [])],
+        tools=[_tool_of(options), *(create_model_tools(options.dialect) if models else [])],
         sections=[section("codemode", render)],
     )
 
@@ -440,6 +450,7 @@ class _CodemodeCall:
         from pi_ai.abort import AbortController
 
         self._options = options
+        self._dialect = options.dialect
         self._api = api
         self._context = context
         self._controller = AbortController()
@@ -478,10 +489,10 @@ class _CodemodeCall:
         #: Set once the call decided an outcome other than the script's own (divergence, mismatch) or failed.
         self._ended: ToolExecutionResult | None = None
         self._failure: BaseException | None = None
-        #: ``models.classify()``/``generate_images()`` calls in flight, and those waiting for a slot.
+        #: ``models.classify()``/``generateImages()`` calls in flight, and those waiting for a slot.
         self._model_calls = 0
         self._model_waiters: list[asyncio.Future[None]] = []
-        #: Images ``models.generate_images()`` returned, to notice a script that never shows them.
+        #: Images ``models.generateImages()`` returned, to notice a script that never shows them.
         self._generated_images = 0
         #: The script's tool calls for ``details``, by VM call ID.
         self._rows: dict[int, CodemodeNestedCall] = {}
@@ -516,7 +527,7 @@ class _CodemodeCall:
     # ─── the call ───────────────────────────────────────────────────────────
 
     async def execute(self, source: str) -> ToolExecutionResult:
-        parsed = parse_codemode_source(source)
+        parsed = parse_codemode_source(source, self._dialect.language)
         agent = await self._api.agent(self._context)
         parent = getattr(self._api, "telemetry_context", None)
         if not is_telemetry_enabled(parent):
@@ -592,8 +603,8 @@ class _CodemodeCall:
         for tool in agent["callable"]:
             declared: DeclaredTool = {
                 "name": tool.name,
-                "jsName": to_codemode_identifier(tool.name),
-                "description": sample_of(tool),
+                "jsName": to_codemode_identifier(tool.name, self._dialect.language),
+                "description": sample_of(tool, self._dialect),
             }
             if tool.structured_output_schema is not None:
                 declared["structured"] = True
@@ -601,9 +612,10 @@ class _CodemodeCall:
                 declared["hidden"] = True
             tools.append(declared)
         callable_ = [tool for tool in agent["callable"] if not tool.name.startswith(CODEMODE_INTERNAL_PREFIX)]
-        models = [] if not self._options.models else [*CATALOG_GLOBALS, *MODEL_CALLS]
+        dialect = self._dialect
+        models = [] if not self._options.models else [*dialect.catalog_globals, *model_calls(dialect)]
         globals_: list[StartGlobal] = [
-            *({"name": name, "spread": True} for name in DISCOVERY_GLOBALS),
+            *({"name": name, "spread": True} for name in dialect.discovery_globals),
             *({"name": name, "spread": True} for name in models),
             *({"name": global_.name, "spread": global_.spread is True} for global_ in self._options.globals),
         ]
@@ -813,6 +825,7 @@ class _CodemodeCall:
             calls=details["calls"],
             limits=_OUTPUT_LIMITS,
             write=self._output_files(),
+            dialect=self._dialect,
         )
         if formatted.full_output_path is not None:
             details["fullOutputPath"] = formatted.full_output_path
@@ -913,7 +926,7 @@ class _CodemodeCall:
     def _on_call(self, made: CodemodeHostCall) -> None:
         if self._stopped:
             return
-        call = _as_tool_call(made)
+        call = _as_tool_call(made, self._dialect)
         if call.target == "tool":
             self._started(call)
         self._issued = max(self._issued, call.id)
@@ -1168,8 +1181,9 @@ class _CodemodeCall:
         return {"calls": calls}
 
     async def _call_global(self, call: CodemodeHostCall) -> CodemodeOutcome:
-        discovery = call.name in DISCOVERY_GLOBALS
-        catalog = call.name in CATALOG_GLOBALS
+        dialect = self._dialect
+        discovery = call.name in dialect.discovery_globals
+        catalog = call.name in dialect.catalog_globals
         global_ = (
             None
             if discovery or catalog
@@ -1182,7 +1196,7 @@ class _CodemodeCall:
             if discovery:
                 value = self._discover(call)
             elif catalog:
-                value = await catalog_call(call.name, call.args, self._api.models, self._context)
+                value = await catalog_call(call.name, call.args, self._api.models, self._context, dialect)
             else:
                 assert global_ is not None
                 value = await global_.execute(call.args, self._api, self._context)
@@ -1211,7 +1225,9 @@ class _CodemodeCall:
         self._model_calls -= 1
 
     def _discover(self, call: CodemodeHostCall) -> Any:
-        """``search_tools()``, ``describe_tool()``, ``describe_namespace()``: answered from the start data."""
+        """``searchTools()``, ``describeTool()``, ``describeNamespace()``: answered from the start data."""
+        dialect = self._dialect
+        language = dialect.language
         namespaces = self._start["namespaces"]
         tools = [tool for tool in self._start["tools"] if tool.get("hidden") is not True]
 
@@ -1219,19 +1235,19 @@ class _CodemodeCall:
             return next((namespace for namespace in namespaces if name in namespace["tools"]), None)
 
         def matches_namespace(namespace: StartNamespace, query: str) -> bool:
-            return namespace["name"] == query or to_codemode_identifier(namespace["name"]) == to_codemode_identifier(
-                query
-            )
+            return namespace["name"] == query or to_codemode_identifier(
+                namespace["name"], language
+            ) == to_codemode_identifier(query, language)
 
-        if call.name == "describe_tool":
-            (name,) = bind_arguments(call.args, ("name",))
+        if call.name == dialect.describe_tool:
+            (name,) = dialect.bind(call.args, ("name",))
             if not isinstance(name, str):
-                raise RuntimeError("describe_tool() expects a tool name")
+                raise RuntimeError(f"{dialect.describe_tool}() expects a tool name")
             return next((tool["description"] for tool in tools if tool["name"] == name or tool["jsName"] == name), None)
-        if call.name == "describe_namespace":
-            (name,) = bind_arguments(call.args, ("name",))
+        if call.name == dialect.describe_namespace:
+            (name,) = dialect.bind(call.args, ("name",))
             if not isinstance(name, str):
-                raise RuntimeError("describe_namespace() expects a namespace name")
+                raise RuntimeError(f"{dialect.describe_namespace}() expects a namespace name")
             found = next((candidate for candidate in namespaces if matches_namespace(candidate, name)), None)
             if found is None:
                 return None
@@ -1240,17 +1256,18 @@ class _CodemodeCall:
                 described["description"] = found["description"]
             if "instructions" in found:
                 described["instructions"] = found["instructions"]
-            described["tools"] = [to_codemode_identifier(tool) for tool in found["tools"]]
+            described["tools"] = [to_codemode_identifier(tool, language) for tool in found["tools"]]
             return described
-        # search_tools(query, limit=8, namespace=None): the options as keyword arguments or one dict (upstream's).
+        # searchTools(query, { limit, namespace }); in Python search_tools(query, limit=8, namespace=None), the options
+        # as keyword arguments or one dict.
         values: list[Any] = list(call.args) if isinstance(call.args, list) else []
         query = values[0] if len(values) > 0 else None
         options: Any = values[1] if len(values) > 1 else None
-        if len(values) == 1 and isinstance(query, dict):
+        if language == "python" and len(values) == 1 and isinstance(query, dict):
             options = query
             query = cast("dict[str, Any]", query).get("query")
         if not isinstance(query, str):
-            raise RuntimeError("search_tools() expects a query string")
+            raise RuntimeError(f"{dialect.search_tools}() expects a query string")
         options_dict: dict[str, Any] = cast("dict[str, Any]", options) if isinstance(options, dict) else {}
         limit = options_dict.get("limit")
         if limit is None:
@@ -1261,10 +1278,10 @@ class _CodemodeCall:
             or (isinstance(limit, float) and not limit.is_integer())
             or limit <= 0
         ):
-            raise RuntimeError("search_tools() limit must be a positive integer")
+            raise RuntimeError(f"{dialect.search_tools}() limit must be a positive integer")
         namespace = options_dict.get("namespace")
         if namespace is not None and not isinstance(namespace, str):
-            raise RuntimeError("search_tools() namespace must be a string")
+            raise RuntimeError(f"{dialect.search_tools}() namespace must be a string")
         documents: list[SearchDocument] = []
         for tool in tools:
             own = namespace_of_tool(tool["name"])
@@ -1332,17 +1349,17 @@ class _CodemodeCall:
             await self._pump()
 
 
-def _as_tool_call(call: CodemodeHostCall) -> CodemodeHostCall:
-    """A script's call of ``models.classify()`` or ``models.generate_images()`` as the call of its internal tool."""
-    tool = MODEL_CALLS.get(call.name) if call.target == "global" else None
+def _as_tool_call(call: CodemodeHostCall, dialect: Dialect) -> CodemodeHostCall:
+    """A script's call of ``models.classify()`` or ``models.generateImages()`` as the call of its internal tool."""
+    tool = model_calls(dialect).get(call.name) if call.target == "global" else None
     if tool is None:
         return call
-    model, context = bind_arguments(call.args, ("model", "context"))
+    model, context = dialect.bind(call.args, ("model", "context"))
     return CodemodeHostCall(call.id, "tool", tool, {"model": model, "context": context})
 
 
 def _count_images(value: Any) -> int:
-    """Image blocks in a ``models.generate_images()`` result."""
+    """Image blocks in a ``models.generateImages()`` result."""
     output = value.get("output") if isinstance(value, dict) else None  # pyright: ignore[reportUnknownMemberType]
     if not isinstance(output, list):
         return 0

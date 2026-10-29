@@ -574,6 +574,8 @@ def test_resolves_settings_over_the_built_in_defaults() -> None:
         "contextRetentionMs": 600_000,
         "afterFailedRun": "keep",
         "restartLimit": 5,
+        "approvalTimeoutMs": 900_000,
+        "maxContinuations": 8,
     }
     assert resolve_settings({"restartLimit": 0})["restartLimit"] == 5
     assert resolve_settings({"restartLimit": math.inf})["restartLimit"] == math.inf

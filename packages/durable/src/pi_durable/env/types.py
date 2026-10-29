@@ -455,6 +455,8 @@ class ShellExecOptions(TypedDict, total=False):
     spill: ShellSpillOptions
     #: The caller keeps only this tail of the output, so the environment may omit output outside it.
     window: ShellOutputWindow
+    #: Written to the command's standard input, which is then closed; without it the command reads an empty input.
+    stdin: str | bytes
 
 
 class Shell(Protocol):

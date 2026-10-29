@@ -85,7 +85,20 @@ def _snapshot_of(view: ConversationView) -> SnapshotEvent:
     event["inbox"] = _queued(inbox)
     event["agent"] = agent if agent is not None else AgentDoc.definition.initial()
     event["usage"] = usage if usage is not None else UsageDoc.definition.initial()
+    event["approvals"] = _pending(view)
+    event["permissions"] = _permissions(view)
     return event
+
+
+def _pending(view: ConversationView) -> list[Any]:
+    """The conversation's approval requests waiting for a decision."""
+    approvals: Any = view["docs"].get("pi.approvals")
+    return [] if approvals is None else [request for request in approvals["requests"] if "decision" not in request]
+
+
+def _permissions(view: ConversationView) -> Any:
+    permissions = view["docs"].get("pi.permissions")
+    return {} if permissions is None else permissions
 
 
 def _queued(inbox: Any) -> list[dict[str, Any]]:
@@ -372,6 +385,12 @@ def _translate(
         events.append(
             {"type": "usage_changed", "usage": now_usage if now_usage is not None else UsageDoc.definition.initial()}
         )
+    if after["docs"].get("pi.approvals") is not before["docs"].get("pi.approvals"):
+        requests = _pending(after)
+        if requests != _pending(before):
+            events.append({"type": "approval_update", "requests": requests})
+    if after["docs"].get("pi.permissions") is not before["docs"].get("pi.permissions"):
+        events.append({"type": "permissions_changed", "permissions": _permissions(after)})
     for status in compactions:
         if not any(candidate["taskId"] == status["taskId"] for candidate in compactions_before):
             events.append(

@@ -1,6 +1,6 @@
 [project]
 name = "pi-ai-python"
-version = "1.7.0"
+version = "2.1.0"
 description = "Python port of pi's AI libraries: a unified LLM API (pi_ai) and a stateful agent runtime (pi_agent)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,8 +37,10 @@ pydantic = ["pydantic>=2.6"]
 bedrock = ["boto3>=1.43"]
 # Image processing for pi_durable's read tool (pi_durable.images, on Pillow).
 images = ["pillow>=11"]
-# Sandbox for pi_codemode scripts (pi_codemode.sandbox, on Monty).
-codemode = ["pydantic-monty>=1.2,<2"]
+# JavaScript sandbox for pi_codemode scripts (pi_codemode.CodemodeSandbox: QuickJS in wasm, on wasmtime).
+codemode = ["wasmtime>=49"]
+# Python sandbox for pi_codemode scripts (pi_codemode.MontyCodemodeSandbox, on Monty).
+codemode-python = ["pydantic-monty>=1.2,<2"]
 # OpenTelemetry adapter for pi_telemetry (pi_telemetry.otel).
 otel = ["opentelemetry-api>=1.28"]
 all = [
@@ -47,6 +49,7 @@ all = [
     "pydantic>=2.6",
     "boto3>=1.43",
     "pillow>=11",
+    "wasmtime>=49",
     "pydantic-monty>=1.2,<2",
     "opentelemetry-api>=1.28",
 ]
@@ -107,6 +110,7 @@ dev = [
     "boto3>=1.43",
     "pydantic>=2.9",
     "pillow>=11",
+    "wasmtime>=49",
     "pydantic-monty>=1.2,<2",
     "opentelemetry-api>=1.28",
     "opentelemetry-sdk>=1.28",

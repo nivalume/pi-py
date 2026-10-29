@@ -28,6 +28,7 @@
 - [压缩](#压缩)
 - [Agent 事件（实验性）](#agent-事件实验性)
 - [Hooks](#hooks)
+- [审批与权限](#审批与权限)
 - [更多会话与分叉](#更多会话与分叉)
 - [中止与子 Agent](#中止与子-agent)
 - [子任务](#子任务)
@@ -45,14 +46,15 @@
 ```bash
 pip install pi-ai-python    # 包含 pi_durable、pi_chord、pi_ai 和 pi_agent
 pip install "pi-ai-python[images]"    # 增加 Pillow，用于 read 工具的图像处理器
-pip install "pi-ai-python[codemode]"  # 增加 pydantic-monty，即代码模式的沙箱
+pip install "pi-ai-python[codemode]"         # 增加 wasmtime，用于代码模式的 JavaScript 沙箱（QuickJS）
+pip install "pi-ai-python[codemode-python]"  # 增加 pydantic-monty，用于代码模式的 Python 沙箱（Monty）
 ```
 
 要求 Python 3.11 或更高。一切都在 `asyncio` 上运行。
 
 ## 本移植包含的内容
 
-pi-durable 的核心：Session 及其存储（memory、SQLite、JSONL）、带内置生成/工具/压缩任务的 Harness、registry、扩展、你定义的工具、hooks、文档、子任务、任务图、视图、watch、agent 事件、本地执行环境，以及存储和环境一致性测试套件。还有 `pi_durable.tools` 的编码工具（`read`、`write`、`edit`、`bash`、`powershell` 和 `CodingTools` 扩展）、`pi_durable.tool_search` 的 `tool_search` 工具、位于 `pi_durable.images` 的基于 Pillow 的 `read` 图像处理器（`images` extra），以及 `pi_durable.codemode` 的代码模式扩展，其脚本是由 Monty 运行的 Python（`codemode` extra）。参见[工具](#工具)与[代码模式](#代码模式)。
+pi-durable 的核心：Session 及其存储（memory、SQLite、JSONL）、带内置生成/工具/压缩任务的 Harness、registry、扩展、你定义的工具、hooks、文档、子任务、任务图、视图、watch、agent 事件、本地执行环境，以及存储和环境一致性测试套件。还有 `pi_durable.tools` 的编码工具（`read`、`write`、`edit`、`bash`、`powershell` 和 `CodingTools` 扩展）、`pi_durable.tool_search` 的 `tool_search` 工具、位于 `pi_durable.images` 的基于 Pillow 的 `read` 图像处理器（`images` extra），以及 `pi_durable.codemode` 的代码模式扩展，其脚本默认是由 QuickJS 运行的 JavaScript，与上游一致（`codemode` extra），也可以改用由 Monty 运行的 Python（`codemode-python` extra）。参见[工具](#工具)与[代码模式](#代码模式)。
 
 尚未包含：Cloudflare 适配器（Durable Object SQLite 存储与 Workers 图像处理器）。
 
@@ -473,7 +475,12 @@ registry.install(create_tool_search_extension())
 
 ## 代码模式
 
-`pi_durable.codemode` 增加一个 `codemode` 工具：模型编写把会话的工具作为 `await tools.<name>(...)` 调用的 Python，运行在 Monty 沙箱（[`pi_codemode`](../codemode/README.md)）中。每次调用都是嵌套工具调用，只有脚本的输出到达模型。脚本在重启后存活：它从停下的地方恢复，而不会重新运行已完成的调用。这就是上游代码模式的 Python 脚本版而非 JavaScript；沙箱需要 `codemode` extra（`pip install "pi-ai-python[codemode]"`）。
+`pi_durable.codemode` 增加一个 `codemode` 工具：模型编写脚本，把会话的工具作为 `await tools.<name>(...)` 调用，脚本运行在 [`pi_codemode`](../codemode/README.md) 沙箱中。每次调用都是嵌套工具调用，只有脚本的输出到达模型。脚本在重启后存活：它从停下的地方恢复，而不会重新运行已完成的调用。
+
+沙箱决定脚本的语言，模型读到的一切都随之变化，因此一个会话只提供一种语言，不会两种都提供：
+
+- `CodemodeSandbox`（`codemode` extra）：在 QuickJS 中运行 JavaScript，即上游的代码模式本身：工具描述、提示段、TypeScript 声明、全局变量、错误信息和源码语法都与上游相同。
+- `MontyCodemodeSandbox`（`codemode-python` extra）：在 Monty 中运行 Python，环境相同，声明为 Python，全局变量为 snake_case。
 
 ```python
 from pi_codemode import CodemodeSandbox
@@ -481,26 +488,25 @@ from pi_durable.codemode import create_codemode_extension
 
 sandbox = CodemodeSandbox(memory_limit_bytes=256 * 1024 * 1024)
 registry.install(create_codemode_extension(sandbox=sandbox))
-# 一次带 {"code": 'return await tools.word_count(text="a b c")'} 的 codemode 调用回答 '{"words":3}'。
+# 一次带 {"code": 'return await tools.word_count({ text: "a b c" })'} 的 codemode 调用回答 '{"words":3}'。
 # 进程关闭时：await harness.close(context)，然后 await sandbox.close()。
 ```
 
 脚本是异步函数体，由模型作为工具的原始输入写出：
 
 ```text
-# @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
-import asyncio
-contents = await asyncio.gather(*[tools.read(path=path) for path in ["a.txt", "b.txt"]])
-print("read", len(contents), "files")
-found = await search_tools("github issues", limit=3)
-return [tool["name"] for tool in found]
+// @options: {"max_output_tokens": 4000, "timeout_ms": 60000}
+const contents = await Promise.all(["a.txt", "b.txt"].map((path) => tools.read({ path })));
+console.log("read", contents.length, "files");
+const found = await searchTools("github issues", { limit: 3 });
+return found.map((tool) => tool.name);
 ```
 
-该扩展还增加一个 `codemode` 提示段，以 Python 声明（`async def read(self, *, path: str) -> str`）的形式在 token 预算内（`inline_budget=`，默认 3000）列出脚本可以调用的工具；脚本用 `search_tools()`、`describe_tool()` 和 `describe_namespace()` 找到其他工具。用 `namespaces=[{"name": ..., "description": ..., "prefix": ...}]` 按名字前缀分组工具，例如一个 MCP 服务器的 `mcp__github__`。结果读起来像编码 agent 的：一个头部、脚本的输出，失败时还有已经做过的调用；超过 `max_output_tokens` 的文本被截断，完整文本在一个临时文件中。脚本还获得 `models.*`：模型目录、`models.classify()` 和 `models.generate_images()`，它们作为内部工具的嵌套调用运行（`models=False` 关闭它们）。脚本运行期间关闭沙箱（例如关闭时）不是一种结果：脚本用下一个进程的沙箱恢复。失败的嵌套调用会在脚本中抛出带错误文本的 `Exception`，除非工具声明了 schema 并随错误返回了自己的值：`tools.bash` 对非零退出也返回 `{"output": ..., "exitCode": ..., ...}`，因此脚本检查 `exitCode`。`store(key, value)` 和 `load(key)` 按会话保留 JSON 值；分叉在进入时看到它们当时的值。`pi_durable.codemode` 不导入沙箱：任何 `pi_codemode.CodemodeSandboxBase` 都可以。
+该扩展还增加一个 `codemode` 提示段，以声明（`read(args: { path: string; }): Promise<string>;`）的形式在 token 预算内（`inline_budget=`，默认 3000）列出脚本可以调用的工具；脚本用 `searchTools()`、`describeTool()` 和 `describeNamespace()` 找到其他工具。用 `namespaces=[{"name": ..., "description": ..., "prefix": ...}]` 按名字前缀分组工具，例如一个 MCP 服务器的 `mcp__github__`。结果读起来像编码 agent 的：一个头部、脚本的输出，失败时还有已经做过的调用；超过 `max_output_tokens` 的文本被截断，完整文本在一个临时文件中。脚本还获得 `models.*`：模型目录、`models.classify()` 和 `models.generateImages()`，它们作为内部工具的嵌套调用运行（`models=False` 关闭它们）。脚本运行期间关闭沙箱（例如关闭时）不是一种结果：脚本用下一个进程的沙箱恢复。失败的嵌套调用会以带错误文本和 `structuredOutput` 的 `Error` 拒绝，除非工具声明了 schema 并随错误返回了自己的值：`tools.bash` 对非零退出也返回 `{ output, exitCode, ... }`，因此脚本检查 `exitCode`。`store(key, value)` 和 `load(key)` 按会话保留 JSON 值；分叉在进入时看到它们当时的值。`pi_durable.codemode` 不导入沙箱：任何 `pi_codemode.CodemodeSandboxBase` 都可以。
 
-脚本全局变量是 snake_case，而上游是 camelCase；工具名不变（`tools.mcp__github__list_issues`，以及内部工具 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`）：
+使用 `MontyCodemodeSandbox` 时，同样的脚本写成 Python，全局变量是 snake_case；工具名不变（`tools.mcp__github__list_issues`，以及内部工具 `pi.codemode.models.classify` 和 `pi.codemode.models.generateImages`）：
 
-| 上游（JavaScript） | 这里（Python） |
+| JavaScript（`CodemodeSandbox`，上游） | Python（`MontyCodemodeSandbox`） |
 | --- | --- |
 | `// @options: {...}` | `# @options: {...}` |
 | `await tools.read({ path })` | `await tools.read(path=...)` 或 `await tools.read({"path": ...})` |
@@ -514,10 +520,11 @@ return [tool["name"] for tool in found]
 | `models.classify(model, context)` | `models.classify(model, context)` |
 | `models.generateImages(model, context)` | `models.generate_images(model, context)` |
 | `undefined`（缺失值） | `None` |
+| 失败调用的 `error.structuredOutput` | 不可见：Monty 的异常只携带消息 |
 
-目录项、分类器和图像上下文以及模型结果都是 pi-ai 的 JSON，键为 camelCase（`result["stopReason"]`、`{"type": "image", "data": ..., "mimeType": ...}`）。Monty 中的异常只携带消息，因此上游附加到失败调用错误上的 `structuredOutput` 对脚本不可见。返回 `None` 的脚本不会给输出增加任何值，因为 Python 无法区分 `return None` 和没有 `return`。
+在两种语言中，目录项、分类器和图像上下文以及模型结果都是 pi-ai 的 JSON，键为 camelCase（`result.stopReason`、`{ type: "image", data, mimeType }`）。返回 `null` 或 `undefined`（`None`）的脚本不会给输出增加任何值。
 
-它如何在重启后存活：沙箱确定性运行脚本（虚拟时钟、带种子的随机数、UTC），工具在把每个结果交给脚本之前把它写入日志（journal）。重启后，工具再次运行脚本，并按相同顺序把日志化的结果交给它，因此它用相同参数做相同调用；这些按 key 重新挂到它们的嵌套调用上，然后脚本继续。当脚本走了与之前不同的路径、沙箱指纹或代码模式版本变化、或它的 `timeout_ms` 期间已过时，重跑会以错误结束调用。重启时正在运行的嵌套调用遵循它自己的重放策略。run 和 journal 文档保持上游的格式，但一个 run 不能在语言间移动：在这里恢复的 TypeScript run（或反之）以“the sandbox changed since it started”结束，因为脚本、全局变量名和沙箱指纹都不同。
+它如何在重启后存活：沙箱确定性运行脚本（虚拟时钟、带种子的随机数、UTC），工具在把每个结果交给脚本之前把它写入日志（journal）。重启后，工具再次运行脚本，并按相同顺序把日志化的结果交给它，因此它用相同参数做相同调用；这些按 key 重新挂到它们的嵌套调用上，然后脚本继续。当脚本走了与之前不同的路径、沙箱指纹或代码模式版本变化、或它的 `timeout_ms` 期间已过时，重跑会以错误结束调用。重启时正在运行的嵌套调用遵循它自己的重放策略。run 和 journal 文档保持上游的格式。一个 run 不能在语言间移动：用 `CodemodeSandbox` 开始、用 `MontyCodemodeSandbox` 恢复的 run（或反之）以“the sandbox changed since it started”结束，因为脚本、全局变量名和沙箱指纹都不同。JavaScript run 报告的指纹与上游沙箱相同。
 
 ## 系统提示
 
@@ -574,6 +581,7 @@ def settings():
         "contextRetentionMs": 600_000,  # 空闲会话的上下文在内存中保留这么久
         "documentRetentionMs": 600_000,  # 无人观察的已加载文档在最后一次使用后于内存中保留这么久
         "followUpMode": user_settings["followUpMode"],
+        "approvalTimeoutMs": 900_000,  # 审批请求等待决定的时长
     }
 
 
@@ -771,7 +779,7 @@ settings = {
 from pi_durable import watch_events
 
 stream = await watch_events(harness, root.id, context)
-print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, ...
+print(sorted(stream.snapshot))  # entries, tools, nestedTools, compactions, inbox, agent, usage, approvals, ...
 
 
 def on_events(events, context):
@@ -810,10 +818,58 @@ registry.install(Guard)
 ```
 
 - **Generation：** `before_request(request, api, context)`（替换一次请求的消息）、`after_response(message, api, context)`、`on_yield(answer, api, context)`（用另一条用户消息继续 run）和 `after_tools(assistant_entry_id, result_entry_ids, api, context)`（一轮的工具做完后运行一次）。
-- **Tools：** `before_tool(call, api, context)`（阻塞，或重写 `arguments`）和 `after_tool(call, result, api, context)`（替换结果）。
+- **Tools：** `before_tool(call, api, context)`（阻塞、重写 `arguments`，或要求审批；见[审批与权限](#审批与权限)）和 `after_tool(call, result, api, context)`（替换结果）。
 - **Compaction：** `before_compact(compaction, api, context)`（拒绝，或提供摘要）。
 
 要把 hook 限制到某些会话，只在那里选择它的扩展，例如 `configure({"extensions": {"add": [Guard]}})`。
+
+## 审批与权限
+
+审批策略按每次工具调用决定它直接运行、被拒绝，还是等人审批。这是对上游的补充，移植自 delta（pi 的 Rust 实现），delta 把 Codex 的审批流程做成了持久化的。用 `approval` 传入；不传时每个调用都直接运行，与上游相同：
+
+```python
+from pi_durable import PermissionDefaults, RulesPolicy
+
+policy = RulesPolicy(
+    PermissionDefaults(
+        mode="default",
+        rules={"allow": ["Bash(git status:*)", "Bash(cargo test:*)"], "deny": ["Read(./.env)", "Bash(rm *)"]},
+    )
+)
+harness = await Harness.open(storage, {"models": models, "registry": registry, "env": env, "approval": policy}, context)
+```
+
+策略要求审批时，工具调用把一个带截止时间的请求提交到会话的 `pi.approvals` 文档，然后在它的 `approval` 阶段等待。UI 列出请求并做决定：
+
+```python
+for request in await root.pending_approvals(context):
+    print(request["name"], request["arguments"], request.get("prompt"), request.get("proposedRule"))
+    await root.decide(request["id"], {"type": "approved"}, context)
+```
+
+| 决定 | 效果 |
+|---|---|
+| `{"type": "approved"}` | 调用以请求中的参数运行。 |
+| `{"type": "approvedForSession"}` | 另外，本会话中同一工具、同一审批键（默认是参数的 JSON）的后续调用不再询问。 |
+| `{"type": "approvedWithRule", "rule": "Bash(git push:*)"}` | 另外，该规则加入会话级（session）允许规则（`harness.permission_rules()`），对所有会话生效。 |
+| `{"type": "denied", "rejection": "..."}` | 调用以 `Tool call blocked: approval denied: ...` 结束。 |
+| `{"type": "abort"}` | 中止会话的 run。 |
+
+无人决定的请求在 `settings["approvalTimeoutMs"]`（15 分钟）或策略给出的 `timeoutMs` 之后超时，调用以 `Tool call blocked: approval timed out after <n>s` 结束。`harness.decide(id, decision, context)` 在调用所在的会话里做决定，`harness.pending_approvals(context)` 列出所有会话的请求。决定及其 `pi.approval` 条目（仅用于展示，从不进入模型上下文）先提交，再通知等待中的调用，所以任何时刻重启都只留下一个结果：进程停止时正在等待的调用会重新等待到存储的截止时间，并读取停机期间做出的决定。`decide()` 会抛出 `ApprovalNotPending`、`UnknownApproval`、`InvalidDecision`（`timedOut` 只能由 Harness 写入）或 `RuleError`。
+
+**规则**使用 Claude Code 的语法。`Bash(<command>)` 匹配命令：`*` 匹配任意文本，结尾的 ` *` 或 `:*` 也匹配不带参数的命令（`Bash(npm run test:*)`）。命令在引号外的 `&&`、`||`、`;`、`|`、`&` 和换行处拆分，并去掉开头的 `NAME=value` 赋值和 `timeout`、`nohup` 等包装命令；拒绝或询问规则在任一部分匹配时生效，允许规则要求每一部分都被允许。`Read(<path>)` 匹配调用读取的路径，`Edit(<path>)` 和 `Write(<path>)` 匹配写入的路径：`//abs/path`、`~/path`、`/path`（相对 `PermissionDefaults.root`）、`./path` 或 `path`（相对调用的工作目录），支持 `*`、`**` 和 `?`；路径匹配模式本身或其下的任何内容，`Read` 拒绝规则也覆盖写入。其他不带括号的名字指工具（`deploy`）。
+
+**模式**决定没有规则时什么可以直接运行：`default`（工作目录和 `directories` 内的读取直接运行，其余询问）、`acceptEdits`（那里的写入也直接运行）、`plan`（拒绝命令和写入）、`dontAsk`（本该询问的都拒绝）、`bypassPermissions`（全部运行）。任何模式下都先看拒绝规则，再看询问规则。每个会话在 `pi.permissions` 里有自己的模式、规则和目录，分叉会复制，被拥有的会话会继承：
+
+```python
+await root.set_permission_mode("plan", context)
+await root.update_permissions({"add": {"allow": ["Bash(make *)"]}, "directories": ["/data"]}, context)
+print(await root.permissions(context))  # {"mode": "plan", "directories": ["/data"], "rules": {"allow": ["Bash(make *)"]}}
+```
+
+调用用于匹配的是其工具的 `permission_subject(args, env, context)`：`bash` 和 `powershell` 是命令，`read`、`write`、`edit` 是绝对路径。自定义工具可以用 `define_tool(..., permission_subject=...)` 提供（参数是 `path` 时用 `pi_durable.tools.path_subject("write")`），用 `approval_key=` 改变会话授权匹配的键。`before_tool` hook 可以返回 `{"permission": "ask", "reason": "..."}`，无论策略怎么说都询问；或返回 `{"permission": "allow"}`，跳过模式本会要求的询问（拒绝和询问规则仍然生效）。
+
+自定义策略是任何带 `decide(call, api, context)` 方法的对象，返回 `{"type": "allow"}`、`{"type": "deny", "reason": ...}` 或 `{"type": "ask", "timeoutMs"?, "prompt"?, "proposedRule"?}`；内置 `AllowAll`、`AskAll` 和 `DenyAll(reason)`。策略抛出异常时调用被拒绝。Agent 事件携带待审批请求（`approval_update`）和 `pi.permissions`（`permissions_changed`），快照里有 `approvals` 和 `permissions`。
 
 ## 更多会话与分叉
 
@@ -1104,7 +1160,8 @@ print(sorted({span.name for span in telemetry.get_spans()}))
 - **存储和环境模块**：`openNodeSqliteStorage` 是 `open_sqlite_storage`（在 `sqlite3` 上），`openNodeJsonlStorage` 是 `open_local_jsonl_storage`，`NodeExecutionEnv` 是 `LocalExecutionEnv`（id `"local"`），`Storage.entry(conversationId, id)` 是 `visible_entry()`，`FileSystem.list_files()` 是可能返回 `not_supported` 的必需方法。一致性套件用 pytest 注册。
 - **二进制数据**是 `bytes`；ID 是普通 `int`（`TaskId`、`EntryId` 等是类型检查器品牌）。
 - **工具与图像**：`createCodingTools({ images })` 是 `create_coding_tools(images=...)`，`createBashTool({ commandPrefix, prepare })` 是 `create_bash_tool(command_prefix=..., prepare=...)`（`prepare` 改变 `BashExecution` dict 的 `command`、`cwd`、`env` 和 `inheritEnv`），`createNodePhotonImages()` 是 `create_pillow_images()`，用 Pillow 而非 Photon，在无空闲超时的工作线程中。`read` 对 `offset` 和 `limit` 保留 JavaScript 的数字语义，因此分数、负数和巨大的值会选择并打印相同的行。
-- **代码模式**在 Monty 中运行 Python 脚本而非 QuickJS 中的 JavaScript：`createCodemodeExtension({ sandbox })` 是 `create_codemode_extension(sandbox=...)`，脚本全局变量是 snake_case（`search_tools()`、`models.generate_images()`），一种语言日志化的 run 不会在另一种中恢复（见[代码模式](#代码模式)）。
+- **代码模式**像上游一样在 QuickJS 中运行 JavaScript，只是跑在 wasmtime 上而不是 worker 线程里；`createCodemodeExtension({ sandbox })` 是 `create_codemode_extension(sandbox=...)`。在 Monty 中运行 Python 脚本是新增的：使用 `MontyCodemodeSandbox` 时脚本全局变量是 snake_case（`search_tools()`、`models.generate_images()`），一种语言日志化的 run 不会在另一种中恢复（见[代码模式](#代码模式)）。
+- **审批与权限**是来自 delta 的新增功能：`HarnessOptions.approval`、`Conversation.decide()`、`pi.approvals`、`pi.permissions` 和 `pi.permission-rules` 文档，以及工具任务的 `approval` 阶段（见[审批与权限](#审批与权限)）。不配置策略时，工具调用的行为与上游相同。
 - **尚未移植**：Cloudflare 适配器（见[本移植包含的内容](#本移植包含的内容)）。
 
 ## 设计说明

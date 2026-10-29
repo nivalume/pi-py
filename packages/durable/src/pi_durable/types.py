@@ -403,8 +403,9 @@ class ReportTask(TypedDict):
     conversationId: ReadOnly[ConversationId]
 
 
-#: A host callback, by its ``HarnessOptions`` name; ``env`` is the environment builder, ``models`` a provider call.
-HostCallback: TypeAlias = Literal["now", "settings", "registry", "env", "models", "setTimer", "onWake"]
+#: A host callback, by its ``HarnessOptions`` name; ``env`` is the environment builder, ``models`` a provider call,
+#: ``approval`` the approval policy.
+HostCallback: TypeAlias = Literal["now", "settings", "registry", "env", "models", "setTimer", "onWake", "approval"]
 
 
 class ReportInfoSessionFailed(TypedDict):

@@ -1,11 +1,12 @@
 """What the model reads about code mode (port of ``codemode/describe.ts``).
 
 The tool's fixed description (the script environment and its globals), and the ``codemode`` prompt section, which
-lists the tools scripts can call as Python declarations (``pi_codemode.render_tool_sample``), grouped by namespace
-and limited to a token budget. Tools that do not fit are found with ``search_tools()``. The section renders from the
+lists the tools scripts can call with their declarations (``pi_codemode.render_tool_sample``), grouped by namespace
+and limited to a token budget. Tools that do not fit are found with ``searchTools()``. The section renders from the
 conversation's callable tools, so it changes with them; the tool's description never does.
 
-Upstream's text describes JavaScript scripts; this one describes the same environment for Python scripts.
+Both follow the sandbox's language: upstream's text and TypeScript declarations for JavaScript scripts, the same
+environment described for Python with Python declarations (see :mod:`.dialect`).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from pi_codemode.declarations import render_tool_sample
 from pi_codemode.identifier import to_codemode_identifier
 from pi_codemode.types import CodemodeToolDeclaration
 
-from .models import MODELS_DESCRIPTION
+from .dialect import JAVASCRIPT, Dialect
 
 if TYPE_CHECKING:
     from typing_extensions import ReadOnly
@@ -55,29 +56,14 @@ _CHARS_PER_TOKEN: Final = 4
 
 _TEXT_OUTPUT_SCHEMA: Final = {"type": "string"}
 
-_DESCRIPTION_INTRO: Final = """Run Python that calls other tools. The input is raw Python (not JSON, no code fence), run as the body of an async function in a Monty sandbox: top-level `await` and `return` work. No file system, network, subprocesses, or host modules; standard modules such as `json`, `re`, `math`, `datetime`, and `asyncio` can be imported.
-- `await tools.<name>(key=value, ...)` returns a string, or a dict if the tool's declaration says so, and raises an Exception with the error text on failure. A tool whose declaration returns a dict returns on failure too when it returned that dict; check its fields. Calls start when made, so `await asyncio.gather(...)` (after `import asyncio`) runs several at once. Calls still running when the script ends are cancelled.
-- The script survives a restart: it resumes where it was, without running finished calls again.
-- Optional first line: `# @options: {"max_output_tokens": 10000, "timeout_ms": 60000}`"""
 
-
-def codemode_description(models: bool) -> str:
+def codemode_description(models: bool, dialect: Dialect = JAVASCRIPT) -> str:
     """The code mode tool's description: the script environment and its globals, the same for every conversation."""
-    globals_ = [
-        "Globals:",
-        "- `text(value)`, `image(data_url_or_image_block)`, `print(...)`, and top-level `return` add output; `exit()` "
-        "ends the script. With several text items, each starts with a `==> text N/M <==` line, and `print` lines "
-        "follow the other output in one `<console_output>` block. `image()` also saves the image to a temp file and "
-        "the result names its path.",
-        "- `store(key, value)` and `load(key)` keep JSON values across codemode calls.",
-        "- `ALL_TOOLS`, `await search_tools(query, limit=8, namespace=None)`, `await describe_tool(name)`, "
-        "`await describe_namespace(name)`: find tools the `codemode` section does not list.",
-    ]
     return "\n\n".join(
         [
-            _DESCRIPTION_INTRO,
-            "\n".join(globals_),
-            *([MODELS_DESCRIPTION] if models else []),
+            dialect.description_intro,
+            "\n".join(["Globals:", *dialect.globals_lines]),
+            *([dialect.models_description] if models else []),
             "The `codemode` section of the system prompt lists the tools scripts can call, by namespace, as far as "
             "space allows.",
         ]
@@ -96,9 +82,9 @@ def declaration_of(tool: ToolRegistration) -> CodemodeToolDeclaration:
     )
 
 
-def sample_of(tool: ToolRegistration) -> str:
-    """``toolSample`` of a tool: its description and Python declaration."""
-    return render_tool_sample(declaration_of(tool))
+def sample_of(tool: ToolRegistration, dialect: Dialect = JAVASCRIPT) -> str:
+    """``toolSample`` of a tool: its description and declaration (TypeScript, or Python for Python scripts)."""
+    return render_tool_sample(declaration_of(tool), language=dialect.language)
 
 
 def namespace_of(name: str, namespaces: Sequence[CodemodeNamespace]) -> CodemodeNamespace | None:
@@ -110,11 +96,11 @@ def namespace_of(name: str, namespaces: Sequence[CodemodeNamespace]) -> Codemode
     return found
 
 
-def _render_tool_section(tool: ToolRegistration) -> str:
+def _render_tool_section(tool: ToolRegistration, dialect: Dialect) -> str:
     """``### `id` (`raw name`)`` followed by the tool's description and declaration."""
-    id = to_codemode_identifier(tool.name)
+    id = to_codemode_identifier(tool.name, dialect.language)
     heading = f"### `{id}`" if id == tool.name else f"### `{id}` (`{tool.name}`)"
-    return f"{heading}\n{sample_of(tool).strip()}"
+    return f"{heading}\n{sample_of(tool, dialect).strip()}"
 
 
 @dataclass(slots=True)
@@ -163,7 +149,10 @@ def _group_order(group: _CatalogGroup) -> tuple[int, str]:
 
 
 def codemode_section(
-    tools: Sequence[ToolRegistration], namespaces: Sequence[CodemodeNamespace], budget: float
+    tools: Sequence[ToolRegistration],
+    namespaces: Sequence[CodemodeNamespace],
+    budget: float,
+    dialect: Dialect = JAVASCRIPT,
 ) -> str | None:
     """The ``codemode`` section: the tools scripts can call, grouped by namespace, with their declarations as far as
     the budget allows. ``None`` without callable tools."""
@@ -177,12 +166,12 @@ def codemode_section(
         if group is None:
             group = _CatalogGroup(namespace)
             groups[key] = group
-        section = _render_tool_section(tool)
+        section = _render_tool_section(tool, dialect)
         group.entries.append(_CatalogEntry(tool.name, section, math.ceil(len(section) / _CHARS_PER_TOKEN)))
     ordered = sorted(groups.values(), key=_group_order)
     shown = _select_catalog(ordered, budget)
 
-    tool_sections = ["Tools scripts can call (`await tools.<name>(...)`):"]
+    tool_sections = [dialect.section_header]
     for group in ordered:
         entries = group.entries
         if len(entries) == 0:
@@ -200,6 +189,6 @@ def codemode_section(
             description = (namespace.get("description") or "").strip()
             tool_sections.append(f"## {namespace['name']}{listing}" + (f"\n{description}" if description else ""))
         elif len(visible) < len(entries):
-            tool_sections.append("Some tools are not listed: find them with `search_tools()`.")
+            tool_sections.append(dialect.not_listed)
         tool_sections.extend(entry.section for entry in visible)
     return "\n\n".join(tool_sections)

@@ -1,6 +1,12 @@
-"""Codemode source format: Python, optionally preceded by one options line (port of ``source.ts``).
+"""Codemode source format: a script, optionally preceded by one options line (port of ``source.ts``).
 
-::
+JavaScript, as upstream's::
+
+    // @options: {"max_output_tokens": 2000, "timeout_ms": 30000}
+    const source = await tools.read({ path: "package.json" });
+    text(JSON.parse(source).name);
+
+Python (``language="python"``)::
 
     # @options: {"max_output_tokens": 2000, "timeout_ms": 30000}
     source = await tools.read(path="pyproject.toml")
@@ -16,16 +22,25 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from .language import CodemodeLanguage, check_codemode_language
+
 __all__ = [
     "CODEMODE_OPTIONS_PREFIX",
     "CODEMODE_SOURCE_GRAMMAR",
+    "PYTHON_CODEMODE_OPTIONS_PREFIX",
+    "PYTHON_CODEMODE_SOURCE_GRAMMAR",
     "CodemodeSourceError",
     "CodemodeSourceOptions",
     "ParsedCodemodeSource",
+    "codemode_options_prefix",
+    "codemode_source_grammar",
     "parse_codemode_source",
 ]
 
-CODEMODE_OPTIONS_PREFIX: Final = "# @options:"
+#: The options line of a JavaScript script, as upstream's.
+CODEMODE_OPTIONS_PREFIX: Final = "// @options:"
+#: The options line of a Python script.
+PYTHON_CODEMODE_OPTIONS_PREFIX: Final = "# @options:"
 
 _SUPPORTED_FIELDS: Final = ("max_output_tokens", "timeout_ms")
 _SUPPORTED_FIELDS_TEXT: Final = "`max_output_tokens` and `timeout_ms`"
@@ -33,9 +48,20 @@ _SUPPORTED_FIELDS_TEXT: Final = "`max_output_tokens` and `timeout_ms`"
 _MAX_TIMEOUT_MS: Final = 2_147_483_647
 _MAX_SAFE_INTEGER: Final = 2**53 - 1
 
-#: Lark grammar for providers with grammar-constrained tool input. It only fixes the shape of the
-#: options line; the options JSON and the code are checked by :func:`parse_codemode_source`.
+#: Lark grammar for providers with grammar-constrained tool input, upstream's, for JavaScript scripts. It only fixes
+#: the shape of the options line; the options JSON and the code are checked by :func:`parse_codemode_source`.
 CODEMODE_SOURCE_GRAMMAR: Final = r"""
+start: options_source | plain_source
+options_source: OPTIONS_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+OPTIONS_LINE: /[ \t]*\/\/ @options:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"""
+
+#: :data:`CODEMODE_SOURCE_GRAMMAR` for Python scripts.
+PYTHON_CODEMODE_SOURCE_GRAMMAR: Final = r"""
 start: options_source | plain_source
 options_source: OPTIONS_LINE NEWLINE SOURCE
 plain_source: SOURCE
@@ -44,6 +70,22 @@ OPTIONS_LINE: /[ \t]*# @options:[^\r\n]*/
 NEWLINE: /\r?\n/
 SOURCE: /[\s\S]+/
 """
+
+_LANGUAGE_NAMES: Final = {"javascript": ("JavaScript", "JS"), "python": ("Python", "Python")}
+
+
+def codemode_options_prefix(language: CodemodeLanguage = "javascript") -> str:
+    """The options line's prefix in ``language``: ``// @options:`` or ``# @options:``."""
+    return (
+        CODEMODE_OPTIONS_PREFIX if check_codemode_language(language) == "javascript" else PYTHON_CODEMODE_OPTIONS_PREFIX
+    )
+
+
+def codemode_source_grammar(language: CodemodeLanguage = "javascript") -> str:
+    """The Lark grammar of the source format in ``language``."""
+    return (
+        CODEMODE_SOURCE_GRAMMAR if check_codemode_language(language) == "javascript" else PYTHON_CODEMODE_SOURCE_GRAMMAR
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -106,30 +148,33 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not valid JSON")
 
 
-def parse_codemode_source(source: str) -> ParsedCodemodeSource:
-    """Split an optional first-line ``# @options: {...}`` from the script.
+def parse_codemode_source(source: str, language: CodemodeLanguage = "javascript") -> ParsedCodemodeSource:
+    """Split an optional first-line options line (``// @options: {...}``, in Python ``# @options: {...}``) from the
+    script.
 
     Raises :class:`CodemodeSourceError` for empty input, invalid options, an options line
     without code after it, and an options line that is not the first line, which would
     otherwise be ignored without notice.
     """
+    prefix = codemode_options_prefix(language)
+    name, short = _LANGUAGE_NAMES[language]
     if source.strip() == "":
         raise CodemodeSourceError(
-            "Expected Python source text (non-empty). Provide Python only, optionally with a first line "
-            '`# @options: {"max_output_tokens": 1000}`.'
+            f"Expected {name} source text (non-empty). Provide {short} only, optionally with a first line "
+            f'`{prefix} {{"max_output_tokens": 1000}}`.'
         )
     lines = source.split("\n")
     for index, line in enumerate(lines):
-        if index > 0 and line.lstrip().startswith(CODEMODE_OPTIONS_PREFIX):
+        if index > 0 and line.lstrip().startswith(prefix):
             raise CodemodeSourceError(
-                f"The {CODEMODE_OPTIONS_PREFIX} line must be the first line of the input; found one on line {index + 1}"
+                f"The {prefix} line must be the first line of the input; found one on line {index + 1}"
             )
     first_line = re.sub(r"\r$", "", lines[0])
     trimmed = first_line.lstrip()
-    if not trimmed.startswith(CODEMODE_OPTIONS_PREFIX):
+    if not trimmed.startswith(prefix):
         return ParsedCodemodeSource(code=source)
     newline = source.find("\n")
     code = "" if newline == -1 else source[newline:]
     if code.strip() == "":
-        raise CodemodeSourceError("The @options line must be followed by Python source on subsequent lines")
-    return ParsedCodemodeSource(code=code, options=_parse_options(trimmed[len(CODEMODE_OPTIONS_PREFIX) :].strip()))
+        raise CodemodeSourceError(f"The @options line must be followed by {name} source on subsequent lines")
+    return ParsedCodemodeSource(code=code, options=_parse_options(trimmed[len(prefix) :].strip()))

@@ -1,4 +1,5 @@
-"""The README's "Using with pi-agent-core", as :func:`pi_codemode.create_codemode_tool`, driven by pi_ai's faux provider."""
+"""The README's "Using with pi-agent-core", as :func:`pi_codemode.create_codemode_tool`, driven by pi_ai's faux provider,
+for JavaScript (the default) and Python scripts."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from pi_ai import (
     faux_text,
     faux_tool_call,
 )
-from pi_codemode import CodemodeSandbox, create_codemode_tool
+from pi_codemode import MontyCodemodeSandbox, create_codemode_tool
 
 PNG = "iVBORw0KGgo="
 
@@ -67,9 +68,71 @@ async def run_agent(tool: AgentTool, script: str) -> ToolResultMessage:
     return results[0]
 
 
-async def test_a_model_runs_a_script_that_calls_the_agents_tools() -> None:
+async def test_a_model_runs_a_javascript_script_that_calls_the_agents_tools() -> None:
     reads: list[Any] = []
     tool = create_codemode_tool([read_tool(reads), count_tool()])
+    assert tool.name == "codemode"
+    assert tool.description == "\n".join(
+        [
+            "Run JavaScript that calls tools as `await tools.<name>(args)`. Output with text() or return.",
+            "",
+            "declare const tools: {",
+            "  /** Read a file */",
+            "  read(args: {",
+            "  // Path to read",
+            "  path: string;",
+            "}): Promise<string>;",
+            "  /** Count things */",
+            "  count(args: {",
+            "  // @integer",
+            "  n: number;",
+            "}): Promise<{",
+            "  // @integer",
+            "  count: number;",
+            "}>;",
+            "};",
+        ]
+    )
+
+    result = await run_agent(
+        tool,
+        '// @options: {"timeout_ms": 30000}\n'
+        'const source = await tools.read({ path: "package.json" });\n'
+        'text("lines " + source.split("\\n").length);\n'
+        f'image("data:image/png;base64,{PNG}");\n'
+        "const counted = await tools.count({ n: 21 });\n"
+        'return [source.split("\\n")[0], counted];',
+    )
+    assert result.is_error is False
+    assert [type(block).__name__ for block in result.content] == ["TextContent", "ImageContent", "TextContent"]
+    assert getattr(result.content[0], "text", None) == "lines 2"
+    assert getattr(result.content[2], "text", None) == '["[project]",{"count":42}]'
+    assert reads == [{"path": "package.json"}]
+
+
+async def test_failed_javascript_scripts_and_nested_calls_are_errors_the_model_sees() -> None:
+    tool = create_codemode_tool([read_tool([]), count_tool()])
+    failed = await run_agent(
+        tool,
+        'try { await tools.count({ n: -1 }) } catch (error) { text("caught " + error.message) }\n'
+        'try { await tools.read() } catch (error) { text("invalid: " + error.message.split("\\n")[0]) }\n'
+        'try { await tools.read("a") } catch (error) { text(error.message) }\n'
+        'throw new RangeError("boom")',
+    )
+    assert failed.is_error is True
+    texts = [getattr(block, "text", "") for block in failed.content]
+    assert texts[:3] == [
+        "caught negative",
+        'invalid: Validation failed for tool "read":',
+        "tools.read() takes one object of arguments, not a string",
+    ]
+    assert texts[3].startswith("RangeError: boom\n    at ")
+    assert "codemode.js:4" in texts[3]
+
+
+async def test_a_model_runs_a_python_script_that_calls_the_agents_tools() -> None:
+    reads: list[Any] = []
+    tool = create_codemode_tool([read_tool(reads), count_tool()], language="python")
     assert tool.name == "codemode"
     assert tool.description.endswith(
         "\n".join(
@@ -104,8 +167,8 @@ async def test_a_model_runs_a_script_that_calls_the_agents_tools() -> None:
     assert reads == [{"path": "pyproject.toml"}]
 
 
-async def test_failed_scripts_and_nested_calls_are_errors_the_model_sees() -> None:
-    tool = create_codemode_tool([read_tool([]), count_tool()])
+async def test_failed_python_scripts_and_nested_calls_are_errors_the_model_sees() -> None:
+    tool = create_codemode_tool([read_tool([]), count_tool()], language="python")
     failed = await run_agent(
         tool,
         "try:\n    await tools.count(n=-1)\nexcept Exception as error:\n    text('caught ' + str(error))\n"
@@ -121,9 +184,20 @@ async def test_failed_scripts_and_nested_calls_are_errors_the_model_sees() -> No
 
 
 async def test_invalid_source_is_reported_without_running_anything() -> None:
-    result = await run_agent(create_codemode_tool([]), "text(1)\n# @options: {}")
+    result = await run_agent(create_codemode_tool([]), "text(1)\n// @options: {}")
     assert result.is_error is True
-    assert "must be the first line" in getattr(result.content[0], "text", "")
+    assert "The // @options: line must be the first line" in getattr(result.content[0], "text", "")
+    result = await run_agent(create_codemode_tool([], language="python"), "text(1)\n# @options: {}")
+    assert result.is_error is True
+    assert "The # @options: line must be the first line" in getattr(result.content[0], "text", "")
+
+
+async def test_a_sandbox_of_the_other_language_is_refused() -> None:
+    tool = create_codemode_tool([], sandbox=lambda tools: MontyCodemodeSandbox(tools=tools))
+    with pytest.raises(ValueError, match="runs python scripts, but the codemode tool is for javascript"):
+        await tool.execute("call-1", {"code": "return 1"})
+    with pytest.raises(ValueError, match="Unknown code mode language"):
+        create_codemode_tool([], language="ruby")  # type: ignore[arg-type]
 
 
 async def test_a_shared_pool_serves_every_call() -> None:
@@ -131,14 +205,14 @@ async def test_a_shared_pool_serves_every_call() -> None:
     from pydantic_monty import AsyncMonty
 
     async with AsyncMonty(max_processes=1) as pool:
-        made: list[CodemodeSandbox] = []
+        made: list[MontyCodemodeSandbox] = []
 
-        def factory(tools: Any) -> CodemodeSandbox:
-            sandbox = CodemodeSandbox(tools=tools, pool=pool)
+        def factory(tools: Any) -> MontyCodemodeSandbox:
+            sandbox = MontyCodemodeSandbox(tools=tools, pool=pool)
             made.append(sandbox)
             return sandbox
 
-        tool = create_codemode_tool([read_tool([])], sandbox=factory)
+        tool = create_codemode_tool([read_tool([])], language="python", sandbox=factory)
         result = await run_agent(tool, "return (await tools.read(path='a')).splitlines()[1]")
         assert getattr(result.content[0], "text", None) == "\"name = 'a'\""
         assert len(made) == 1 and made[0].closed

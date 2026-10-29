@@ -18,6 +18,7 @@ from .env import require_env
 if TYPE_CHECKING:
     from pi_chord.context import Context
 
+    from ..approval import PermissionSubject
     from ..harness.types import ToolDiagnostic, ToolExecutionApi, ToolExecutionResult, ToolRegistration
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "BashToolInput",
     "PowerShellToolInput",
     "ShellStructuredOutput",
+    "command_subject",
     "create_bash_tool",
     "create_powershell_tool",
 ]
@@ -219,7 +221,14 @@ def create_bash_tool(*, command_prefix: str | None = None, prepare: BashPrepare 
         structured_output_schema=_SHELL_STRUCTURED_OUTPUT_SCHEMA,
         output_limits={"retain": "tail"},
         execute=execute,
+        permission_subject=command_subject,
     )
+
+
+def command_subject(args: dict[str, Any], _env: Any, _context: Context) -> PermissionSubject | None:
+    """``permission_subject`` of ``bash`` and ``powershell``: the command, which ``Bash(...)`` rules match."""
+    command = args.get("command")
+    return {"type": "command", "command": command} if isinstance(command, str) else None
 
 
 #: Output in UTF-8 whatever the console's code page, as the coding agent's ``powershell`` tool does.
@@ -261,4 +270,5 @@ def create_powershell_tool(
         structured_output_schema=_SHELL_STRUCTURED_OUTPUT_SCHEMA,
         output_limits={"retain": "tail"},
         execute=execute,
+        permission_subject=command_subject,
     )

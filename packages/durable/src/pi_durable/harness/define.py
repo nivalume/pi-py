@@ -75,10 +75,14 @@ def define_tool(
     deferred: Literal[True] | None = None,
     output_limits: ToolOutputLimits | None = None,
     constrained_sampling: ConstrainedSamplingConfig | Literal[False] | None = None,
+    permission_subject: Callable[[dict[str, Any], Any, Context], Any] | None = None,
+    approval_key: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> ToolRegistration:
     """Build a tool registration; ``execute(args, api, context)`` receives arguments validated against ``parameters``.
 
     ``parameters`` is a JSON Schema (:class:`pi_ai.Type`) or a Pydantic model; default an empty object schema.
+    ``permission_subject`` and ``approval_key`` are what the approval policy and session grants see of a call
+    (``ToolRegistration``).
     """
     return ToolRegistration(
         name,
@@ -93,6 +97,8 @@ def define_tool(
         callers=callers,
         deferred=deferred,
         output_limits=output_limits,
+        permission_subject=permission_subject,
+        approval_key=approval_key,
     )
 
 
